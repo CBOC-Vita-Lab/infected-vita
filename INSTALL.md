@@ -1,5 +1,8 @@
 # Install
 
+For the desktop app and matching ZIP, see [Desktop Install](DESKTOP-INSTALL.md).
+The manual method below remains available. Private preview access is required.
+
 Use your owner-built `INFC00001` VPK or your existing private-preview bundle.
 [Start Here](START-HERE.txt) is the short version.
 
