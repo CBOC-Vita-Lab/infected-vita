@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 04:42:30 +0000
+Subject: [PATCH] Merge branch 'gfx-options' into infected-next
+
+Brings in:
+* gfx_cost: work in progress at interruption
+
+diff --git a/tools/gfx_compare/gfx_cost.py b/tools/gfx_compare/gfx_cost.py
+index 8dada3c..71005a1 100644
+--- a/tools/gfx_compare/gfx_cost.py
++++ b/tools/gfx_compare/gfx_cost.py
+@@ -37,6 +37,7 @@ ROWS = [
+     ("gfx.antialiasing=msaa4 (desktop preview)", with_on(gfx__antialiasing="msaa4")),
+     ("gfx.pixel_lighting=on", with_on(gfx__pixel_lighting="on")),
+     ("gfx.effects_scale=2", with_on(gfx__effects_scale="2")),
++    ("gfx.movie_filter=sharp", with_on(gfx__movie_filter="sharp")),
+     ("perf.show_fps=on", with_on(perf__show_fps="on")),
+     ("everything on (smooth, mips, fxaa, pixel lighting, scale 2)",
+      with_on(gfx__texture_filter="smooth", gfx__mipmaps="on", gfx__antialiasing="fxaa", gfx__pixel_lighting="on",
+@@ -52,13 +53,14 @@ FIELDS = [
+     ("post", r"post passes \(fxaa/resolve/...\)\s+\d+\s+\[([\d.]+)\]"),
+     ("mipkb", r"mip bytes uploaded \(CPU\)\s+\d+\s+\[([\d.]+)\]"),
+     ("variants", r"shader variants (\d+),"),
++    ("sharp", r"full-screen pictures sharpened\s+\d+\s+\[([\d.]+)\]"),
+     ("gl_ms", r"GL submission ([\d.]+) ms"),
+     ("flip_ms", r"whole flip ([\d.]+) ms"),
+ ]
+ 
+ 
+-def run(replay, dump, flip, repeat, ports):
+-    cmd = [replay, dump, "--flips", str(flip), "--null-draw", "--cpu-time", "--repeat", str(repeat), "--stats"]
++def run(replay, dump, flip, repeat, ports, extra=()):
++    cmd = [replay, dump, "--flips", str(flip), "--null-draw", "--cpu-time", "--repeat", str(repeat), "--stats"] + list(extra)
+     for p in ports:
+         cmd += ["--port", p]
+     out = subprocess.run(["nice", "-n", "10"] + cmd, capture_output=True, text=True, timeout=600,
+@@ -78,23 +80,24 @@ def main():
+     ap.add_argument("--flip", required=True, type=int)
+     ap.add_argument("--repeat", type=int, default=30)
+     ap.add_argument("--runs", type=int, default=3)
++    ap.add_argument("--replay-arg", action="append", default=[], help="extra argument for ge_replay")
+     ap.add_argument("--out")
+     args = ap.parse_args()
+-    lines = ["| option | GL draws | prog switches | tex binds | extra passes | mip KiB/flip | GL submit ms | whole flip ms | vs baseline |",
+-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
++    lines = ["| option | GL draws | prog switches | tex binds | extra passes | pictures sharpened | mip KiB/flip | GL submit ms | whole flip ms | vs baseline |",
++             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+     base = None
+     for label, ports in ROWS:
+         best = None
+         for _ in range(args.runs):
+-            row = run(args.replay, args.dump, args.flip, args.repeat, ports)
++            row = run(args.replay, args.dump, args.flip, args.repeat, ports, args.replay_arg)
+             if best is None or row["flip_ms"] < best["flip_ms"]:
+                 best = row
+         if base is None:
+             base = best
+         ratio = best["flip_ms"] / base["flip_ms"] if base["flip_ms"] else float("nan")
+-        lines.append("| %s | %.0f | %.0f | %.0f | %.0f | %.1f | %.2f | %.2f | x%.2f |" %
+-                     (label, best["gl_draws"], best["prog"], best["texbind"], best["post"], best["mipkb"], best["gl_ms"],
+-                      best["flip_ms"], ratio))
++        lines.append("| %s | %.0f | %.0f | %.0f | %.0f | %.0f | %.1f | %.2f | %.2f | x%.2f |" %
++                     (label, best["gl_draws"], best["prog"], best["texbind"], best["post"], best["sharp"], best["mipkb"],
++                      best["gl_ms"], best["flip_ms"], ratio))
+         print(lines[-1], flush=True)
+     text = "\n".join(lines) + "\n"
+     if args.out:

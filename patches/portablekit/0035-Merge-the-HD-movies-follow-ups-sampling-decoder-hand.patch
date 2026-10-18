@@ -1,0 +1,485 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:39:56 +0000
+Subject: [PATCH] Merge the HD movies follow-ups (sampling, decoder hand-back,
+ logging) into all
+
+Brings in:
+* gl: sample a native HD movie frame exactly as its binder described it
+* hd movies: give the pictures, frames and decoder back when no movie plays; report the rate a movie held
+* hd movies: give the original decoder the parameter sets when it takes over
+* hd movies: say in the log, without a trace switch, how many replacement movies were found
+
+diff --git a/host/gpu/gl/gl_hd_movie.cpp b/host/gpu/gl/gl_hd_movie.cpp
+index 22b4d6e..0184683 100644
+--- a/host/gpu/gl/gl_hd_movie.cpp
++++ b/host/gpu/gl/gl_hd_movie.cpp
+@@ -38,6 +38,8 @@ HdNativeBinder *g_binder = nullptr;
+ 
+ void set_hd_native_binder(HdNativeBinder *binder) { g_binder = binder; }
+ 
++bool release_hd_native_frames() { return g_binder == nullptr || g_binder->release_frames(); }
++
+ GLuint GlHdMovieTexture::update(const movie::HdPicture &picture) {
+     if (picture.native) {
+         if (g_binder == nullptr || picture.width == 0u || picture.height == 0u) return 0u;
+diff --git a/host/gpu/gl/gl_hd_movie.hpp b/host/gpu/gl/gl_hd_movie.hpp
+index 82f9e29..99e5908 100644
+--- a/host/gpu/gl/gl_hd_movie.hpp
++++ b/host/gpu/gl/gl_hd_movie.hpp
+@@ -27,9 +27,16 @@ public:
+     // The GL texture that samples `picture.native` as a 2D texture of picture.width x picture.height; 0 when it cannot. The
+     // binder owns the texture; the same frame may be asked for again and again.
+     virtual GLuint texture_for(const movie::HdPicture &picture) = 0;
++    // Called on the render thread when no movie is playing and no replacement picture has been drawn for a while (a second or
++    // more): the binder deletes the GL textures it made and gives back whatever it keeps for decoding (frame memory, the
++    // decoder). Every picture the renderer and the frame store held has been let go by then. True when everything is given
++    // back; false when a picture of the source is still alive (the renderer asks again at the next frame).
++    virtual bool release_frames() { return true; }
+ };
+ // Registers the binder of this platform (null: none; a native picture then cannot be shown and the original movie plays).
+ void set_hd_native_binder(HdNativeBinder *binder);
++// release_frames() of the registered binder (true without one).
++bool release_hd_native_frames();
+ 
+ class GlHdMovieTexture {
+ public:
+@@ -39,6 +46,8 @@ public:
+     GLuint update(const movie::HdPicture &picture);
+     void release();
+     [[nodiscard]] GLuint id() const noexcept { return texture_; }
++    // The texture belongs to the platform's binder (a native frame): its sampler state is the binder's, GL parameter calls would undo it.
++    [[nodiscard]] bool native() const noexcept { return native_; }
+     [[nodiscard]] std::uint64_t uploads() const noexcept { return uploads_; }
+     // CPU time of the render thread in the conversion and in the upload call, in microseconds, over all uploads.
+     [[nodiscard]] std::uint64_t convert_microseconds() const noexcept { return convert_us_; }
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 6715abc..afd1d7c 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -221,6 +221,7 @@ constexpr std::uint32_t kHashPhases = 8u;
+ constexpr std::uint32_t kYoungUses = 4u;
+ constexpr std::uint64_t kVolatileFrames = 240u;
+ constexpr std::uint64_t kHdReleaseInterval = 30u;  // frames between two looks at the HD budget
++constexpr std::uint64_t kHdMovieIdleFrames = 120u;  // frames without a replacement movie picture drawn (and no movie) before they are released
+ 
+ struct TextureEntry {
+     GLuint id{};
+@@ -318,6 +319,8 @@ struct GlRenderer::Impl {
+     GlHdTextures hd;          // HD texture pack (gfx.hd_textures) and the texture dump
+     GlHdMovieTexture hd_movie_texture;                       // the replacement picture of an HD movie (gfx.hd_movies)
+     std::shared_ptr<const movie::HdPicture> hd_movie_shown;  // the picture the texture holds
++    bool hd_movie_held{};                                    // pictures of a movie are alive (store, texture, the platform's frames)
++    std::uint64_t hd_movie_last_use{};                       // the frame at which a draw last used a replacement picture
+     bool hd_configured{};
+     GLuint upload_texture{};  // for upload_frame
+     GLuint clear_texture{};   // 1x1 transparent black for quad_clear
+@@ -1021,6 +1024,25 @@ struct GlRenderer::Impl {
+                          static_cast<unsigned long long>(hd.resident_bytes() >> 10u), static_cast<unsigned long long>(budget >> 10u));
+     }
+ 
++    // gfx.hd_movies: what a finished movie leaves behind (the pictures in the store, the texture, and on a platform with a decoder
++    // of its own the frames and the decoder) goes once no movie exists and no draw has used a replacement picture for
++    // kHdMovieIdleFrames frames: a game that keeps drawing the last picture of a movie after it was closed (a fade) still finds it.
++    // The grace also outlasts the display lists in flight, so nothing the GPU may still read is freed.
++    void release_idle_hd_movie() {
++        if (!hd_movie_held || frames < hd_movie_last_use + kHdMovieIdleFrames) return;
++        movie::HdFrameStore &store = movie::HdFrameStore::instance();
++        const std::uint64_t serial = store.serial();
++        if (store.any_session()) return;
++        hd_movie_shown.reset();
++        hd_movie_texture.release();
++        if (!store.clear_if_unchanged(serial)) return;  // a movie began in between
++        if (release_hd_native_frames()) {
++            hd_movie_held = false;
++            static const bool trace = portablekit::env("TRACE_HDMOVIE") != nullptr;
++            if (trace) std::fprintf(stderr, "[hdmovie] frame %llu: the replacement pictures are released\n", static_cast<unsigned long long>(frames));
++        }
++    }
++
+     // ---- blending ---------------------------------------------------------------------------------
+ 
+     BlendPlan plan_blend(const BlendState &blend) {
+@@ -1680,6 +1702,10 @@ struct GlRenderer::Impl {
+             if (hd_movie_texture.update(*picture) == 0u) return false;
+             cache.texture = ~0u;  // the update bound the texture itself
+             hd_movie_shown = picture;
++            // A native frame (the Vita's decoder output) is sampled as it is described by the platform's binder; a glTexParameteri would
++            // rewrite that description (vitaGL changes the mip count, which moves the chroma plane). The draw below asks for exactly what
++            // the binder set: linear, clamped, no mips (binding.hd_movie forces it in submit()), so the cache is told it is there.
++            if (hd_movie_texture.native()) samplers[hd_movie_texture.id()] = Sampler{GL_LINEAR, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE};
+             static const bool trace = portablekit::env("TRACE_HDMOVIE") != nullptr;
+             if (trace) {
+                 const auto uploads = hd_movie_texture.uploads();
+@@ -1691,6 +1717,8 @@ struct GlRenderer::Impl {
+                                  static_cast<double>(hd_movie_texture.upload_microseconds()) / 1000.0 / static_cast<double>(uploads));
+             }
+         }
++        hd_movie_held = true;
++        hd_movie_last_use = frames;
+         out.id = hd_movie_texture.id();
+         out.hd_movie = true;
+         out.opaque = true;
+@@ -2247,6 +2275,7 @@ struct GlRenderer::Impl {
+         ++frames;
+         evict_textures();
+         release_stale_hd();
++        release_idle_hd_movie();
+         note_present(ge_draws);
+         scene_draws = 0u;
+         composite_seen = false;
+diff --git a/host/movie/hd_frame_store.cpp b/host/movie/hd_frame_store.cpp
+index 40de9df..3cb6d46 100644
+--- a/host/movie/hd_frame_store.cpp
++++ b/host/movie/hd_frame_store.cpp
+@@ -68,6 +68,25 @@ void HdFrameStore::clear() {
+     for (Slot &slot : slots_) slot = Slot{};
+ }
+ 
++std::uint64_t HdFrameStore::serial() const {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    return serial_;
++}
++
++bool HdFrameStore::clear_if_unchanged(std::uint64_t serial) {
++    // The pictures are released after the lock: a platform frame's last reference ends in the platform's own code.
++    std::shared_ptr<const HdPicture> dropped[kSlots];
++    {
++        const std::lock_guard<std::mutex> lock(mutex_);
++        if (serial_ != serial) return false;
++        for (std::size_t i = 0; i < kSlots; ++i) {
++            dropped[i] = std::move(slots_[i].picture);
++            slots_[i] = Slot{};
++        }
++    }
++    return true;
++}
++
+ // ---- the marker ----------------------------------------------------------------------------------------------------------
+ 
+ void write_hd_marker(psprecomp::GuestMemory &memory, std::uint32_t address, const HdMarker &marker) {
+diff --git a/host/movie/hd_movie.cpp b/host/movie/hd_movie.cpp
+index f0afcf5..9969946 100644
+--- a/host/movie/hd_movie.cpp
++++ b/host/movie/hd_movie.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cctype>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -108,6 +109,50 @@ bool is_idr_unit(std::span<const std::uint8_t> unit) noexcept {
+     return false;
+ }
+ 
++namespace {
++
++// Calls `visit(type, begin, end)` for every NAL unit of an Annex B access unit; `end` leaves out the zero bytes in front of the next start code.
++template <typename Visit>
++void for_each_nal(std::span<const std::uint8_t> unit, Visit visit) {
++    std::size_t begin = 0u;
++    bool open = false;
++    const auto close = [&](std::size_t stop) {
++        while (stop > begin && unit[stop - 1u] == 0u) --stop;
++        if (stop > begin) visit(static_cast<unsigned>(unit[begin] & 0x1Fu), begin, stop);
++    };
++    for (std::size_t i = 0; i + 2u < unit.size(); ++i) {
++        if (unit[i] == 0u && unit[i + 1u] == 0u && unit[i + 2u] == 1u) {
++            if (open) close(i);
++            begin = i + 3u;
++            open = begin < unit.size();
++            i += 2u;
++        }
++    }
++    if (open) close(unit.size());
++}
++
++}  // namespace
++
++bool has_parameter_sets(std::span<const std::uint8_t> unit) noexcept {
++    bool sps = false, pps = false;
++    for_each_nal(unit, [&](unsigned type, std::size_t, std::size_t) {
++        sps = sps || type == 7u;
++        pps = pps || type == 8u;
++    });
++    return sps && pps;
++}
++
++std::vector<std::uint8_t> extract_parameter_sets(std::span<const std::uint8_t> unit) {
++    std::vector<std::uint8_t> sets;
++    for_each_nal(unit, [&](unsigned type, std::size_t begin, std::size_t end) {
++        if (type != 7u && type != 8u) return;
++        const std::uint8_t start[4] = {0u, 0u, 0u, 1u};
++        sets.insert(sets.end(), start, start + 4);
++        sets.insert(sets.end(), unit.begin() + static_cast<std::ptrdiff_t>(begin), unit.begin() + static_cast<std::ptrdiff_t>(end));
++    });
++    return sets;
++}
++
+ // ---- the library ---------------------------------------------------------------------------------------------------------
+ 
+ HdLibrary &HdLibrary::instance() {
+@@ -135,7 +180,8 @@ void HdLibrary::configure(const std::string &root) {
+         if (movie.frames == 0u || !file_exists(movie.path)) continue;  // not installed: the original plays
+         movies_.push_back(std::move(movie));
+     }
+-    if (trace_enabled()) std::cerr << "[hdmovie] " << movies_.size() << " replacement(s) in " << root_ << "\n";
++    // Always when there are some: the one line that tells a copy of the movies was found (whether they are used is the setting's business).
++    if (!movies_.empty() || trace_enabled()) std::cerr << "[hdmovie] " << movies_.size() << " replacement(s) in " << root_ << "\n";
+ }
+ 
+ const HdMovie *HdLibrary::identify(std::span<const std::uint8_t> header, std::string *why) const {
+@@ -186,22 +232,31 @@ HdSession::HdSession(const HdMovie &movie, const PsmfTiming &timing) : movie_(mo
+     id_ = next_id.fetch_add(1u);
+     const std::lock_guard<std::mutex> lock(session_mutex());
+     live_sessions().push_back(this);
++    HdFrameStore::instance().session_opened();
+     if (trace_enabled()) std::cerr << "[hdmovie] session " << id_ << ": " << movie_.name << ", " << movie_.frames << " pictures\n";
+ }
+ 
+ HdSession::~HdSession() {
+-    {
+-        const std::lock_guard<std::mutex> lock(session_mutex());
+-        auto &sessions = live_sessions();
+-        sessions.erase(std::remove(sessions.begin(), sessions.end(), this), sessions.end());
+-    }
+     if (trace_enabled() || shown_ != 0u) std::cerr << "[hdmovie] session " << id_ << " ended: " << summary() << "\n";
++    // The source first (the platform's decoder is given back), then the session stops counting as live: the renderer lets go of
++    // the pictures this movie left behind only when no session exists.
+     if (source_) source_->close();
++    const std::lock_guard<std::mutex> lock(session_mutex());
++    auto &sessions = live_sessions();
++    sessions.erase(std::remove(sessions.begin(), sessions.end(), this), sessions.end());
++    HdFrameStore::instance().session_closed();
+ }
+ 
+ std::string HdSession::summary() const {
+     std::ostringstream text;
+     text << movie_.name << ": " << shown_ << " replacement pictures, " << original_ << " original";
++    if (shown_ > 1u && last_shown_us_ > first_shown_us_) {
++        const double seconds = static_cast<double>(last_shown_us_ - first_shown_us_) / 1e6;
++        char rate[96];
++        std::snprintf(rate, sizeof(rate), " (%.2f s, %.2f pictures/s, longest wait %.0f ms)", seconds, static_cast<double>(shown_ - 1u) / seconds,
++                      static_cast<double>(longest_gap_us_) / 1000.0);
++        text << rate;
++    }
+     if (source_) {
+         text << ", " << source_->pictures_decoded() << " decoded, " << source_->seeks() << " seek(s)";
+         if (source_->pictures_decoded() != 0u && source_->decode_cpu_us() != 0u)
+@@ -234,6 +289,9 @@ bool HdSession::ensure_source() {
+ }
+ 
+ void HdSession::remember(std::span<const std::uint8_t> unit) {
++    // Not every IDR unit of a movie carries its parameter sets (about one in six of the originals' does not): the original decoder,
++    // which has seen none of the units the replacement showed, needs them in front of the first unit it is given after a switch.
++    if (std::vector<std::uint8_t> sets = extract_parameter_sets(unit); !sets.empty()) parameter_sets_ = std::move(sets);
+     if (is_idr_unit(unit)) {
+         history_.clear();
+         history_bytes_ = 0u;
+@@ -264,6 +322,12 @@ bool HdSession::show(psprecomp::GuestMemory &memory, std::uint32_t destination,
+             replay_ = std::move(history_);
+             history_.clear();
+             history_bytes_ = 0u;
++            if (!parameter_sets_.empty() && !has_parameter_sets(replay_.front()))
++                replay_.front().insert(replay_.front().begin(), parameter_sets_.begin(), parameter_sets_.end());
++        } else if (last_state_ == 1 && !parameter_sets_.empty()) {
++            // The replacement showed units that were too many to keep: the original decoder starts again at the next IDR unit, and that
++            // one may not carry the parameter sets.
++            replay_.push_back(parameter_sets_);
+         }
+         history_lost_ = false;
+         blackened_.clear();
+@@ -288,6 +352,14 @@ bool HdSession::show(psprecomp::GuestMemory &memory, std::uint32_t destination,
+     }
+     write_hd_marker(memory, destination, HdMarker{id_, static_cast<std::uint32_t>(index), timing_.width, timing_.height});
+     ++shown_;
++    {
++        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        if (shown_ == 1u)
++            first_shown_us_ = now;
++        else
++            longest_gap_us_ = std::max<std::int64_t>(longest_gap_us_, now - last_shown_us_);
++        last_shown_us_ = now;
++    }
+     if (last_state_ == 2) ++switches_;
+     last_state_ = 1;
+     return true;
+@@ -316,6 +388,8 @@ void HdSession::resume() {
+     if (source_) source_->resume();
+ }
+ 
++bool HdSession::any_live() { return HdFrameStore::instance().any_session(); }
++
+ void HdSession::pause_all(bool paused) {
+     const std::lock_guard<std::mutex> lock(session_mutex());
+     for (HdSession *session : live_sessions()) {
+diff --git a/host/movie/hd_movie.hpp b/host/movie/hd_movie.hpp
+index c97e187..5da6243 100644
+--- a/host/movie/hd_movie.hpp
++++ b/host/movie/hd_movie.hpp
+@@ -61,8 +61,18 @@ public:
+     // The picture of (session, index); when the exact one is gone, the newest of the session; null when there is none.
+     [[nodiscard]] std::shared_ptr<const HdPicture> find(std::uint32_t session, std::uint64_t index) const;
+     void clear();
++    // Drops every picture when nothing was published since `serial` (the value serial() had when the caller last looked); false
++    // when something was. The renderer uses it to let go of the pictures a finished movie left behind (and, with them, the
++    // platform frames they hold) without racing a movie that starts at that moment.
++    bool clear_if_unchanged(std::uint64_t serial);
++    [[nodiscard]] std::uint64_t serial() const;
+     // Whether a picture was ever published: the renderer looks for markers only after the first.
+     [[nodiscard]] bool in_use() const noexcept { return published_.load(std::memory_order_relaxed); }
++    // Sessions that exist (HdSession counts itself in and out). Kept here, not in HdSession, so that the renderer, which links the store
++    // and not the session code, can tell whether a movie is being played.
++    void session_opened() noexcept { sessions_.fetch_add(1, std::memory_order_relaxed); }
++    void session_closed() noexcept { sessions_.fetch_sub(1, std::memory_order_relaxed); }
++    [[nodiscard]] bool any_session() const noexcept { return sessions_.load(std::memory_order_relaxed) > 0; }
+ 
+ private:
+     struct Slot {
+@@ -76,6 +86,7 @@ private:
+     Slot slots_[kSlots];
+     std::uint64_t serial_{};
+     std::atomic<bool> published_{false};
++    std::atomic<int> sessions_{0};
+ };
+ 
+ // ---- the marker ----------------------------------------------------------------------------------------------------------
+@@ -207,6 +218,8 @@ public:
+     [[nodiscard]] std::string summary() const;
+     // The pause listener of the kernel reaches every live session.
+     static void pause_all(bool paused);
++    // Whether any session exists (a movie with a replacement is being played, or paused in the middle): HdFrameStore::any_session().
++    [[nodiscard]] static bool any_live();
+ 
+ private:
+     bool ensure_source();
+@@ -223,12 +236,20 @@ private:
+     std::size_t history_bytes_{};
+     bool history_lost_{};
+     std::vector<std::vector<std::uint8_t>> replay_;
++    std::vector<std::uint8_t> parameter_sets_;  // the latest SPS and PPS the replacement showed (Annex B), for the original decoder
+     std::vector<std::uint32_t> blackened_;  // destinations already filled with black
+     std::uint64_t shown_{}, original_{}, switches_{};
+     int last_state_{0};  // 0 none yet, 1 replacement, 2 original
++    // Wall clock (steady, microseconds) of the first and the latest replacement picture and the longest wait between two of them:
++    // what tells the rate a device holds (the end-of-movie line prints it; a pause or a skip shows up as a long wait).
++    std::int64_t first_shown_us_{}, last_shown_us_{}, longest_gap_us_{};
+ };
+ 
+ // The unit is an IDR picture (NAL type 5 somewhere in it).
+ [[nodiscard]] bool is_idr_unit(std::span<const std::uint8_t> unit) noexcept;
++// The unit carries a sequence and a picture parameter set (NAL types 7 and 8).
++[[nodiscard]] bool has_parameter_sets(std::span<const std::uint8_t> unit) noexcept;
++// The unit's SPS and PPS NAL units, each behind a four byte start code (empty when it has none).
++[[nodiscard]] std::vector<std::uint8_t> extract_parameter_sets(std::span<const std::uint8_t> unit);
+ 
+ } // namespace portablekit::movie
+diff --git a/tests/hd_movie_tests.cpp b/tests/hd_movie_tests.cpp
+index 70ff92a..855a188 100644
+--- a/tests/hd_movie_tests.cpp
++++ b/tests/hd_movie_tests.cpp
+@@ -263,6 +263,16 @@ void test_store_and_marker() {
+     store.clear();
+     check(store.find(7u, 119u) == nullptr, "clear empties the store");
+ 
++    // The renderer lets go of a finished movie's pictures only when nothing was published since it last looked.
++    auto held = std::make_shared<HdPicture>();
++    store.publish(9u, 1u, held);
++    const std::uint64_t seen = store.serial();
++    store.publish(9u, 2u, held);
++    check(!store.clear_if_unchanged(seen) && store.find(9u, 2u) == held, "a store that changed since the look is not cleared");
++    check(held.use_count() == 3, "(the store holds the picture twice)");
++    check(store.clear_if_unchanged(store.serial()) && store.find(9u, 2u) == nullptr, "an unchanged store is cleared");
++    check(held.use_count() == 1, "the cleared pictures are let go");
++
+     psprecomp::GuestMemory memory;
+     const std::uint32_t at = 0x08400000u;
+     HdMarker marker;
+@@ -304,7 +314,25 @@ private:
+ };
+ 
+ FakeSource *g_fake = nullptr;
++bool g_fail_open = false;
++class RefusingSource final : public HdSource {
++public:
++    bool open(const std::string &) override {
++        error_ = "no decoder";
++        return false;
++    }
++    void close() override {}
++    const std::string &error() const override { return error_; }
++    std::uint32_t width() const override { return 0u; }
++    std::uint32_t height() const override { return 0u; }
++    std::uint32_t frame_count() const override { return 0u; }
++    std::shared_ptr<const HdPicture> frame_for(std::int64_t) override { return nullptr; }
++
++private:
++    std::string error_;
++};
+ std::unique_ptr<HdSource> make_fake() {
++    if (g_fail_open) return std::make_unique<RefusingSource>();
+     auto source = std::make_unique<FakeSource>();
+     g_fake = source.get();
+     return source;
+@@ -327,8 +355,10 @@ void test_session(const fs::path &dir) {
+     timing.height = 272u;
+     psprecomp::GuestMemory memory;
+     const std::uint32_t destination = 0x08500000u, stride = 512u;
++    check(!HdSession::any_live(), "no session exists before the first");
+     {
+         HdSession session(movie, timing);
++        check(HdSession::any_live(), "a session counts as live");
+         const auto pts_of = [&](int index) { return static_cast<std::int64_t>(90000 + 3003 * index); };
+         // Pictures 0..3 replaced; 0 and 4 are IDR units.
+         bool all_replaced = true;
+@@ -364,7 +394,48 @@ void test_session(const fs::path &dir) {
+         session.restart();
+         check(session.take_replay().empty(), "restart forgets what is pending");
+     }
++    {
++        // An IDR unit does not always carry the parameter sets. The original decoder, which has seen none of the units the replacement
++        // showed, is given the last ones in front of the first unit it is replayed.
++        HdSession session(movie, timing);
++        const auto pts_of = [&](int index) { return static_cast<std::int64_t>(90000 + 3003 * index); };
++        const Bytes sets{0, 0, 0, 1, 0x67u, 0x64u, 0x00u, 0x1Fu, 0xACu, 0, 0, 0, 1, 0x68u, 0xEEu, 0x3Cu};
++        Bytes first_idr = {0, 0, 0, 1, 0x09u, 0xF0u};  // an access unit delimiter in front, as the discs' movies have
++        first_idr.insert(first_idr.end(), sets.begin(), sets.end());
++        const Bytes idr = unit_of(true);
++        first_idr.insert(first_idr.end(), idr.begin(), idr.end());
++        check(has_parameter_sets(first_idr) && !has_parameter_sets(unit_of(true)) && !has_parameter_sets(unit_of(false)), "the unit with both parameter sets is told");
++        check(extract_parameter_sets(first_idr) == sets, "the parameter sets are cut out with four byte start codes");
++        check(extract_parameter_sets(unit_of(true)).empty(), "a unit without them gives none");
++        check(session.show(memory, destination, stride, first_idr, pts_of(0), true), "picture 0 (IDR with parameter sets) replaced");
++        for (int i = 1; i < 4; ++i) check(session.show(memory, destination, stride, unit_of(false), pts_of(i), true), "pictures 1 to 3 replaced");
++        check(session.show(memory, destination, stride, unit_of(true), pts_of(4), true), "picture 4 (IDR without parameter sets) replaced");
++        check(session.show(memory, destination, stride, unit_of(false), pts_of(5), true), "picture 5 replaced");
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(6), false), "the original takes over at picture 6");
++        const auto replay = session.take_replay();
++        Bytes expected = sets;
++        expected.insert(expected.end(), idr.begin(), idr.end());
++        check(replay.size() == 2u && replay[0] == expected && replay[1] == unit_of(false),
++              "the replay starts with the parameter sets, in front of the IDR unit that has none");
++        // Taking over at an IDR unit that has its own sets after a replay that needs none added.
++        check(session.show(memory, destination, stride, first_idr, pts_of(7), true), "replaced again at picture 7");
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(8), false), "the original again at picture 8");
++        const auto again = session.take_replay();
++        check(again.size() == 1u && again[0] == first_idr, "an IDR unit with its sets is replayed as it is");
++    }
+     check(g_closed, "the source is closed with the session");
++    check(!HdSession::any_live(), "no session exists after the last");
++
++    // A source that cannot be opened (no decoder, the decoder is busy): the original plays, every time, without a retry per picture.
++    g_fail_open = true;
++    {
++        HdSession session(movie, timing);
++        bool any = false;
++        for (int i = 0; i < 3; ++i) any = any || session.show(memory, destination, stride, unit_of(i == 0), 90000 + 3003 * i, true);
++        check(!any, "a source that cannot open leaves every picture to the original");
++        check(session.original() == 3u && session.shown() == 0u, "and the session counts them as original");
++    }
++    g_fail_open = false;
+     set_hd_source_factory(nullptr);
+ }
+ 

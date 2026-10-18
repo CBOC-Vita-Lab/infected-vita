@@ -1,0 +1,35 @@
+# Vita3K: the mission-1 briefing is a still picture for minutes (the mission loads behind it): the same screen with the HD pack
+# off, 2x and 4x, through the settings menu (SELECT+START held). Then gameplay with the default (4x) once more.
+waitlog 2400 flips=22[0-9][0-9][(]
+wait 2
+shot s0_briefing_default
+# ---- HD textures: best available -> off
+down select; down start; wait 2.5; up start; up select
+wait 8
+press right 1.0; wait 2
+press circle 1.0; wait 3
+wait 25
+shot s1_briefing_hd_off
+# ---- off -> 2x pack
+down select; down start; wait 2.5; up start; up select
+wait 8
+press right 1.0; wait 2
+press circle 1.0; wait 3
+wait 25
+shot s2_briefing_hd_2x
+# ---- 2x pack -> 4x pack
+down select; down start; wait 2.5; up start; up select
+wait 8
+press right 1.0; wait 2
+shot s3_menu_hd_4x
+press circle 1.0; wait 3
+wait 25
+shot s3_briefing_hd_4x
+waitlog 1500 flips=26[0-9][0-9][(]
+wait 30
+shot s4_gameplay_4x
+wait 90
+shot s5_gameplay_4x_later
+down select; down start; down l; down r; wait 4
+up r; up l; up start; up select
+wait 10

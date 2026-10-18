@@ -1,4 +1,6 @@
 INFECTED VITA
+For a new owner, build your own VPK using BUILDING.md. The private candidate
+below contains translated game code and is not a public download.
 Private candidate / INFC00001. Not cleared for redistribution.
 
 FIRST INSTALL

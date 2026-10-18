@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:12:30 +0000
+Subject: [PATCH] renderer: specialise the lighting code to each light's shape
+
+A specialised lit program now also carries 3 bits per light: off, or directional, point or spot, plain diffuse or
+another kind. The lighting code leaves out the lights that are off and the branches a light cannot take (no
+attenuation for a directional light, no specular or power for a plain diffuse one). The uniform-driven vertex program
+was about 600 instructions on the Vita whatever the lights.
+
+Verified: 25 replayed gameplay frames pixel-identical with specialisation on and off; the shader lint compiles all
+578 programs. A mission frame switches programs 37 times instead of 20, with fewer uniform uploads (193, was 232).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index fdecc69..30721e3 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2117,10 +2117,17 @@ struct GlRenderer::Impl {
+         // The texture function, the alpha comparison and the blend fix-up compiled into the fragment program
+         // (settings.specialize): a few instructions per pixel instead of a hundred on the Vita.
+         if (settings.specialize) {
++            std::uint32_t light_codes = 0u;
++            if (lit) {
++                for (std::size_t i = 0; i < call.lighting.lights.size() && i < 4u; ++i) {
++                    const LightState &light = call.lighting.lights[i];
++                    light_codes |= glsl::light_code(light.enabled, light.type, light.kind) << (3u * i);
++                }
++            }
+             state.program_flags = glsl::specialize(
+                 state.program_flags, static_cast<std::uint32_t>(state.texenv[0] + 0.5f), state.texenv[1] > 0.5f,
+                 state.texenv[2] > 0.5f, static_cast<std::uint32_t>(state.alpha[0] + 0.5f),
+-                static_cast<std::uint32_t>(state.shader_blend[0] + 0.5f));
++                static_cast<std::uint32_t>(state.shader_blend[0] + 0.5f), light_codes);
+         }
+         // Transform.
+         if (!through) {
+diff --git a/host/gpu/gl/gl_shaders.cpp b/host/gpu/gl/gl_shaders.cpp
+index ef4956e..6e0f91f 100644
+--- a/host/gpu/gl/gl_shaders.cpp
++++ b/host/gpu/gl/gl_shaders.cpp
+@@ -107,6 +107,28 @@ const char *const kLightTerm = R"GLSL(
+     }
+ )GLSL";
+ 
++// The same term with the light's type (and, for a plain diffuse light, its kind) known: no test of whether it is on, no
++// branch on the type, no specular or power code for a diffuse light. @TYPE@ is replaced by the code's pieces below.
++const char *const kLightTermPoint = R"GLSL(
++        to_light -= world_position;
++        float light_distance = length(to_light);
++        vec3 k = u_light_attenuation[@I@].xyz;
++        scale = clamp(1.0 / max(k.x + k.y * light_distance + k.z * light_distance * light_distance, 1e-20), 0.0, 1.0);
++)GLSL";
++const char *const kLightTermSpot = R"GLSL(
++        vec3 axis = u_light_direction[@I@].xyz;
++        axis = dot(axis, axis) > 0.0 ? normalize(axis) : vec3(0.0, 0.0, 1.0);
++        float angle = dot(axis, -to_light);
++        scale *= angle >= u_light_spot[@I@].y ? pow(max(angle, 0.0), u_light_spot[@I@].x) : 0.0;
++)GLSL";
++const char *const kLightTermSpecular = R"GLSL(
++        if (kind > 0.5 && kind < 1.5 && n_dot_l >= 0.0) {
++            vec3 half_vector = normalize(to_light + vec3(0.0, 0.0, 1.0));
++            specular += u_light_specular[@I@].rgb * specular_material *
++                        pow(max(dot(normal, half_vector), 0.0), power) * scale;
++        }
++)GLSL";
++
+ const char *const kLightFunction = R"GLSL(
+ void light_eval(vec3 world_position, vec3 surface_normal, vec4 vertex_color, out vec4 color, out vec3 separate_specular) {
+     bool has_color = u_flags.x > 0.5;
+@@ -458,13 +480,51 @@ vec4 picture_tap(vec2 uv) { return texture2D(u_texture, clamp(uv, v_rect.xy, v_r
+ 
+ const char *uniform_name(Uniform uniform) { return kUniformNames[uniform]; }
+ 
+-// kLightFunction with its four lights written out (see kLightTerm).
+-std::string light_function_source() {
++namespace {
++void replace_index(std::string &term, int light) {
++    for (std::size_t at = term.find("@I@"); at != std::string::npos; at = term.find("@I@", at + 1u))
++        term.replace(at, 3u, std::to_string(light));
++}
++
++// One light whose shape is known (light_code()): the arithmetic of kLightTerm, minus what this light cannot need.
++std::string specialized_light_term(int light, std::uint32_t code) {
++    if (code == 0u) return {};
++    const std::uint32_t type = (code - 1u) % 3u;   // 0 directional, 1 point, 2 spot
++    const bool plain_diffuse = code <= 3u;
++    std::string term = "    {\n";
++    if (!plain_diffuse) term += "        float kind = u_light_attenuation[@I@].w;\n";
++    term += "        vec3 to_light = u_light_position[@I@].xyz;\n        float scale = 1.0;\n";
++    if (type >= 1u) term += kLightTermPoint;
++    term += "        to_light = dot(to_light, to_light) > 0.0 ? normalize(to_light) : vec3(0.0, 0.0, 1.0);\n";
++    if (type == 2u) term += kLightTermSpot;
++    term += "        float n_dot_l = dot(normal, to_light);\n        float diffuse = max(n_dot_l, 0.0);\n";
++    if (!plain_diffuse) term += "        if (kind > 1.5) diffuse = pow(diffuse, power);\n";
++    term += "        sum += (u_light_ambient[@I@].rgb * ambient_material.rgb +\n"
++            "                u_light_diffuse[@I@].rgb * diffuse_material * diffuse) * scale;\n";
++    if (!plain_diffuse) term += kLightTermSpecular;
++    term += "    }\n";
++    replace_index(term, light);
++    return term;
++}
++} // namespace
++
++std::uint32_t light_code(bool enabled, std::uint32_t type, std::uint32_t kind) {
++    if (!enabled) return 0u;
++    return 1u + std::min(type, 2u) + (kind == 0u ? 0u : 3u);
++}
++
++// kLightFunction with its four lights written out (see kLightTerm). `flags` with kSpecialized: each light as its
++// code in the flags says (specialized_light_term), otherwise every light tested and branched on at run time.
++std::string light_function_source(std::uint32_t flags = 0u) {
++    const bool specialized = (flags & kSpecialized) != 0u;
+     std::string lights;
+     for (int light = 0; light < 4; ++light) {
++        if (specialized) {
++            lights += specialized_light_term(light, (flags >> (kSpecLightShift + 3 * light)) & 7u);
++            continue;
++        }
+         std::string term = kLightTerm;
+-        for (std::size_t at = term.find("@I@"); at != std::string::npos; at = term.find("@I@", at + 1u))
+-            term.replace(at, 3u, std::to_string(light));
++        replace_index(term, light);
+         lights += term;
+     }
+     std::string source = kLightFunction;
+@@ -479,7 +539,7 @@ std::string vertex_source(std::uint32_t flags) {
+     std::string out = "#version 100\n" + defines(flags) + kVertexHead;
+     if ((flags & kLight) != 0u && (flags & kPixelLight) == 0u) {
+         out += kLightUniforms;
+-        out += light_function_source();
++        out += light_function_source(flags);
+     }
+     out += kVertexBody;
+     return out;
+@@ -489,7 +549,7 @@ std::string fragment_source(std::uint32_t flags) {
+     std::string out = "#version 100\n" + defines(flags) + specialization_defines(flags) + kFragmentHead;
+     if ((flags & kLight) != 0u && (flags & kPixelLight) != 0u) {
+         out += kLightUniforms;
+-        out += light_function_source();
++        out += light_function_source(flags);
+     }
+     if ((flags & kSharpen) != 0u) {
+         out += kPictureTapRect;
+@@ -514,7 +574,7 @@ std::vector<std::uint32_t> valid_program_flags() {
+ }
+ 
+ std::uint32_t specialize(std::uint32_t flags, std::uint32_t texture_function, bool texture_alpha, bool texture_rgb,
+-                         std::uint32_t alpha_function, std::uint32_t blend_fix) {
++                         std::uint32_t alpha_function, std::uint32_t blend_fix, std::uint32_t light_codes) {
+     std::uint32_t out = (flags & ((1u << kProgramFlagBits) - 1u)) | kSpecialized;
+     if ((flags & kTexture) != 0u) {
+         out |= (std::min(texture_function, 7u) << kSpecTexEnvShift);
+@@ -523,6 +583,7 @@ std::uint32_t specialize(std::uint32_t flags, std::uint32_t texture_function, bo
+     }
+     if ((flags & kAlphaTest) != 0u) out |= (std::min(alpha_function, 7u) << kSpecAlphaShift);
+     out |= (std::min(blend_fix, 7u) << kSpecBlendShift);
++    if ((flags & kLight) != 0u) out |= (light_codes & 0xFFFu) << kSpecLightShift;
+     return out;
+ }
+ 
+@@ -541,6 +602,11 @@ std::vector<std::uint32_t> specialized_lint_flags() {
+             for (std::uint32_t function = 0; function < 8u; ++function) out.push_back(specialize(flags, 0u, true, false, function, 0u));
+         }
+         for (std::uint32_t blend = 1; blend < 5u; ++blend) out.push_back(specialize(flags, 0u, true, false, 6u, blend));
++        if ((flags & kLight) != 0u) {
++            // Each light shape as light 0, then four lights of different shapes at once.
++            for (std::uint32_t code = 1; code < 7u; ++code) out.push_back(specialize(flags, 0u, true, false, 6u, 0u, code));
++            out.push_back(specialize(flags, 0u, true, false, 6u, 0u, 1u | (2u << 3) | (3u << 6) | (5u << 9)));
++        }
+     }
+     std::sort(out.begin(), out.end());
+     out.erase(std::unique(out.begin(), out.end()), out.end());
+@@ -570,6 +636,12 @@ std::string describe(std::uint32_t flags) {
+         }
+         const std::uint32_t blend = (flags >> kSpecBlendShift) & 7u;
+         if (blend != 0u) out += ",bfix" + std::to_string(blend);
++        if ((flags & kLight) != 0u) {
++            // One letter per light: - off, d directional, p point, s spot; capital when its kind is not plain diffuse.
++            static const char kLightLetter[8] = {'-', 'd', 'p', 's', 'D', 'P', 'S', 'S'};
++            out += ",L";
++            for (int light = 0; light < 4; ++light) out += kLightLetter[(flags >> (kSpecLightShift + 3 * light)) & 7u];
++        }
+         out += "]";
+     }
+     return out;
+diff --git a/host/gpu/gl/gl_shaders.hpp b/host/gpu/gl/gl_shaders.hpp
+index db92a97..1a7dfd2 100644
+--- a/host/gpu/gl/gl_shaders.hpp
++++ b/host/gpu/gl/gl_shaders.hpp
+@@ -29,6 +29,10 @@ enum ProgramFlag : std::uint32_t {
+     kSpecTextureRgb = 1u << 13,    // a texture with no alpha (texel alpha is 1)
+     kSpecAlphaShift = 14,          // 3 bits: the alpha test's comparison (with kAlphaTest)
+     kSpecBlendShift = 17,          // 3 bits: the blend fix-up (u_blend.x)
++    // With kLight: each light's shape compiled into the lighting code, 3 bits per light (light i at kSpecLightShift + 3i):
++    // 0 off, 1 + type (directional, point, spot) for a plain diffuse light, 4 + type for the other kinds (diffuse and
++    // specular, powered diffuse), whose kind is then still read from u_light_attenuation.w.
++    kSpecLightShift = 20,
+ };
+ 
+ // The uniforms every program may have; a program that lacks one (the compiler
+@@ -67,9 +71,13 @@ enum Uniform : std::uint32_t {
+ [[nodiscard]] std::string vertex_source(std::uint32_t flags);
+ [[nodiscard]] std::string fragment_source(std::uint32_t flags);
+ // `flags` (the low kProgramFlagBits) made into a specialised program for this texture function, texture alpha use,
+-// alpha-less texture, alpha comparison and blend fix-up; the parts that `flags` does not use are left out of the key.
++// alpha-less texture, alpha comparison, blend fix-up and lights; the parts that `flags` does not use are left out of the key.
++// `light_codes`: light_code() of lights 0..3 at bits 0, 3, 6, 9 (used with kLight only).
+ [[nodiscard]] std::uint32_t specialize(std::uint32_t flags, std::uint32_t texture_function, bool texture_alpha,
+-                                       bool texture_rgb, std::uint32_t alpha_function, std::uint32_t blend_fix);
++                                       bool texture_rgb, std::uint32_t alpha_function, std::uint32_t blend_fix,
++                                       std::uint32_t light_codes = 0u);
++// The 3-bit code of one light for kSpecLightShift: `type` 0 directional, 1 point, 2 or 3 spot; `kind` 0 diffuse.
++[[nodiscard]] std::uint32_t light_code(bool enabled, std::uint32_t type, std::uint32_t kind);
+ // A sample of specialised programs that covers every compiled-in choice at least once (for the shader lint).
+ [[nodiscard]] std::vector<std::uint32_t> specialized_lint_flags();
+ // A short name for logs and the readiness note: "through+tex+alpha".

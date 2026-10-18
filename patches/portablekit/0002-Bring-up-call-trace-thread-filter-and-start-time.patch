@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 16:22:59 +0000
+Subject: [PATCH] Bring-up call trace: thread filter and start time
+
+<prefix>_TRACE_THREAD=name keeps one thread's calls; <prefix>_TRACE_FROM_EMU=S
+starts counting at S seconds of emulated time, next to _TRACE_FROM_FLIP.
+A movie's reader thread otherwise uses up the first N calls of the imports
+the main thread is being traced for.
+
+interpreter_account_native(), used by a port that replaces a guest function
+with native code, keeps instruction counts and per-address profiles as they
+were before the replacement.
+
+Verified on x86_64 Linux without a renderer, with one game. Not verified
+elsewhere.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/perf/bringup_stats.cpp b/host/perf/bringup_stats.cpp
+index 6f4e428..d713009 100644
+--- a/host/perf/bringup_stats.cpp
++++ b/host/perf/bringup_stats.cpp
+@@ -114,6 +114,8 @@ struct State {
+     std::vector<std::string> trace_words;
+     std::uint64_t trace_limit{50};
+     std::uint64_t trace_from_flip{};
++    std::string trace_thread;
++    std::uint64_t trace_from_us{};
+     std::unordered_map<std::string, std::uint64_t> trace_seen;
+     std::unordered_map<std::string, std::string> names;
+     psprecomp::Runtime *runtime{};
+@@ -217,7 +219,8 @@ void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint
+         const std::string &name = found->second;
+         for (const std::string &word : s.trace_words) {
+             if (name.find(word) == std::string::npos) continue;
+-            if (s.flip < s.trace_from_flip) break;
++            if (s.flip < s.trace_from_flip || kernel().now_us() < s.trace_from_us) break;
++            if (!s.trace_thread.empty() && s.trace_thread != psprecomp::runtime_thread_name()) break;
+             if (++s.trace_seen[name] > s.trace_limit) break;
+             const psprecomp::AllegrexContext &c = ctx;
+             // File names are what tell a level load from a menu; show them.
+@@ -448,6 +451,8 @@ void install(psprecomp::Runtime &runtime, const gpu::GeState &ge) {
+         }
+         s.trace_words = split(list, ',');
+         s.trace_from_flip = env_number("TRACE_FROM_FLIP");
++        s.trace_from_us = env_number("TRACE_FROM_EMU") * 1'000'000u;
++        if (const char *thread = portablekit::env("TRACE_THREAD"); thread != nullptr) s.trace_thread = thread;
+     }
+     if (s.stats || !s.trace_words.empty() || s.max_frames != 0u || s.max_wall_ms != 0 || s.max_emu_us != 0u) {
+         psprecomp::set_runtime_pre_import_hook(&pre_import);
+diff --git a/host/perf/bringup_stats.hpp b/host/perf/bringup_stats.hpp
+index b06c2a1..8b9ebfb 100644
+--- a/host/perf/bringup_stats.hpp
++++ b/host/perf/bringup_stats.hpp
+@@ -30,7 +30,9 @@
+ //   <prefix>_TRACE_CALLS=word,word:N prints the first N calls to each import whose
+ //                                 `Library::name` contains a word (file names for
+ //                                 sceIoOpen and friends); <prefix>_TRACE_FROM_FLIP=F
+-//                                 starts counting at flip F.
++//                                 (or <prefix>_TRACE_FROM_EMU=S, seconds of emulated
++//                                 time) starts counting at flip F and <prefix>_TRACE_THREAD=name
++//                                 keeps only that thread's calls.
+ //
+ // Files, per phase <p>: frames_<p>.csv (one row per flip), calls_<p>.csv (every
+ // import by calling thread), calls_per_frame_<p>.txt (the imports of each

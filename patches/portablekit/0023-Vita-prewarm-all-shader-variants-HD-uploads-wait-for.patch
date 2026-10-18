@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 06:26:05 +0000
+Subject: [PATCH] Vita: prewarm all shader variants, HD uploads wait for the
+ GXM transfer, scripted overlay shots per opening
+
+- GlRenderer::prewarm_shaders() builds every valid world program (glsl::valid_program_flags(): 32), the fxaa and bicubic post
+  programs and the overlay canvas (PREWARM_SHADERS=1); ge_replay lints the same list.
+- HD textures on the Vita: vitaGL swizzles a compressed level with an asynchronous sceGxmTransferCopy and grows the buffer for the next
+  mip level with a realloc that can move it; the transfer then landed in freed memory and broke the mspace (Vita3K crashed in
+  mspace_malloc a few textures into the game). sceGxmTransferFinish() after every DXT level fixes it. RGBA8 records upload level 0 and
+  let vitaGL build the chain (glGenerateMipmap).
+- GlCanvas::quad renamed put_quad (newlib's sys/types.h defines a macro named quad).
+- HD_TRACE=1 logs every level uploaded; scripted overlay screenshots from the second opening are named <name>_<N>.png.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 7fb34bb..9b3c87d 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -17,6 +17,10 @@
+ #define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+ #endif
+ 
++#if defined(__vita__)
++extern "C" int sceGxmTransferFinish(void);   // libSceGxm: waits for every pending sceGxmTransferCopy
++#endif
++
+ namespace portablekit::gpu {
+ namespace {
+ 
+@@ -182,6 +186,16 @@ bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, co
+         if (record.format != HdFormat::Rgba8 && (width < 4u || height < 4u)) break;
+ #endif
+         const std::uint8_t *data = blob.data() + offset;
++        if (config_.trace) {
++            std::cerr << "[hdtex] upload key " << std::hex << record.key << std::dec << " " << record.width << "x" << record.height << " fmt "
++                      << static_cast<int>(record.format) << " level " << level << " (" << width << "x" << height << ", " << bytes
++                      << " bytes of " << blob.size() << ")" << std::endl;
++        }
++#if defined(__vita__)
++        // vitaGL ignores the data of glTexImage2D above level 0 (it builds the chain itself from level 0): an RGBA8 record is
++        // uploaded as level 0 and the chain is generated once.
++        if (record.format == HdFormat::Rgba8 && level > 0) break;
++#endif
+         if (record.format == HdFormat::Rgba8) {
+             glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA, static_cast<GLsizei>(width),
+                          static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+@@ -198,11 +212,24 @@ bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, co
+                          static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, decode_.data());
+             gpu_bytes += static_cast<std::uint64_t>(width) * height * 4u;
+         }
++#if defined(__vita__)
++        // vitaGL swizzles a compressed level with an asynchronous sceGxmTransferCopy and grows the buffer for the next level with a
++        // realloc that may move (and free) it: wait for the transfer first, or it lands in freed memory.
++        if (record.format != HdFormat::Rgba8) (void)sceGxmTransferFinish();
++#endif
+         offset += bytes;
+         ++uploaded;
+         width = std::max(width / 2u, 1u);
+         height = std::max(height / 2u, 1u);
+     }
++#if defined(__vita__)
++    if (record.format == HdFormat::Rgba8 && record.mip_count > 1u && uploaded != 0u) {
++        glGenerateMipmap(GL_TEXTURE_2D);
++        // The chain vitaGL builds runs down to 1x1; the pack's memory estimate is the pack's own chain.
++        uploaded = record.mip_count;
++        gpu_bytes = hd_chain_bytes(record.format, record.width, record.height, record.mip_count);
++    }
++#endif
+     levels = static_cast<std::uint8_t>(uploaded);
+     return uploaded != 0u;
+ }
+diff --git a/host/gpu/gl/gl_overlay.cpp b/host/gpu/gl/gl_overlay.cpp
+index 6b308b8..da13bec 100644
+--- a/host/gpu/gl/gl_overlay.cpp
++++ b/host/gpu/gl/gl_overlay.cpp
+@@ -165,7 +165,7 @@ void GlCanvas::end() {
+     glEnableVertexAttribArray(1u);
+ }
+ 
+-void GlCanvas::quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, std::uint32_t color) {
++void GlCanvas::put_quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, std::uint32_t color) {
+     if (vertices_.size() + 6u > kMaxVertices) flush_quads();
+     const Vertex a{x0, y0, u0, v0, color}, b{x1, y0, u1, v0, color}, c{x0, y1, u0, v1, color}, d{x1, y1, u1, v1, color};
+     vertices_.push_back(a);
+@@ -182,7 +182,7 @@ void GlCanvas::fill(int x, int y, int w, int h, std::uint32_t color) {
+     const int cell_x = (kWhiteCell % kColumns) * kCellWidth + 3, cell_y = (kWhiteCell / kColumns) * kCellHeight + 3;
+     const float u = (static_cast<float>(cell_x) + 0.5f) / static_cast<float>(kAtlasWidth);
+     const float v = (static_cast<float>(cell_y) + 0.5f) / static_cast<float>(kAtlasHeight);
+-    quad(static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + w), static_cast<float>(y + h), u, v, u, v, color);
++    put_quad(static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + w), static_cast<float>(y + h), u, v, u, v, color);
+ }
+ 
+ void GlCanvas::text(int x, int y, int scale, std::uint32_t color, std::string_view text) {
+@@ -196,7 +196,7 @@ void GlCanvas::text(int x, int y, int scale, std::uint32_t color, std::string_vi
+             const float v0 = static_cast<float>(cell_y) / static_cast<float>(kAtlasHeight);
+             const float u1 = static_cast<float>(cell_x + overlay::kGlyphWidth) / static_cast<float>(kAtlasWidth);
+             const float v1 = static_cast<float>(cell_y + overlay::kGlyphHeight) / static_cast<float>(kAtlasHeight);
+-            quad(static_cast<float>(pen), static_cast<float>(y), static_cast<float>(pen + overlay::kGlyphWidth * scale),
++            put_quad(static_cast<float>(pen), static_cast<float>(y), static_cast<float>(pen + overlay::kGlyphWidth * scale),
+                  static_cast<float>(y + overlay::kGlyphHeight * scale), u0, v0, u1, v1, color);
+         }
+         pen += overlay::kGlyphAdvance * scale;
+diff --git a/host/gpu/gl/gl_overlay.hpp b/host/gpu/gl/gl_overlay.hpp
+index bdf27bb..1a2b31d 100644
+--- a/host/gpu/gl/gl_overlay.hpp
++++ b/host/gpu/gl/gl_overlay.hpp
+@@ -47,7 +47,8 @@ private:
+         float x, y, u, v;
+         std::uint32_t color;
+     };
+-    void quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, std::uint32_t color);
++    // (not "quad": newlib's sys/types.h defines a macro of that name)
++    void put_quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, std::uint32_t color);
+     void flush_quads();
+ 
+     unsigned program_{};
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 9c6baf7..79a17f4 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2334,6 +2334,39 @@ bool GlRenderer::capture_frame(const std::string &path) {
+ std::uint64_t GlRenderer::frames_presented() const noexcept { return impl_->frames; }
+ std::uint64_t GlRenderer::draws_submitted() const noexcept { return impl_->draws; }
+ 
++std::size_t GlRenderer::prewarm_shaders() {
++    Impl &impl = *impl_;
++    if (!impl.ready) return 0;
++    std::size_t built = 0, failed = 0;
++    const auto start = std::chrono::steady_clock::now();
++    for (const std::uint32_t flags : glsl::valid_program_flags()) {
++        if (impl.program_for(flags) != nullptr) ++built;
++        else ++failed;
++    }
++    // The post passes: FXAA and the bicubic enlargement (the multisample resolve is a desktop preview and is not built here).
++    if (impl.ensure_post_program(impl.fxaa_program, impl.fxaa_failed, [] { return glsl::fxaa_fragment_source(); }, "fxaa")) ++built;
++    else ++failed;
++    if (impl.ensure_post_program(impl.bicubic_program, impl.bicubic_failed, [] { return glsl::bicubic_fragment_source(); }, "bicubic")) ++built;
++    else ++failed;
++    // The overlay's own program (the fps counter and the settings menu).
++    if (impl.canvas.ready()) {
++        ++built;
++    } else {
++        std::string error;
++        if (impl.canvas.create(error)) {
++            ++impl.aux_programs;
++            impl.variant_names.push_back("overlay:ui");
++            ++built;
++        } else {
++            std::cerr << "[gl] prewarm: " << error << "\n";
++            ++failed;
++        }
++    }
++    std::cerr << "[gl] prewarm: " << built << " programs ready, " << failed << " failed, "
++              << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() << " ms\n";
++    return built;
++}
++
+ void GlRenderer::flush() {
+     if (impl_->ready) impl_->flush();
+ }
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 5bc273f..ccc9bba 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -210,6 +210,11 @@ public:
+     void reset_frame_stats();
+     // Distinct shader programs compiled so far, and a line naming each.
+     [[nodiscard]] std::size_t shader_variants() const noexcept;
++    // Compiles and links every program the renderer can ask for (the world programs of glsl::valid_program_flags() and the
++    // post passes the options switch on) now instead of at the first draw that needs one. On the Vita this fills vitaGL's
++    // shader cache with every variant (<prefix>_PREWARM_SHADERS=1 once, in the emulator or on the console); a later run
++    // finds them all compiled. Returns the number of programs built (or found already built); failures are logged.
++    std::size_t prewarm_shaders();
+     [[nodiscard]] std::vector<std::string> shader_variant_names() const;
+     [[nodiscard]] std::string gl_description() const;
+     // Texture cache: entries and bytes held.
+diff --git a/host/gpu/gl/gl_shaders.cpp b/host/gpu/gl/gl_shaders.cpp
+index 61828f9..cb11341 100644
+--- a/host/gpu/gl/gl_shaders.cpp
++++ b/host/gpu/gl/gl_shaders.cpp
+@@ -397,6 +397,20 @@ std::string fragment_source(std::uint32_t flags) {
+     return out;
+ }
+ 
++std::vector<std::uint32_t> valid_program_flags() {
++    std::vector<std::uint32_t> out;
++    for (std::uint32_t flags = 0; flags < (1u << kProgramFlagBits); ++flags) {
++        const bool through = (flags & kThrough) != 0u;
++        if (through && (flags & (kLight | kFog | kPixelLight)) != 0u) continue;
++        if (!through && (flags & kRectClamp) != 0u) continue;
++        if ((flags & kRectClamp) != 0u && (flags & kTexture) == 0u) continue;
++        if ((flags & kPixelLight) != 0u && (flags & kLight) == 0u) continue;
++        if ((flags & kSharpen) != 0u && (!through || (flags & kTexture) == 0u || (flags & kRectClamp) == 0u)) continue;
++        out.push_back(flags);
++    }
++    return out;
++}
++
+ std::string describe(std::uint32_t flags) {
+     std::string out = (flags & kThrough) != 0u ? "through" : "transform";
+     if ((flags & kLight) != 0u) out += (flags & kPixelLight) != 0u ? "+light(pixel)" : "+light";
+diff --git a/host/gpu/gl/gl_shaders.hpp b/host/gpu/gl/gl_shaders.hpp
+index 4abfbad..08db916 100644
+--- a/host/gpu/gl/gl_shaders.hpp
++++ b/host/gpu/gl/gl_shaders.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <vector>
+ 
+ // GLSL ES 1.00 sources for the GE's draws. A program is chosen by a handful of
+ // flags (ProgramKey); everything else a draw varies in (texture function, alpha
+@@ -58,6 +59,10 @@ enum Uniform : std::uint32_t {
+ [[nodiscard]] std::string fragment_source(std::uint32_t flags);
+ // A short name for logs and the readiness note: "through+tex+alpha".
+ [[nodiscard]] std::string describe(std::uint32_t flags);
++// Every flag combination the renderer can ask for (the others make no sense: fog or lights on a screen-space draw, a pixel-lit
++// program without lights, the movie sharpener on anything but a clamped textured quad). One list for the shader lint, the
++// pre-warming of the Vita's shader cache and the tests.
++[[nodiscard]] std::vector<std::uint32_t> valid_program_flags();
+ 
+ // A plain textured quad: positions in clip space, one texture, no state of the GE's.
+ [[nodiscard]] std::string blit_vertex_source();
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index 70ff61e..8d1f479 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -345,6 +345,7 @@ HdConfig hd_config_from_environment() {
+     if (hd_pack_present(config.data_root)) port::settings().set_unavailable(port::Key::GfxHdTextures, nullptr);
+     config.mode = hd_textures_setting(config.data_root);
+     config.follow_settings = true;
++    config.trace = env_any("HD_TRACE") != nullptr;
+     if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = std::strtoull(text, nullptr, 10) * 1024ull * 1024ull;
+     if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
+     config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index 147cc2b..c7c4d2e 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -124,6 +124,9 @@ struct HdConfig {
+     // at the setting's generation and switches (every texture is uploaded again). A replayer that names the mode itself
+     // leaves this off.
+     bool follow_settings{false};
++    // <prefix>_HD_TRACE=1: every upload (key, size, format, level) is logged before the driver sees it; a crash in the driver
++    // (an emulator, a console) then names the texture.
++    bool trace{false};
+ };
+ 
+ // THE place gfx.hd_textures is read from: the port settings (host/settings/port_settings.hpp). `auto` (the setting's
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 061bfa8..bb46f7d 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -1611,6 +1611,9 @@ static bool create_gl_renderer() {
+         std::cerr << "Renderer: GLES2 backend unavailable (" << error << "); running headless\n";
+         return false;
+     }
++    // <prefix>_PREWARM_SHADERS=1: every program is built now (on the Vita this fills the shader cache with all variants).
++    if (const char *warm = portablekit::env("PREWARM_SHADERS"); warm != nullptr && *warm != '\0' && *warm != '0')
++        (void)renderer->prewarm_shaders();
+     media().renderer = std::move(renderer);
+     overlay_host::attach(*media().renderer);
+     // While the settings menu holds the guest still the audio device is silenced, and afterwards the frame statistics
+diff --git a/host/overlay/overlay_host.cpp b/host/overlay/overlay_host.cpp
+index 8af7d78..cc46072 100644
+--- a/host/overlay/overlay_host.cpp
++++ b/host/overlay/overlay_host.cpp
+@@ -113,6 +113,8 @@ bool run_modal(gpu::Renderer &renderer, const ModalHost &host) {
+     // A run nobody can close the menu in is closed for it: a scripted run that forgot to, or no input at all.
+     const std::uint64_t frame_limit = scripted ? 3600u : (host.has_device_input ? 0u : kHeadlessFrames);
+ 
++    static std::uint32_t openings = 0;
++    const std::uint32_t opening = ++openings;
+     std::fprintf(stderr, "[menu] open%s%s\n", scripted ? " (scripted)" : "", host.on_renderer_thread ? " (renderer thread)" : "");
+     m.open(device());
+     const auto on_renderer = [&host](const std::function<void()> &job) {
+@@ -132,7 +134,8 @@ bool run_modal(gpu::Renderer &renderer, const ModalHost &host) {
+             if (scripted && shot_dir != nullptr && *shot_dir != '\0') {
+                 const std::string name = script.shot_at(frame);
+                 if (!name.empty()) {
+-                    const std::string path = std::string(shot_dir) + "/" + name + ".png";
++                    // The second and later openings of a run add their number, so a scripted run keeps every capture.
++                    const std::string path = std::string(shot_dir) + "/" + name + (opening > 1u ? "_" + std::to_string(opening) : std::string()) + ".png";
+                     if (renderer.capture_frame(path)) std::fprintf(stderr, "[menu] shot %s\n", path.c_str());
+                     else std::fprintf(stderr, "[menu] cannot write %s\n", path.c_str());
+                 }
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 66144c7..874f896 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -387,15 +387,8 @@ int run_shader_lint(const Options &options) {
+         std::string name, vertex, fragment;
+     };
+     std::vector<Variant> variants;
+-    for (std::uint32_t flags = 0; flags < (1u << glsl::kProgramFlagBits); ++flags) {
+-        const bool through = (flags & glsl::kThrough) != 0u;
+-        if (through && (flags & (glsl::kLight | glsl::kFog | glsl::kPixelLight)) != 0u) continue;
+-        if (!through && (flags & glsl::kRectClamp) != 0u) continue;
+-        if ((flags & glsl::kRectClamp) != 0u && (flags & glsl::kTexture) == 0u) continue;
+-        if ((flags & glsl::kPixelLight) != 0u && (flags & glsl::kLight) == 0u) continue;
+-        if ((flags & glsl::kSharpen) != 0u && (!through || (flags & glsl::kTexture) == 0u || (flags & glsl::kRectClamp) == 0u)) continue;
++    for (const std::uint32_t flags : glsl::valid_program_flags())
+         variants.push_back({glsl::describe(flags), glsl::vertex_source(flags), glsl::fragment_source(flags)});
+-    }
+     const std::size_t world = variants.size();
+     variants.push_back({"post:blit", glsl::blit_vertex_source(), glsl::blit_fragment_source()});
+     variants.push_back({"post:fxaa", glsl::blit_vertex_source(), glsl::fxaa_fragment_source()});

@@ -1,0 +1,576 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 04:30:10 +0000
+Subject: [PATCH] movies: decode one picture ahead on a helper thread, and a
+ NEON YCbCr to RGBA row conversion
+
+open_async(): decode() hands the unit to a thread of its own and returns the previous unit's picture, so the decoder works while the
+caller converts and shows the last one. DecodeThreadPlatform lets a platform supply its own thread and event (the Vita pins it to a
+spare core); <prefix>_MOVIE_ASYNC=0 turns it off. yuv420_row_to_rgba (movie/yuv_convert.hpp) replaces the per-pixel loop with the
+same integer arithmetic, eight pixels at a time with NEON; tests/yuv_convert_tests.cpp compares it with the old loop for every
+(y, cb, cr) in both ranges and random rows of every length. The test is one file, not a CMake target:
+  g++ -O2 -std=c++20 -Ihost -Iinclude tests/yuv_convert_tests.cpp -o yuv_test && ./yuv_test
+
+Verified: on x86-64 the test reports 33,638,225 pixels with 0 mismatching rows (that is the scalar path). Not verified: the NEON
+path, the speed-up and the intro movie on the PS Vita.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/hle/hle_mpeg.cpp b/host/hle/hle_mpeg.cpp
+index e527c85..8e9f64c 100644
+--- a/host/hle/hle_mpeg.cpp
++++ b/host/hle/hle_mpeg.cpp
+@@ -23,6 +23,7 @@
+ #include "movie/avc_decoder.hpp"
+ #include "movie/hd_movie.hpp"
+ #include "movie/psmf_demuxer.hpp"
++#include "movie/yuv_convert.hpp"
+ #include "settings/port_settings.hpp"
+ 
+ #include "psprecomp/common.hpp"
+@@ -394,7 +395,7 @@ void register_library(HleRegistrar &hle) {
+         state->stream_packets = module().pending_stream_packets;
+         memory.store32(mpeg, work + kHandleOffset);
+         if (state->ringbuffer != 0u) memory.store32(state->ringbuffer + ring::kMpeg, mpeg);
+-        if (!state->video.open())
++        if (!state->video.open_async())
+             log_once("mpeg-avc", "[mpeg] the H.264 decoder could not be opened; movies will be black");
+         state->started_us = kernel().now_us();
+         state->started_real = std::chrono::steady_clock::now();
+@@ -574,26 +575,12 @@ void store_picture(psprecomp::GuestMemory &memory, std::uint32_t buffer, const m
+ }
+ 
+ // One row of a YCbCr picture as 8-bit R, G, B, A: BT.601, with limited-range
+-// luma stretched to full range.
++// luma stretched to full range (movie/yuv_convert.hpp, NEON on the Vita).
+ void picture_row_to_rgba(const movie::Picture &picture, std::uint32_t row, std::uint32_t columns, std::uint8_t *out) {
+     const std::uint32_t chroma_width = (picture.width + 1u) / 2u;
+-    for (std::uint32_t column = 0; column < columns; ++column) {
+-        int y = picture.y[static_cast<std::size_t>(row) * picture.width + column];
+-        const std::size_t chroma = static_cast<std::size_t>(row / 2u) * chroma_width + column / 2u;
+-        const int cb = picture.cb[chroma] - 128;
+-        const int cr = picture.cr[chroma] - 128;
+-        int scale = 1 << 16;
+-        if (!picture.full_range) {
+-            y -= 16;
+-            scale = 76309;  // 255/219
+-        }
+-        const int luma = y * scale;
+-        std::uint8_t *pixel = out + static_cast<std::size_t>(column) * 4u;
+-        pixel[0] = static_cast<std::uint8_t>(std::clamp((luma + 91881 * cr) >> 16, 0, 255));
+-        pixel[1] = static_cast<std::uint8_t>(std::clamp((luma - 22554 * cb - 46802 * cr) >> 16, 0, 255));
+-        pixel[2] = static_cast<std::uint8_t>(std::clamp((luma + 116130 * cb) >> 16, 0, 255));
+-        pixel[3] = 0xFFu;
+-    }
++    movie::yuv420_row_to_rgba(picture.y.data() + static_cast<std::size_t>(row) * picture.width,
++                              picture.cb.data() + static_cast<std::size_t>(row / 2u) * chroma_width,
++                              picture.cr.data() + static_cast<std::size_t>(row / 2u) * chroma_width, columns, picture.full_range, out);
+ }
+ 
+ // A decoded picture straight into the game's buffer, as sceMpegAvcDecode
+@@ -602,6 +589,17 @@ void store_pixels(psprecomp::GuestMemory &memory, std::uint32_t buffer, std::uin
+                   const movie::Picture &picture) {
+     const std::uint32_t columns = std::min(stride, picture.width);
+     const std::uint32_t bytes_per_pixel = mode == 3u ? 4u : 2u;
++    const std::size_t row_bytes = static_cast<std::size_t>(stride) * bytes_per_pixel;
++    // 32-bit pixels, the usual case: the rows are converted straight into the guest's memory, no copy in between. The rows past
++    // `columns` of a wider stride are not touched, as before.
++    if (mode == 3u && picture.height != 0u) {
++        const std::size_t span = row_bytes * (picture.height - 1u) + static_cast<std::size_t>(columns) * 4u;
++        if (std::uint8_t *destination = memory.raw_pointer(buffer, span)) {
++            for (std::uint32_t row = 0; row < picture.height; ++row)
++                picture_row_to_rgba(picture, row, columns, destination + row * row_bytes);
++            return;
++        }
++    }
+     std::vector<std::uint8_t> rgba(static_cast<std::size_t>(columns) * 4u);
+     std::vector<std::uint8_t> line(static_cast<std::size_t>(columns) * bytes_per_pixel);
+     for (std::uint32_t row = 0; row < picture.height; ++row) {
+diff --git a/host/movie/avc_decoder.cpp b/host/movie/avc_decoder.cpp
+index 625283f..b42a5b7 100644
+--- a/host/movie/avc_decoder.cpp
++++ b/host/movie/avc_decoder.cpp
+@@ -1,9 +1,16 @@
+ #include "movie/avc_decoder.hpp"
+ 
++#include "../profile.hpp"
+ #include "perf/bench.hpp"
+ #include "perf/phase_timers.hpp"
+ 
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
+ 
+ #if defined(PORTABLEKIT_HAS_FFMPEG)
+ extern "C" {
+@@ -14,6 +21,51 @@ extern "C" {
+ 
+ namespace portablekit::movie {
+ 
++namespace {
++
++// The default thread and event: std::thread and a condition variable.
++struct DefaultEvent {
++    std::mutex mutex;
++    std::condition_variable wake;
++    bool signalled{};
++};
++void *default_event_create() { return new DefaultEvent(); }
++void default_event_destroy(void *event) { delete static_cast<DefaultEvent *>(event); }
++void default_event_wait(void *event, std::uint64_t timeout_us) {
++    auto *e = static_cast<DefaultEvent *>(event);
++    std::unique_lock<std::mutex> lock(e->mutex);
++    if (!e->signalled) e->wake.wait_for(lock, std::chrono::microseconds(timeout_us));
++    e->signalled = false;
++}
++void default_event_signal(void *event) {
++    auto *e = static_cast<DefaultEvent *>(event);
++    {
++        std::lock_guard<std::mutex> lock(e->mutex);
++        e->signalled = true;
++    }
++    e->wake.notify_all();
++}
++struct DefaultThread {
++    std::thread thread;
++};
++void *default_thread_start(void (*fn)(void *), void *arg, const char *, int, std::size_t) {
++    auto *t = new DefaultThread();
++    t->thread = std::thread([fn, arg] { fn(arg); });
++    return t;
++}
++void default_thread_join(void *handle) {
++    auto *t = static_cast<DefaultThread *>(handle);
++    if (t->thread.joinable()) t->thread.join();
++    delete t;
++}
++
++DecodeThreadPlatform g_decode_platform{&default_event_create, &default_event_destroy, &default_event_wait, &default_event_signal,
++                                       &default_thread_start, &default_thread_join, -1};
++
++} // namespace
++
++void set_decode_thread_platform(const DecodeThreadPlatform &platform) noexcept { g_decode_platform = platform; }
++
+ #if defined(PORTABLEKIT_HAS_FFMPEG)
+ 
+ struct AvcDecoder::Impl {
+@@ -22,15 +74,103 @@ struct AvcDecoder::Impl {
+     AVFrame *frame{};
+     bool draining{};
+ 
++    // ---- decode-ahead (open_async). The guest thread owns `job_unit` and `result` while `state` is Idle, the worker while it is
++    // Queued or Running; the release/acquire pairs on `state` hand them over.
++    enum State : int { Idle = 0, Queued = 1, Done = 2 };
++    DecodeThreadPlatform platform{};
++    void *worker{};
++    void *wake{};      // the worker sleeps on this
++    void *done{};      // the guest thread sleeps on this
++    std::atomic<int> state{Idle};
++    std::atomic<bool> quit{false};
++    std::vector<std::uint8_t> job_unit;
++    Picture result;
++    bool result_produced{};
++    bool in_flight{};  // a unit was handed over and its picture not yet taken (guest thread only)
++
+     ~Impl() { close(); }
+ 
++    void stop_worker() {
++        if (worker == nullptr) return;
++        quit.store(true, std::memory_order_release);
++        platform.event_signal(wake);
++        platform.thread_join(worker);
++        worker = nullptr;
++        platform.event_destroy(wake);
++        platform.event_destroy(done);
++        wake = done = nullptr;
++        state.store(Idle, std::memory_order_release);
++        quit.store(false, std::memory_order_release);
++        in_flight = false;
++    }
++
+     void close() {
++        stop_worker();
+         avcodec_free_context(&context);
+         av_packet_free(&packet);
+         av_frame_free(&frame);
+         draining = false;
+     }
+ 
++    // The worker: one unit at a time, in order.
++    static void worker_main(void *self) {
++        Impl &impl = *static_cast<Impl *>(self);
++        while (!impl.quit.load(std::memory_order_acquire)) {
++            if (impl.state.load(std::memory_order_acquire) != Queued) {
++                impl.platform.event_wait(impl.wake, 20'000u);
++                continue;
++            }
++            impl.result_produced = impl.decode_now(impl.job_unit, impl.result);
++            impl.state.store(Done, std::memory_order_release);
++            impl.platform.event_signal(impl.done);
++        }
++    }
++
++    // Starts the thread; false when there is none (the caller keeps decoding in its own thread).
++    bool start_worker() {
++        static const bool disabled = [] {
++            const char *text = portablekit::env("MOVIE_ASYNC");
++            return text != nullptr && std::string(text) == "0";
++        }();
++        if (disabled) return false;
++        platform = g_decode_platform;
++        if (platform.event_create == nullptr || platform.thread_start == nullptr || platform.thread_join == nullptr ||
++            platform.event_wait == nullptr || platform.event_signal == nullptr || platform.event_destroy == nullptr)
++            return false;
++        wake = platform.event_create();
++        done = platform.event_create();
++        state.store(Idle, std::memory_order_release);
++        quit.store(false, std::memory_order_release);
++        worker = platform.thread_start(&Impl::worker_main, this, "movie-decode", platform.core, 256u * 1024u);
++        if (worker == nullptr) {
++            platform.event_destroy(wake);
++            platform.event_destroy(done);
++            wake = done = nullptr;
++            return false;
++        }
++        return true;
++    }
++
++    // Waits (host time) for the unit in flight and takes its picture into `picture`; the result of that unit.
++    bool collect(Picture &picture) {
++        if (!in_flight) return false;
++        while (state.load(std::memory_order_acquire) != Done) platform.event_wait(done, 2'000u);
++        in_flight = false;
++        const bool produced = result_produced;
++        if (produced) std::swap(picture, result);
++        state.store(Idle, std::memory_order_release);
++        return produced;
++    }
++
++    // One unit through the decoder, in the calling thread.
++    bool decode_now(std::span<const std::uint8_t> unit, Picture &picture) {
++        av_packet_unref(packet);
++        if (av_new_packet(packet, static_cast<int>(unit.size())) < 0) return false;
++        std::memcpy(packet->data, unit.data(), unit.size());
++        if (avcodec_send_packet(context, packet) < 0) return false;
++        return take(picture);
++    }
++
+     // Copies the frame FFmpeg holds into `picture`, dropping row padding.
+     bool take(Picture &picture) {
+         if (avcodec_receive_frame(context, frame) < 0) return false;
+@@ -84,6 +224,12 @@ bool AvcDecoder::open() {
+     return true;
+ }
+ 
++bool AvcDecoder::open_async() {
++    if (!open()) return false;
++    (void)impl_->start_worker();   // without a thread the decoder simply stays synchronous
++    return true;
++}
++
+ void AvcDecoder::close() { impl_->close(); }
+ bool AvcDecoder::is_open() const noexcept { return impl_->context != nullptr; }
+ 
+@@ -92,17 +238,21 @@ bool AvcDecoder::decode(std::span<const std::uint8_t> unit, Picture &picture) {
+     Impl &impl = *impl_;
+     if (impl.context == nullptr || unit.empty() || impl.draining) return false;
+     const portablekit::phase::Scope timer(portablekit::phase::Decode);
+-    av_packet_unref(impl.packet);
+-    if (av_new_packet(impl.packet, static_cast<int>(unit.size())) < 0) return false;
+-    std::memcpy(impl.packet->data, unit.data(), unit.size());
+-    if (avcodec_send_packet(impl.context, impl.packet) < 0) return false;
+-    return impl.take(picture);
++    if (impl.worker == nullptr) return impl.decode_now(unit, picture);
++    // Decode-ahead: take the picture of the unit handed over last time (waiting only for what it still needs), then hand this one.
++    const bool produced = impl.collect(picture);
++    impl.job_unit.assign(unit.begin(), unit.end());
++    impl.state.store(Impl::Queued, std::memory_order_release);
++    impl.in_flight = true;
++    impl.platform.event_signal(impl.wake);
++    return produced;
+ }
+ 
+ bool AvcDecoder::drain(Picture &picture) {
+     const bench::Scope bench_scope(bench::MovieDecode);
+     Impl &impl = *impl_;
+     if (impl.context == nullptr) return false;
++    if (impl.worker != nullptr && impl.collect(picture)) return true;   // the unit still in flight comes first
+     if (!impl.draining) {
+         impl.draining = true;
+         avcodec_send_packet(impl.context, nullptr);
+@@ -113,6 +263,10 @@ bool AvcDecoder::drain(Picture &picture) {
+ void AvcDecoder::reset() {
+     Impl &impl = *impl_;
+     if (impl.context == nullptr) return;
++    if (impl.worker != nullptr && impl.in_flight) {   // let the worker finish, then forget what it made
++        Picture discard;
++        impl.collect(discard);
++    }
+     avcodec_flush_buffers(impl.context);
+     impl.draining = false;
+ }
+@@ -126,6 +280,7 @@ AvcDecoder::~AvcDecoder() = default;
+ 
+ bool AvcDecoder::available() noexcept { return false; }
+ bool AvcDecoder::open() { return false; }
++bool AvcDecoder::open_async() { return false; }
+ void AvcDecoder::close() {}
+ bool AvcDecoder::is_open() const noexcept { return false; }
+ bool AvcDecoder::decode(std::span<const std::uint8_t>, Picture &) { return false; }
+diff --git a/host/movie/avc_decoder.hpp b/host/movie/avc_decoder.hpp
+index 296de81..12ac790 100644
+--- a/host/movie/avc_decoder.hpp
++++ b/host/movie/avc_decoder.hpp
+@@ -19,6 +19,20 @@ struct Picture {
+     std::vector<std::uint8_t> cr;
+ };
+ 
++// What the decode-ahead thread needs from the machine, for a platform with its own threads and events (the Vita's: a thread pinned to
++// the idle core with a stack of known size, a kernel event). Without it a std::thread and a condition variable do the same.
++struct DecodeThreadPlatform {
++    void *(*event_create)() = nullptr;                                   // auto-reset event
++    void (*event_destroy)(void *event) = nullptr;
++    void (*event_wait)(void *event, std::uint64_t timeout_us) = nullptr; // returns early once signalled since the last return
++    void (*event_signal)(void *event) = nullptr;
++    // Runs fn(arg) on a new thread pinned to `core` with a stack of `stack_bytes`; returns a handle or nullptr.
++    void *(*thread_start)(void (*fn)(void *), void *arg, const char *name, int core, std::size_t stack_bytes) = nullptr;
++    void (*thread_join)(void *handle) = nullptr;
++    int core = -1;
++};
++void set_decode_thread_platform(const DecodeThreadPlatform &platform) noexcept;
++
+ // H.264 pictures decoded with FFmpeg's libavcodec. Without FFmpeg the class
+ // still exists but open() fails.
+ class AvcDecoder {
+@@ -31,11 +45,15 @@ public:
+     [[nodiscard]] static bool available() noexcept;
+ 
+     bool open();
++    // Decode-ahead: decode() hands the unit to a thread of its own and returns the picture of the PREVIOUS unit (false for the
++    // first call), so the decoder works while the caller converts and shows the last picture. One picture of delay; drain() returns
++    // the one still held at the end. Falls back to open() when no thread can be started; <prefix>_MOVIE_ASYNC=0 turns it off.
++    bool open_async();
+     void close();
+     [[nodiscard]] bool is_open() const noexcept;
+ 
+     // Decodes one access unit (Annex B). Returns true and fills `picture`
+-    // when a picture comes out; the decoder may hold pictures back.
++    // when a picture comes out; the decoder may hold pictures back (in async mode it always holds one).
+     bool decode(std::span<const std::uint8_t> unit, Picture &picture);
+     // Returns a held-back picture at the end of the stream, if any is left.
+     bool drain(Picture &picture);
+diff --git a/host/movie/yuv_convert.hpp b/host/movie/yuv_convert.hpp
+new file mode 100644
+index 0000000..4b620cd
+--- /dev/null
++++ b/host/movie/yuv_convert.hpp
+@@ -0,0 +1,115 @@
++#pragma once
++
++// One row of a planar YCbCr 4:2:0 picture as 8-bit R, G, B, A (BT.601; limited-range luma is stretched to full range), the
++// conversion the movie player runs for every picture it hands to the game. It was a per-pixel loop with three std::clamp and two
++// heap-allocated row buffers: about 16 ms of a 480 x 272 picture on a 444 MHz Cortex-A9, half of the time the intro movie had
++// for a frame. This header is the same arithmetic, in the same integer steps, so the output is bit-identical:
++//   luma = (y - 16) * 76309 (limited) or y * 65536 (full); cb, cr minus 128;
++//   R = clamp((luma + 91881 cr) >> 16), G = clamp((luma - 22554 cb - 46802 cr) >> 16), B = clamp((luma + 116130 cb) >> 16).
++// The scalar form needs one table lookup per term and one chroma sample per two pixels; with NEON eight pixels go at once.
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++
++#if defined(__ARM_NEON) && !defined(PORTABLEKIT_NO_NEON)
++#include <arm_neon.h>
++#define PORTABLEKIT_YUV_NEON 1
++#endif
++
++namespace portablekit::movie {
++
++namespace yuv_detail {
++
++struct Tables {
++    std::int32_t luma_limited[256];
++    std::int32_t luma_full[256];
++    std::int32_t cr_r[256];   // 91881 * (cr - 128)
++    std::int32_t cr_g[256];   // 46802 * (cr - 128)
++    std::int32_t cb_g[256];   // 22554 * (cb - 128)
++    std::int32_t cb_b[256];   // 116130 * (cb - 128)
++    std::uint8_t clip[1024];  // clip[v + 256] = clamp(v, 0, 255) for the shifted sums, which stay inside [-256, 767]
++    Tables() {
++        for (int i = 0; i < 256; ++i) {
++            luma_limited[i] = (i - 16) * 76309;
++            luma_full[i] = i * (1 << 16);
++            cr_r[i] = 91881 * (i - 128);
++            cr_g[i] = 46802 * (i - 128);
++            cb_g[i] = 22554 * (i - 128);
++            cb_b[i] = 116130 * (i - 128);
++        }
++        for (int v = -256; v < 768; ++v) clip[v + 256] = static_cast<std::uint8_t>(std::clamp(v, 0, 255));
++    }
++};
++
++inline const Tables &tables() {
++    static const Tables instance;
++    return instance;
++}
++
++} // namespace yuv_detail
++
++// `columns` pixels of one row. `y` points at the row's luma, `cb` and `cr` at the chroma row it shares (rows 2k and 2k + 1 use the
++// same one). `out` receives columns * 4 bytes: R, G, B, 0xFF.
++inline void yuv420_row_to_rgba(const std::uint8_t *y, const std::uint8_t *cb, const std::uint8_t *cr, std::uint32_t columns,
++                               bool full_range, std::uint8_t *out) {
++    std::uint32_t column = 0;
++#if defined(PORTABLEKIT_YUV_NEON)
++    {
++        const std::int32_t scale = full_range ? (1 << 16) : 76309;
++        const std::int16_t bias = full_range ? 0 : 16;
++        const int16x8_t y_bias = vdupq_n_s16(bias);
++        const int16x8_t c_bias = vdupq_n_s16(128);
++        for (; column + 8u <= columns; column += 8u) {
++            const uint8x8_t y8 = vld1_u8(y + column);
++            // four chroma samples cover eight pixels: duplicate each
++            uint8x8_t cb4 = vdup_n_u8(0), cr4 = vdup_n_u8(0);
++            std::uint32_t cb_word, cr_word;
++            __builtin_memcpy(&cb_word, cb + column / 2u, 4);
++            __builtin_memcpy(&cr_word, cr + column / 2u, 4);
++            cb4 = vreinterpret_u8_u32(vdup_n_u32(cb_word));
++            cr4 = vreinterpret_u8_u32(vdup_n_u32(cr_word));
++            const uint8x8_t cb8 = vzip_u8(cb4, cb4).val[0];
++            const uint8x8_t cr8 = vzip_u8(cr4, cr4).val[0];
++
++            const int16x8_t y16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(y8)), y_bias);
++            const int16x8_t cb16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cb8)), c_bias);
++            const int16x8_t cr16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(cr8)), c_bias);
++
++            const int32x4_t luma_lo = vmulq_n_s32(vmovl_s16(vget_low_s16(y16)), scale);
++            const int32x4_t luma_hi = vmulq_n_s32(vmovl_s16(vget_high_s16(y16)), scale);
++            const int32x4_t cb_lo = vmovl_s16(vget_low_s16(cb16)), cb_hi = vmovl_s16(vget_high_s16(cb16));
++            const int32x4_t cr_lo = vmovl_s16(vget_low_s16(cr16)), cr_hi = vmovl_s16(vget_high_s16(cr16));
++
++            const int32x4_t r_lo = vshrq_n_s32(vmlaq_n_s32(luma_lo, cr_lo, 91881), 16);
++            const int32x4_t r_hi = vshrq_n_s32(vmlaq_n_s32(luma_hi, cr_hi, 91881), 16);
++            const int32x4_t g_lo = vshrq_n_s32(vmlsq_n_s32(vmlsq_n_s32(luma_lo, cb_lo, 22554), cr_lo, 46802), 16);
++            const int32x4_t g_hi = vshrq_n_s32(vmlsq_n_s32(vmlsq_n_s32(luma_hi, cb_hi, 22554), cr_hi, 46802), 16);
++            const int32x4_t b_lo = vshrq_n_s32(vmlaq_n_s32(luma_lo, cb_lo, 116130), 16);
++            const int32x4_t b_hi = vshrq_n_s32(vmlaq_n_s32(luma_hi, cb_hi, 116130), 16);
++
++            // saturating narrows clamp to [0, 255]: signed 32 -> unsigned 16 (negative -> 0), then unsigned 16 -> 8
++            uint8x8x4_t pixels;
++            pixels.val[0] = vqmovn_u16(vcombine_u16(vqmovun_s32(r_lo), vqmovun_s32(r_hi)));
++            pixels.val[1] = vqmovn_u16(vcombine_u16(vqmovun_s32(g_lo), vqmovun_s32(g_hi)));
++            pixels.val[2] = vqmovn_u16(vcombine_u16(vqmovun_s32(b_lo), vqmovun_s32(b_hi)));
++            pixels.val[3] = vdup_n_u8(0xFF);
++            vst4_u8(out + static_cast<std::size_t>(column) * 4u, pixels);
++        }
++    }
++#endif
++    const yuv_detail::Tables &t = yuv_detail::tables();
++    const std::int32_t *luma = full_range ? t.luma_full : t.luma_limited;
++    const std::uint8_t *clip = t.clip + 256;
++    for (; column < columns; ++column) {
++        const std::size_t chroma = column / 2u;
++        const std::int32_t l = luma[y[column]];
++        std::uint8_t *pixel = out + static_cast<std::size_t>(column) * 4u;
++        pixel[0] = clip[(l + t.cr_r[cr[chroma]]) >> 16];
++        pixel[1] = clip[(l - t.cb_g[cb[chroma]] - t.cr_g[cr[chroma]]) >> 16];
++        pixel[2] = clip[(l + t.cb_b[cb[chroma]]) >> 16];
++        pixel[3] = 0xFFu;
++    }
++}
++
++} // namespace portablekit::movie
+diff --git a/tests/yuv_convert_tests.cpp b/tests/yuv_convert_tests.cpp
+new file mode 100644
+index 0000000..47f39ce
+--- /dev/null
++++ b/tests/yuv_convert_tests.cpp
+@@ -0,0 +1,83 @@
++// yuv420_row_to_rgba (host/movie/yuv_convert.hpp) against the per-pixel conversion it replaced, which is repeated here as the
++// reference: every (y, cb, cr) in both ranges, then random rows of every length from 1 to 41 (the scalar tail after the NEON
++// blocks, odd widths, chroma that changes along the row). Exit status 0 only when every byte is identical.
++#include "movie/yuv_convert.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <random>
++#include <vector>
++
++namespace {
++
++// The loop that stood in picture_row_to_rgba: one pixel at a time, std::clamp, a division for the chroma index.
++void reference_row(const std::uint8_t *y_row, const std::uint8_t *cb_row, const std::uint8_t *cr_row, std::uint32_t columns,
++                   bool full_range, std::uint8_t *out) {
++    for (std::uint32_t column = 0; column < columns; ++column) {
++        int y = y_row[column];
++        const std::size_t chroma = column / 2u;
++        const int cb = cb_row[chroma] - 128;
++        const int cr = cr_row[chroma] - 128;
++        int scale = 1 << 16;
++        if (!full_range) {
++            y -= 16;
++            scale = 76309;
++        }
++        const int luma = y * scale;
++        std::uint8_t *pixel = out + static_cast<std::size_t>(column) * 4u;
++        pixel[0] = static_cast<std::uint8_t>(std::clamp((luma + 91881 * cr) >> 16, 0, 255));
++        pixel[1] = static_cast<std::uint8_t>(std::clamp((luma - 22554 * cb - 46802 * cr) >> 16, 0, 255));
++        pixel[2] = static_cast<std::uint8_t>(std::clamp((luma + 116130 * cb) >> 16, 0, 255));
++        pixel[3] = 0xFFu;
++    }
++}
++
++} // namespace
++
++int main() {
++    long checked = 0, bad = 0;
++    // 1. every colour, 256 pixels (a multiple of 8) per row
++    {
++        std::vector<std::uint8_t> y(256), cb(128), cr(128), got(256 * 4), want(256 * 4);
++        for (int i = 0; i < 256; ++i) y[i] = static_cast<std::uint8_t>(i);
++        for (int range = 0; range < 2; ++range)
++            for (int b = 0; b < 256; ++b)
++                for (int r = 0; r < 256; ++r) {
++                    std::fill(cb.begin(), cb.end(), static_cast<std::uint8_t>(b));
++                    std::fill(cr.begin(), cr.end(), static_cast<std::uint8_t>(r));
++                    portablekit::movie::yuv420_row_to_rgba(y.data(), cb.data(), cr.data(), 256, range == 1, got.data());
++                    reference_row(y.data(), cb.data(), cr.data(), 256, range == 1, want.data());
++                    checked += 256;
++                    if (got != want) {
++                        if (bad++ < 5) std::printf("MISMATCH range %d cb %d cr %d\n", range, b, r);
++                    }
++                }
++    }
++    // 2. random rows of every length
++    {
++        std::mt19937 rng(12345);
++        for (int round = 0; round < 4000; ++round) {
++            const std::uint32_t columns = 1u + static_cast<std::uint32_t>(round % 41);
++            const bool full = (round & 1) != 0;
++            std::vector<std::uint8_t> y(columns + 16), cb(columns / 2 + 16), cr(columns / 2 + 16);
++            std::vector<std::uint8_t> got(columns * 4 + 16, 0xEE), want(columns * 4 + 16, 0xEE);
++            for (auto &v : y) v = static_cast<std::uint8_t>(rng());
++            for (auto &v : cb) v = static_cast<std::uint8_t>(rng());
++            for (auto &v : cr) v = static_cast<std::uint8_t>(rng());
++            portablekit::movie::yuv420_row_to_rgba(y.data(), cb.data(), cr.data(), columns, full, got.data());
++            reference_row(y.data(), cb.data(), cr.data(), columns, full, want.data());
++            checked += columns;
++            if (got != want) {   // the guard bytes past the row are compared too: nothing may be written beyond it
++                if (bad++ < 5) std::printf("MISMATCH random row, %u columns, %s\n", columns, full ? "full" : "limited");
++            }
++        }
++    }
++#if defined(PORTABLEKIT_YUV_NEON)
++    const char *path = "NEON blocks of 8 + scalar tail";
++#else
++    const char *path = "scalar tables";
++#endif
++    std::printf("%s: %ld pixels checked, %ld mismatching rows -> %s\n", path, checked, bad, bad == 0 ? "OK" : "FAILED");
++    return bad == 0 ? 0 : 1;
++}

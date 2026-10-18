@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 21:05:37 +0000
+Subject: [PATCH] tools: armprof, ARM instruction counts of the walk and the
+ renderer under QEMU
+
+The profiler that found the work in b2e0cc3..63f2059: a QEMU TCG plugin that
+counts executed instructions per translated block between ge_replay's marker
+functions, a do-nothing GLES2 for the ARM build, the toolchain file (the
+Vita's -mcpu/-mfpu, no stack protector), and scripts that attribute the counts
+to functions, callers and source lines. ge_replay already refers to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/tools/armprof/README.md b/tools/armprof/README.md
+new file mode 100644
+index 0000000..5f0d5fa
+--- /dev/null
++++ b/tools/armprof/README.md
+@@ -0,0 +1,52 @@
++# armprof: ARM instruction counts of the GE walk and the GL renderer
++
++The PS Vita's CPU (a Cortex-A9 at 444 MHz) is where Infected's renderer was bound, and the console has no profiler we
++can attach. This directory measures the same code as an ARM program instead: `ge_replay` built for a Cortex-A9 with the
++Vita's compiler flags, a stub GLES2 that does nothing, run under QEMU's user-mode emulator with a TCG plugin that counts
++the instructions of every translated block, only between two marker functions. The counts are exact and repeatable to
++the instruction, so a change of a few thousand instructions per frame is visible; time on the console follows them at
++roughly 1.5 (walk) to 2 (renderer) cycles an instruction.
++
++`ge_replay` calls `ge_replay_profile_on/off()` around the display-list walk and `ge_replay_profile_submit_on/off()`
++around each `Renderer::submit()`; `run_prof.sh LABEL walk|submit` counts one or the other.
++
++## Setting up (once)
++
++```sh
++# QEMU with plugins (user mode, ARM only)
++git clone --depth 1 -b v8.2.2 https://gitlab.com/qemu-project/qemu.git && cd qemu
++./configure --target-list=arm-linux-user --enable-plugins --disable-system && make -j4    # build/qemu-arm
++
++# the plugin
++gcc -O2 -shared -fPIC $(pkg-config --cflags glib-2.0) -I qemu/include/qemu tbcount.c -o libtbcount.so
++
++# an ARM sysroot with zlib and the stub GL (Ubuntu: gcc-arm-linux-gnueabihf, g++-arm-linux-gnueabihf)
++export ARMPROF_SYSROOT=$PWD/sysroot
++arm-linux-gnueabihf-gcc -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb -I<GLES2/EGL headers> -c stub_gl.c
++arm-linux-gnueabihf-ar rcs $ARMPROF_SYSROOT/lib/libstubgl.a stub_gl.o
++# (zlib: configure with CC=arm-linux-gnueabihf-gcc --static --prefix=$ARMPROF_SYSROOT)
++
++# the ARM ge_replay (static, -O3, the Vita's -mcpu/-mfpu, no stack protector or fortify as VitaSDK has neither)
++cmake -S <PortableKit> -B build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
++      -DPORTABLEKIT_GE_REPLAY=ON -DPORTABLEKIT_GL_RENDERER=ON -DPORTABLEKIT_RENDERER=OFF \
++      -DPORTABLEKIT_GL_INCLUDE_DIR=<GLES2/EGL headers> -DPORTABLEKIT_GL_LIBRARIES=$ARMPROF_SYSROOT/lib/libstubgl.a
++cmake --build build --target ge_replay
++```
++
++## Measuring
++
++```sh
++export ARMPROF_BUILD=$PWD/build QEMU=$PWD/qemu/build/qemu-arm
++./run_prof.sh base submit <dump dir>             # the renderer's own work per frame, by function
++./run_prof.sh base walk <dump dir>               # the walk (with the renderer inline)
++./run_prof.sh prep submit <dump dir> --prepare   # the GL thread's share when the split renderer prepares draws
++./run_calls.sh c1 submit <dump dir> memset __aeabi_uidivmod   # who calls these, per frame
++python3 lines.py build/bin/ge_replay tb_base_submit_r1.out tb_base_submit_r3.out 20 "GlRenderer::Impl::submit(" 40
++```
++
++Each run replays the flips twice (`--repeat 1` and `3`) and reports the difference per frame, so loading the dump and
++first-use costs (program links, texture decodes) cancel out. `lines.py` splits one function's count by source line,
++both by the innermost (inlined) line and by the function's own line it was inlined at.
++
++The plugin is built against QEMU's plugin API header (GPL-2.0-or-later); it is a development tool, not part of what a
++port links.
+diff --git a/tools/armprof/attribute.py b/tools/armprof/attribute.py
+new file mode 100644
+index 0000000..3004629
+--- /dev/null
++++ b/tools/armprof/attribute.py
+@@ -0,0 +1,42 @@
++"""attribute.py BINARY TB_R1 TB_R3 FRAMES: per-frame instruction counts by function, from two tbcount runs (r3 - r1)."""
++import bisect, subprocess, sys
++binary, a_path, b_path, frames = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
++syms = []
++for line in subprocess.run(['arm-linux-gnueabihf-nm', '-C', '--defined-only', '-S', '--numeric-sort', binary], capture_output=True, text=True).stdout.splitlines():
++    parts = line.split(' ', 3)
++    if len(parts) < 4 or parts[2] not in 'tTwW': continue
++    addr = int(parts[0], 16) & ~1; size = int(parts[1], 16)
++    syms.append((addr, size, parts[3]))
++syms.sort()
++starts = [s[0] for s in syms]
++def fn(pc):
++    i = bisect.bisect_right(starts, pc) - 1
++    if i < 0: return '?'
++    a, s, n = syms[i]
++    return n if pc < a + max(s, 2) else '?' + hex(pc)
++def load(path):
++    d = {}
++    for line in open(path):
++        pc, n, e, m = line.split()
++        pc = int(pc, 16); n = int(n); e = int(e); m = int(m)
++        name = fn(pc)
++        ins, mem = d.get(name, (0, 0))
++        d[name] = (ins + n * e, mem + m)
++    return d
++a = load(a_path); b = load(b_path)
++rows = []
++for k, (ins, mem) in b.items():
++    ia, ma = a.get(k, (0, 0))
++    rows.append(((ins - ia) / frames, (mem - ma) / frames, k))
++rows.sort(reverse=True)
++total = sum(r[0] for r in rows)
++print(f'total ARM instructions per frame: {total:,.0f}')
++groups = {}
++for ins, mem, k in rows:
++    pass
++skip = ('inflate', 'adler32', 'gedump::', 'zcalloc', 'zcfree', 'crc32', 'fread', '_IO_', 'uncompress')
++kept = [r for r in rows if not any(s in r[2] for s in skip)]
++ktotal = sum(r[0] for r in kept)
++print(f'excluding dump loading: {ktotal:,.0f} instructions, {sum(r[1] for r in kept):,.0f} memory accesses per frame')
++for ins, mem, k in kept[:60]:
++    print(f'{ins:12,.0f} {mem:11,.0f} {100*ins/ktotal:5.1f}%  {k[:140]}')
+diff --git a/tools/armprof/callers.py b/tools/armprof/callers.py
+new file mode 100644
+index 0000000..a2f202b
+--- /dev/null
++++ b/tools/armprof/callers.py
+@@ -0,0 +1,21 @@
++"""callers.py BINARY CALLS_R1 CALLS_R3 [FRAMES]: per frame, which function called each watched function (tbcount watch=)."""
++import bisect, subprocess, sys
++binary=sys.argv[1]
++syms=[]
++for line in subprocess.run(['arm-linux-gnueabihf-nm','-C','--defined-only','-S','--numeric-sort',binary],capture_output=True,text=True).stdout.splitlines():
++    p=line.split(' ',3)
++    if len(p)<4 or p[2] not in 'tTwW': continue
++    syms.append((int(p[0],16)&~1,int(p[1],16),p[3]))
++syms.sort(); starts=[s[0] for s in syms]
++def fn(pc):
++    i=bisect.bisect_right(starts,pc)-1
++    return syms[i][2] if i>=0 and pc<syms[i][0]+max(syms[i][1],2) else hex(pc)
++def load(p):
++    d={}
++    for line in open(p):
++        e,c,n=line.split(); key=(fn(int(e,16)),fn(int(c,16))); d[key]=d.get(key,0)+int(n)
++    return d
++a=load(sys.argv[2]); b=load(sys.argv[3])
++frames=float(sys.argv[4]) if len(sys.argv)>4 else 20.0
++rows=sorted(((b[k]-a.get(k,0))/frames,k) for k in b); rows.reverse()
++for v,(e,c) in rows[:30]: print(f'{v:9.0f}  {e[:20]:20s} <- {c[:120]}')
+diff --git a/tools/armprof/lines.py b/tools/armprof/lines.py
+new file mode 100644
+index 0000000..80ca39f
+--- /dev/null
++++ b/tools/armprof/lines.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""lines.py BINARY TB_R1 TB_R3 FRAMES FUNC_SUBSTRING [N]: per-source-line ARM instruction counts per frame inside one
++function (by every instruction of every translated block, so inlined code is counted on its own line), innermost line
++and the line of the function itself it was inlined at."""
++import bisect, collections, re, subprocess, sys
++
++binary, a_path, b_path, frames, want = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5]
++top = int(sys.argv[6]) if len(sys.argv) > 6 else 40
++
++syms = []
++for line in subprocess.run(['arm-linux-gnueabihf-nm', '-C', '--defined-only', '-S', '--numeric-sort', binary],
++                           capture_output=True, text=True).stdout.splitlines():
++    parts = line.split(' ', 3)
++    if len(parts) < 4 or parts[2] not in 'tTwW':
++        continue
++    syms.append((int(parts[0], 16) & ~1, int(parts[1], 16), parts[3]))
++targets = [s for s in syms if want in s[2]]
++if not targets:
++    sys.exit('no function matches ' + want)
++start, size, name = max(targets, key=lambda s: s[1])
++print('function:', name[:150], hex(start), size)
++
++dis = subprocess.run(['arm-linux-gnueabihf-objdump', '-d', '--no-show-raw-insn', f'--start-address={start:#x}',
++                      f'--stop-address={start + size:#x}', binary], capture_output=True, text=True).stdout
++insns = [int(m.group(1), 16) for m in re.finditer(r'^\s*([0-9a-f]+):\s', dis, re.M)]
++index = {a: i for i, a in enumerate(insns)}
++
++
++def load(path):
++    d = collections.Counter()
++    for line in open(path):
++        pc, n, e, _ = line.split()
++        pc = int(pc, 16) & ~1
++        if pc in index:
++            d[(pc, int(n))] += int(e)
++    return d
++
++
++a, b = load(a_path), load(b_path)
++per_insn = collections.Counter()
++for key, execs in b.items():
++    pc, n = key
++    delta = execs - a.get(key, 0)
++    if delta <= 0:
++        continue
++    i = index[pc]
++    for addr in insns[i:i + n]:
++        per_insn[addr] += delta
++
++addrs = sorted(per_insn)
++chains = {}
++batch = 400
++for k in range(0, len(addrs), batch):
++    chunk = addrs[k:k + batch]
++    args = []
++    for x in chunk:
++        args += [hex(x), '0x0']
++    res = subprocess.run(['arm-linux-gnueabihf-addr2line', '-i', '-f', '-C', '-e', binary] + args,
++                         capture_output=True, text=True).stdout.splitlines()
++    pairs = [(res[j], res[j + 1]) for j in range(0, len(res) - 1, 2)]
++    cur, idx = [], 0
++    for fn, loc in pairs:
++        if loc.startswith('??') and fn == '??' and cur:
++            chains[chunk[idx]] = cur
++            cur, idx = [], idx + 1
++            continue
++        if fn == '??' and not cur:
++            continue
++        cur.append((fn, loc.split(' ')[0].split('/')[-1]))
++    if cur and idx < len(chunk):
++        chains[chunk[idx]] = cur
++
++inner, outer = collections.Counter(), collections.Counter()
++total = 0
++for addr, n in per_insn.items():
++    total += n
++    chain = chains.get(addr, [('?', '?')])
++    inner[f'{chain[0][1]}  [{chain[0][0][:60]}]'] += n
++    outer[chain[-1][1]] += n
++print(f'total {total / frames:,.0f} instructions per frame')
++print('-- by the line of the function itself (inlined calls folded in):')
++for k, n in outer.most_common(top):
++    print(f'{n / frames:12,.0f}  {k}')
++print('-- by innermost line:')
++for k, n in inner.most_common(top):
++    print(f'{n / frames:12,.0f}  {k}')
+diff --git a/tools/armprof/run_calls.sh b/tools/armprof/run_calls.sh
+new file mode 100755
+index 0000000..f514280
+--- /dev/null
++++ b/tools/armprof/run_calls.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++# run_calls.sh LABEL walk|submit DUMP_DIR FUNCTION... : who calls each named function (by its symbol), per frame.
++set -u
++here=$(cd "$(dirname "$0")" && pwd)
++label=$1; which=$2; dumps=$3; shift 3
++B=${ARMPROF_BUILD:?set ARMPROF_BUILD}/bin/ge_replay
++QEMU=${QEMU:-qemu-arm}; PLUGIN=${PLUGIN:-$here/libtbcount.so}; FLIPS=${FLIPS:-4201-4210}
++addr() { arm-linux-gnueabihf-nm "$B" | awk -v n="$1" '$3==n{print $1; exit}'; }
++case $which in
++  walk) ON=$(addr ge_replay_profile_on); OFF=$(addr ge_replay_profile_off);;
++  submit) ON=$(addr ge_replay_profile_submit_on); OFF=$(addr ge_replay_profile_submit_off);;
++esac
++W=""
++for f in "$@"; do a=$(addr "$f"); [ -n "$a" ] && W="$W${W:+:}$a" || echo "no symbol $f"; done
++n=$(echo "$FLIPS" | awk -F- '{print $2-$1+1}')
++for r in 1 3; do
++  "$QEMU" -plugin "$PLUGIN,out=tbc_${label}_r$r.out,on=$ON,off=$OFF,watch=$W" "$B" "$dumps" --flips "$FLIPS" --repeat $r --scale 2 \
++    > /dev/null 2>&1 || echo "run failed r$r"
++done
++python3 "$here/callers.py" "$B" "tbc_${label}_r1.out.calls" "tbc_${label}_r3.out.calls" $((2 * n))
+diff --git a/tools/armprof/run_prof.sh b/tools/armprof/run_prof.sh
+new file mode 100755
+index 0000000..8d87bd6
+--- /dev/null
++++ b/tools/armprof/run_prof.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++# run_prof.sh LABEL walk|submit DUMP_DIR [extra ge_replay args]
++# Per-frame ARM instruction counts by function, between ge_replay's profile markers: `walk` around the list walk (which
++# includes the renderer's submit() when it runs inline), `submit` around Renderer::submit only. Runs the flips twice
++# (--repeat 1 and 3) and takes the difference, so loading the dump and first-use work cancel out; prints per frame.
++# Environment: QEMU (qemu-arm built with --enable-plugins), ARMPROF_BUILD (the ARM build directory), PLUGIN (libtbcount.so),
++# FLIPS (default 4201-4210).
++set -u
++here=$(cd "$(dirname "$0")" && pwd)
++label=$1; which=$2; dumps=$3; shift 3
++B=${ARMPROF_BUILD:?set ARMPROF_BUILD}/bin/ge_replay
++QEMU=${QEMU:-qemu-arm}; PLUGIN=${PLUGIN:-$here/libtbcount.so}; FLIPS=${FLIPS:-4201-4210}
++addr() { arm-linux-gnueabihf-nm "$B" | awk -v n="$1" '$3==n{print $1; exit}'; }
++case $which in
++  walk) ON=$(addr ge_replay_profile_on); OFF=$(addr ge_replay_profile_off);;
++  submit) ON=$(addr ge_replay_profile_submit_on); OFF=$(addr ge_replay_profile_submit_off);;
++  *) echo "walk or submit"; exit 2;;
++esac
++n=$(echo "$FLIPS" | awk -F- '{print $2-$1+1}')
++for r in 1 3; do
++  "$QEMU" -plugin "$PLUGIN,out=tb_${label}_r$r.out,on=$ON,off=$OFF" "$B" "$dumps" --flips "$FLIPS" --repeat $r --scale 2 "$@" \
++    > "run_${label}_r$r.log" 2>&1 || echo "run failed r$r"
++done
++python3 "$here/attribute.py" "$B" "tb_${label}_r1.out" "tb_${label}_r3.out" $((2 * n)) | tail -n +2 > "prof_${label}.txt"
++head -40 "prof_${label}.txt"
+diff --git a/tools/armprof/stub_gl.c b/tools/armprof/stub_gl.c
+new file mode 100644
+index 0000000..52bb7db
+--- /dev/null
++++ b/tools/armprof/stub_gl.c
+@@ -0,0 +1,104 @@
++// A do-nothing EGL + GLES2 for counting the renderer's own instructions on ARM under QEMU.
++#include <EGL/egl.h>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
++#include <string.h>
++
++static GLuint next_name = 1;
++static GLint next_location = 0;
++
++EGLBoolean eglBindAPI(EGLenum api) { (void)api; return EGL_TRUE; }
++EGLBoolean eglChooseConfig(EGLDisplay d, const EGLint *a, EGLConfig *c, EGLint n, EGLint *num) {
++    (void)d; (void)a; (void)n; if (c) c[0] = (EGLConfig)1; if (num) *num = 1; return EGL_TRUE;
++}
++EGLContext eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext s, const EGLint *a) { (void)d; (void)c; (void)s; (void)a; return (EGLContext)1; }
++EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *a) { (void)d; (void)c; (void)a; return (EGLSurface)1; }
++EGLBoolean eglDestroyContext(EGLDisplay d, EGLContext c) { (void)d; (void)c; return EGL_TRUE; }
++EGLBoolean eglDestroySurface(EGLDisplay d, EGLSurface s) { (void)d; (void)s; return EGL_TRUE; }
++EGLDisplay eglGetDisplay(EGLNativeDisplayType n) { (void)n; return (EGLDisplay)1; }
++__eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) { (void)name; return 0; }
++EGLBoolean eglInitialize(EGLDisplay d, EGLint *maj, EGLint *min) { (void)d; if (maj) *maj = 1; if (min) *min = 4; return EGL_TRUE; }
++EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface a, EGLSurface b, EGLContext c) { (void)d; (void)a; (void)b; (void)c; return EGL_TRUE; }
++const char *eglQueryString(EGLDisplay d, EGLint n) { (void)d; (void)n; return ""; }
++EGLBoolean eglTerminate(EGLDisplay d) { (void)d; return EGL_TRUE; }
++
++void glActiveTexture(GLenum t) { (void)t; }
++void glAttachShader(GLuint p, GLuint s) { (void)p; (void)s; }
++void glBindAttribLocation(GLuint p, GLuint i, const GLchar *n) { (void)p; (void)i; (void)n; }
++void glBindFramebuffer(GLenum t, GLuint f) { (void)t; (void)f; }
++void glBindRenderbuffer(GLenum t, GLuint r) { (void)t; (void)r; }
++void glBindTexture(GLenum t, GLuint x) { (void)t; (void)x; }
++void glBlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { (void)r; (void)g; (void)b; (void)a; }
++void glBlendEquationSeparate(GLenum a, GLenum b) { (void)a; (void)b; }
++void glBlendFuncSeparate(GLenum a, GLenum b, GLenum c, GLenum d) { (void)a; (void)b; (void)c; (void)d; }
++GLenum glCheckFramebufferStatus(GLenum t) { (void)t; return GL_FRAMEBUFFER_COMPLETE; }
++void glClear(GLbitfield m) { (void)m; }
++void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { (void)r; (void)g; (void)b; (void)a; }
++void glClearDepthf(GLfloat d) { (void)d; }
++void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { (void)r; (void)g; (void)b; (void)a; }
++void glCompileShader(GLuint s) { (void)s; }
++void glCompressedTexImage2D(GLenum t, GLint l, GLenum f, GLsizei w, GLsizei h, GLint b, GLsizei s, const void *d) {
++    (void)t; (void)l; (void)f; (void)w; (void)h; (void)b; (void)s; (void)d;
++}
++void glCopyTexSubImage2D(GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h) {
++    (void)t; (void)l; (void)xo; (void)yo; (void)x; (void)y; (void)w; (void)h;
++}
++GLuint glCreateProgram(void) { return next_name++; }
++GLuint glCreateShader(GLenum t) { (void)t; return next_name++; }
++void glCullFace(GLenum m) { (void)m; }
++void glDeleteProgram(GLuint p) { (void)p; }
++void glDeleteShader(GLuint s) { (void)s; }
++void glDeleteTextures(GLsizei n, const GLuint *t) { (void)n; (void)t; }
++void glDepthFunc(GLenum f) { (void)f; }
++void glDepthMask(GLboolean f) { (void)f; }
++void glDepthRangef(GLfloat n, GLfloat f) { (void)n; (void)f; }
++void glDisable(GLenum c) { (void)c; }
++void glDisableVertexAttribArray(GLuint i) { (void)i; }
++void glDrawArrays(GLenum m, GLint f, GLsizei c) { (void)m; (void)f; (void)c; }
++void glDrawElements(GLenum m, GLsizei c, GLenum t, const void *i) { (void)m; (void)c; (void)t; (void)i; }
++void glEnable(GLenum c) { (void)c; }
++void glEnableVertexAttribArray(GLuint i) { (void)i; }
++void glFinish(void) {}
++void glFramebufferRenderbuffer(GLenum t, GLenum a, GLenum rt, GLuint r) { (void)t; (void)a; (void)rt; (void)r; }
++void glFramebufferTexture2D(GLenum t, GLenum a, GLenum tt, GLuint x, GLint l) { (void)t; (void)a; (void)tt; (void)x; (void)l; }
++void glFrontFace(GLenum m) { (void)m; }
++void glGenFramebuffers(GLsizei n, GLuint *f) { for (GLsizei i = 0; i < n; ++i) f[i] = next_name++; }
++void glGenRenderbuffers(GLsizei n, GLuint *r) { for (GLsizei i = 0; i < n; ++i) r[i] = next_name++; }
++void glGenTextures(GLsizei n, GLuint *t) { for (GLsizei i = 0; i < n; ++i) t[i] = next_name++; }
++void glGenerateMipmap(GLenum t) { (void)t; }
++GLenum glGetError(void) { return GL_NO_ERROR; }
++void glGetIntegerv(GLenum p, GLint *d) { (void)p; if (d) *d = 4096; }
++void glGetProgramInfoLog(GLuint p, GLsizei b, GLsizei *l, GLchar *i) { (void)p; (void)b; if (l) *l = 0; if (i && b > 0) i[0] = 0; }
++void glGetProgramiv(GLuint p, GLenum n, GLint *v) { (void)p; (void)n; if (v) *v = GL_TRUE; }
++void glGetShaderInfoLog(GLuint s, GLsizei b, GLsizei *l, GLchar *i) { (void)s; (void)b; if (l) *l = 0; if (i && b > 0) i[0] = 0; }
++void glGetShaderiv(GLuint s, GLenum n, GLint *v) { (void)s; (void)n; if (v) *v = GL_TRUE; }
++const GLubyte *glGetString(GLenum n) {
++    (void)n; return (const GLubyte *)"OpenGL ES 2.0 stub GL_EXT_texture_compression_s3tc GL_OES_depth24 GL_EXT_blend_minmax";
++}
++GLint glGetUniformLocation(GLuint p, const GLchar *n) { (void)p; (void)n; return next_location++; }
++void glLinkProgram(GLuint p) { (void)p; }
++void glPixelStorei(GLenum p, GLint v) { (void)p; (void)v; }
++void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t, void *d) {
++    (void)x; (void)y; (void)f; (void)t; if (d) memset(d, 0, (size_t)w * (size_t)h * 4u);
++}
++void glRenderbufferStorage(GLenum t, GLenum f, GLsizei w, GLsizei h) { (void)t; (void)f; (void)w; (void)h; }
++void glScissor(GLint x, GLint y, GLsizei w, GLsizei h) { (void)x; (void)y; (void)w; (void)h; }
++void glShaderSource(GLuint s, GLsizei c, const GLchar *const *str, const GLint *l) { (void)s; (void)c; (void)str; (void)l; }
++void glTexImage2D(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *p) {
++    (void)t; (void)l; (void)i; (void)w; (void)h; (void)b; (void)f; (void)ty; (void)p;
++}
++void glTexParameteri(GLenum t, GLenum p, GLint v) { (void)t; (void)p; (void)v; }
++void glTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *p) {
++    (void)t; (void)l; (void)x; (void)y; (void)w; (void)h; (void)f; (void)ty; (void)p;
++}
++void glUniform1i(GLint l, GLint v) { (void)l; (void)v; }
++void glUniform2fv(GLint l, GLsizei c, const GLfloat *v) { (void)l; (void)c; (void)v; }
++void glUniform4fv(GLint l, GLsizei c, const GLfloat *v) { (void)l; (void)c; (void)v; }
++void glUniformMatrix4fv(GLint l, GLsizei c, GLboolean t, const GLfloat *v) { (void)l; (void)c; (void)t; (void)v; }
++void glUseProgram(GLuint p) { (void)p; }
++void glVertexAttribPointer(GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void *p) {
++    (void)i; (void)s; (void)t; (void)n; (void)st; (void)p;
++}
++void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) { (void)x; (void)y; (void)w; (void)h; }
++void glBindBuffer(GLenum t, GLuint b) { (void)t; (void)b; }
++void glGenBuffers(GLsizei n, GLuint *b) { for (GLsizei i = 0; i < n; ++i) b[i] = next_name++; }
+diff --git a/tools/armprof/tbcount.c b/tools/armprof/tbcount.c
+new file mode 100644
+index 0000000..c002e75
+--- /dev/null
++++ b/tools/armprof/tbcount.c
+@@ -0,0 +1,110 @@
++// tbcount: a QEMU TCG plugin that counts executed guest instructions per translation block, only while the program is
++// between calls of two marker functions (on=ADDR, off=ADDR: their entry addresses, from nm). Writes "pc insns execs" lines.
++#include <glib.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <qemu-plugin.h>
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++typedef struct {
++    uint64_t pc;
++    uint64_t insns;
++    uint64_t execs;
++} Block;
++
++static GHashTable *blocks;
++static GMutex lock;
++static const char *out_path = "tbcount.out";
++static uint64_t on_addr = 1, off_addr = 1;   // 1: never a block address (thumb bit cleared below)
++static volatile int active;                  // 0 until the on marker runs when markers are given
++// watch=ADDR:ADDR:...: functions whose callers are counted (the block that ran just before each call's entry block).
++static uint64_t watched[16];
++static int watched_count;
++static uint64_t last_pc;
++static GHashTable *calls;   // (entry << 32 | caller pc) -> count
++
++static void exec_on(unsigned int cpu, void *udata) { active = 1; }
++static void exec_off(unsigned int cpu, void *udata) { active = 0; }
++static void exec_block(unsigned int cpu, void *udata) {
++    Block *b = udata;
++    if (active) b->execs++;
++    last_pc = b->pc;
++}
++static void exec_watched(unsigned int cpu, void *udata) {
++    if (!active) return;
++    uint64_t key = ((uint64_t)(uintptr_t)udata << 32) | (last_pc & 0xFFFFFFFFull);
++    uint64_t *count = g_hash_table_lookup(calls, &key);
++    if (count == NULL) {
++        uint64_t *k = g_new(uint64_t, 1);
++        *k = key;
++        count = g_new0(uint64_t, 1);
++        g_hash_table_insert(calls, k, count);
++    }
++    ++*count;
++}
++
++static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
++    uint64_t pc = qemu_plugin_tb_vaddr(tb);
++    size_t n = qemu_plugin_tb_n_insns(tb);
++    if (pc == on_addr) qemu_plugin_register_vcpu_tb_exec_cb(tb, exec_on, QEMU_PLUGIN_CB_NO_REGS, NULL);
++    if (pc == off_addr) qemu_plugin_register_vcpu_tb_exec_cb(tb, exec_off, QEMU_PLUGIN_CB_NO_REGS, NULL);
++    for (int i = 0; i < watched_count; ++i)
++        if (pc == watched[i]) qemu_plugin_register_vcpu_tb_exec_cb(tb, exec_watched, QEMU_PLUGIN_CB_NO_REGS, (void *)(uintptr_t)pc);
++    uint64_t key = pc ^ ((uint64_t)n << 52);
++    g_mutex_lock(&lock);
++    Block *b = g_hash_table_lookup(blocks, &key);
++    if (b == NULL) {
++        b = g_new0(Block, 1);
++        b->pc = pc;
++        b->insns = n;
++        uint64_t *k = g_new(uint64_t, 1);
++        *k = key;
++        g_hash_table_insert(blocks, k, b);
++    }
++    g_mutex_unlock(&lock);
++    qemu_plugin_register_vcpu_tb_exec_cb(tb, exec_block, QEMU_PLUGIN_CB_NO_REGS, b);
++}
++
++static void plugin_exit(qemu_plugin_id_t id, void *p) {
++    FILE *f = fopen(out_path, "w");
++    if (f == NULL) return;
++    GHashTableIter it;
++    gpointer k, v;
++    g_hash_table_iter_init(&it, blocks);
++    while (g_hash_table_iter_next(&it, &k, &v)) {
++        Block *b = v;
++        if (b->execs) fprintf(f, "%llx %llu %llu 0\n", (unsigned long long)b->pc, (unsigned long long)b->insns,
++                              (unsigned long long)b->execs);
++    }
++    fclose(f);
++    if (watched_count == 0) return;
++    char path[512];
++    snprintf(path, sizeof path, "%s.calls", out_path);
++    f = fopen(path, "w");
++    if (f == NULL) return;
++    g_hash_table_iter_init(&it, calls);
++    while (g_hash_table_iter_next(&it, &k, &v))
++        fprintf(f, "%llx %llx %llu\n", (unsigned long long)(*(uint64_t *)k >> 32), (unsigned long long)(*(uint64_t *)k & 0xFFFFFFFFull),
++                (unsigned long long)*(uint64_t *)v);
++    fclose(f);
++}
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc, char **argv) {
++    active = 1;
++    for (int i = 0; i < argc; ++i) {
++        if (g_str_has_prefix(argv[i], "out=")) out_path = g_strdup(argv[i] + 4);
++        if (g_str_has_prefix(argv[i], "on=")) { on_addr = strtoull(argv[i] + 3, NULL, 16) & ~1ull; active = 0; }
++        if (g_str_has_prefix(argv[i], "off=")) off_addr = strtoull(argv[i] + 4, NULL, 16) & ~1ull;
++        if (g_str_has_prefix(argv[i], "watch=")) {
++            gchar **parts = g_strsplit(argv[i] + 6, ":", 16);
++            for (int j = 0; parts[j] != NULL && watched_count < 16; ++j) watched[watched_count++] = strtoull(parts[j], NULL, 16) & ~1ull;
++            g_strfreev(parts);
++        }
++    }
++    blocks = g_hash_table_new(g_int64_hash, g_int64_equal);
++    calls = g_hash_table_new(g_int64_hash, g_int64_equal);
++    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
++    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
++    return 0;
++}
+diff --git a/tools/armprof/toolchain.cmake b/tools/armprof/toolchain.cmake
+new file mode 100644
+index 0000000..17caecf
+--- /dev/null
++++ b/tools/armprof/toolchain.cmake
+@@ -0,0 +1,12 @@
++set(CMAKE_SYSTEM_NAME Linux)
++set(CMAKE_SYSTEM_PROCESSOR arm)
++set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
++set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
++set(ARCH "-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb")
++set(CMAKE_C_FLAGS_INIT "${ARCH} -g -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0")
++set(CMAKE_CXX_FLAGS_INIT "${ARCH} -g -fno-math-errno -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0")
++set(CMAKE_FIND_ROOT_PATH /usr/arm-linux-gnueabihf $ENV{ARMPROF_SYSROOT})
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")

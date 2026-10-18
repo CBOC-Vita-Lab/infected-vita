@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 09:16:17 +0000
+Subject: [PATCH] Merge gameplay-tuning framework commits (profile frame_hook,
+ interpreter watch, ge_replay --zstats) into all
+
+Brings in:
+* Profile frame_hook (once per guest flip); write watch reports the interpreter pc, ra, sp and a stack trace
+* Interpreter watch: float regs and optional stack trace (PSPRECOMP_INTERPRETER_WATCH_STACK)
+* ge_replay --zstats: view-space z range per transformed draw
+
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 2f8b660..5ad569d 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -947,6 +947,7 @@ void register_display_ctrl(HleRegistrar &hle) {
+         present_frame(rt);
+ #endif
+         bringup::on_flip(rt, media().display.framebuffer, media().display.pixel_format);
++        if (portablekit::game().frame_hook != nullptr) portablekit::game().frame_hook(rt, bringup::flip_count());
+ #if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
+         // At most kFramesInFlight flips are ahead of the GE thread: the guest waits (in host time, the kernel keeps
+         // running) for the oldest one, which paces the game by the renderer when the renderer is the slower side.
+diff --git a/host/profile.hpp b/host/profile.hpp
+index 09322ed..ef5dec6 100644
+--- a/host/profile.hpp
++++ b/host/profile.hpp
+@@ -238,6 +238,10 @@ struct GameProfile {
+     // Called once the executable is in memory and before it runs, for the
+     // per-game patches that have no better home. Null means there are none.
+     void (*patch_loaded_image)(psprecomp::Runtime &, const psprecomp::Elf32Image &) = nullptr;
++    // Called once per game frame from sceDisplaySetFrameBuf (the guest's flip), on the guest thread that flipped, after the
++    // frame has been presented and before the guest runs on: a place to apply settings that change while the game runs
++    // (poke guest memory) and to sample guest state. `flip` counts the guest's flips (1 for the first). Null: none.
++    void (*frame_hook)(psprecomp::Runtime &, std::uint64_t flip) = nullptr;
+ 
+     // --- The game's camera and view ----------------------------------------
+     // Drives the game's own camera from what the player asks of it
+diff --git a/src/guest_memory.cpp b/src/guest_memory.cpp
+index 20001d7..6b15d44 100644
+--- a/src/guest_memory.cpp
++++ b/src/guest_memory.cpp
+@@ -27,6 +27,7 @@ namespace psprecomp {
+ std::int32_t runtime_thread_uid() noexcept;
+ const char *runtime_thread_name() noexcept;
+ std::uint32_t runtime_dispatch_pc() noexcept;
++void runtime_watch_context(std::uint32_t &pc, std::uint32_t &ra, std::uint32_t &sp) noexcept;
+ 
+ namespace {
+ struct WriteWatch {
+@@ -67,17 +68,41 @@ bool overlaps_watch(std::uint32_t address, std::size_t length) {
+            static_cast<std::uint64_t>(canonical_watch) < first_end;
+ }
+ 
++const GuestMemory *g_watch_memory = nullptr;
++
++// Words on the guest stack that look like return addresses (the instruction two before is a jal/jalr into the code range).
++void print_stack_trace(std::uint32_t sp) {
++    if (g_watch_memory == nullptr) return;
++    std::cerr << "    stack:";
++    int printed = 0;
++    for (std::uint32_t off = 0; off < 0x600u && printed < 12; off += 4u) {
++        const std::uint32_t at = sp + off;
++        if (!g_watch_memory->contains(at, 4u)) break;
++        const std::uint32_t w = g_watch_memory->load32(at);
++        if (w < 0x08804000u || w >= 0x08B00000u || (w & 3u) != 0u || !g_watch_memory->contains(w - 8u, 4u)) continue;
++        const std::uint32_t insn = g_watch_memory->load32(w - 8u);
++        if ((insn >> 26) == 3u || (insn & 0xFC1FFFFFu) == 0x0000F809u) {
++            std::cerr << " " << hex32(w) << "(sp+0x" << std::hex << off << std::dec << ")";
++            ++printed;
++        }
++    }
++    std::cerr << "\n";
++}
++
+ void log_write_watch(std::uint32_t address, std::size_t length, const char *operation,
+                      std::uint64_t old_value, std::uint64_t new_value) {
+     if (!overlaps_watch(address, length)) return;
++    std::uint32_t cur_pc = 0u, cur_ra = 0u, cur_sp = 0u;
++    runtime_watch_context(cur_pc, cur_ra, cur_sp);
+     std::cerr << "[watch-write] uid=" << runtime_thread_uid()
+               << " name=" << runtime_thread_name()
+-              << " pc=" << hex32(runtime_dispatch_pc())
++              << " pc=" << hex32(runtime_dispatch_pc()) << " cpu.pc=" << hex32(cur_pc) << " ra=" << hex32(cur_ra) << " sp=" << hex32(cur_sp)
+               << " op=" << operation
+               << " address=" << hex32(address)
+               << " size=" << length
+               << " old=0x" << std::hex << old_value
+               << " new=0x" << new_value << std::dec << "\n";
++    print_stack_trace(cur_sp);
+ }
+ }  // namespace
+ 
+@@ -140,6 +165,7 @@ void set_arena_provider(const ArenaProvider &provider) noexcept { g_arena_provid
+ 
+ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+     : write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
++    if (write_watch_enabled_) g_watch_memory = this;
+     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
+         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
+     }
+diff --git a/src/interpreter.cpp b/src/interpreter.cpp
+index e375200..48399e4 100644
+--- a/src/interpreter.cpp
++++ b/src/interpreter.cpp
+@@ -108,6 +108,7 @@ void note_access(std::uint32_t pc, std::uint32_t address, bool store) {
+ std::vector<std::uint32_t> g_watch;
+ std::uint64_t g_watch_limit = 40u;
+ std::uint32_t g_watch_words = 0u;
++bool g_watch_stack = false;
+ std::unordered_map<std::uint32_t, std::uint64_t> g_watch_seen;
+ 
+ void load_watch_list(const char *text) {
+@@ -139,6 +140,7 @@ void load_settings() {
+             g_budget = static_cast<std::uint64_t>(value);
+     }
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_WATCH")) load_watch_list(text);
++    g_watch_stack = std::getenv("PSPRECOMP_INTERPRETER_WATCH_STACK") != nullptr;
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_WATCH_LIMIT")) {
+         char *end = nullptr;
+         const unsigned long long value = std::strtoull(text, &end, 0);
+@@ -161,7 +163,25 @@ void report_watch(Runtime &runtime, const AllegrexContext &ctx, std::uint32_t pc
+               << " a0=" << hex32(ctx.gpr[4]) << " a1=" << hex32(ctx.gpr[5])
+               << " a2=" << hex32(ctx.gpr[6]) << " a3=" << hex32(ctx.gpr[7])
+               << " s0=" << hex32(ctx.gpr[16]) << " s1=" << hex32(ctx.gpr[17])
+-              << " s2=" << hex32(ctx.gpr[18]) << " ra=" << hex32(ctx.gpr[31]);
++              << " s2=" << hex32(ctx.gpr[18]) << " ra=" << hex32(ctx.gpr[31])
++              << " f12=" << ctx.fpr[12] << " f13=" << ctx.fpr[13] << " f14=" << ctx.fpr[14] << " sp=" << hex32(ctx.gpr[29]);
++    if (g_watch_stack) {
++        // Words on the guest stack that look like return addresses: the instruction two before is a jal/jalr.
++        std::cerr << "\n         stack:";
++        const GuestMemory &memory = runtime.memory();
++        int printed = 0;
++        for (std::uint32_t off = 0; off < 0x800u && printed < 14; off += 4u) {
++            const std::uint32_t at = ctx.gpr[29] + off;
++            if (!memory.contains(at, 4u)) break;
++            const std::uint32_t w = memory.load32(at);
++            if (w < 0x08804000u || w >= 0x08B00000u || (w & 3u) != 0u || !memory.contains(w - 8u, 4u)) continue;
++            const std::uint32_t insn = memory.load32(w - 8u);
++            if ((insn >> 26) == 3u || (insn & 0xFC1FFFFFu) == 0x0000F809u) {
++                std::cerr << " " << hex32(w);
++                ++printed;
++            }
++        }
++    }
+     // What a0 points at, when it is a pointer to an object: the field that is
+     // never what the game waits for is usually visible right here.
+     if (g_watch_words != 0u && runtime.memory().contains(ctx.gpr[4], g_watch_words * 4u)) {
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index fbae5e6..b053cc6 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -132,6 +132,13 @@ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noex
+ std::int32_t runtime_thread_uid() noexcept { return g_runtime_thread_uid; }
+ const char *runtime_thread_name() noexcept { return g_runtime_thread_name.data(); }
+ std::uint32_t runtime_dispatch_pc() noexcept { return g_runtime_dispatch_pc; }
++// For the write watch: where the interpreter is (it keeps ctx.pc current) and the return address, so a store can be
++// attributed to an instruction and its caller. Only meaningful for interpreted code.
++void runtime_watch_context(std::uint32_t &pc, std::uint32_t &ra, std::uint32_t &sp) noexcept {
++    pc = g_cpu.pc;
++    ra = g_cpu.gpr[31];
++    sp = g_cpu.gpr[29];
++}
+ RuntimeExecutionContextToken capture_runtime_execution_context() noexcept {
+     return RuntimeExecutionContextToken{g_runtime_thread_uid, g_runtime_thread_switch_generation_fast};
+ }
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 874f896..8f3c122 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -13,6 +13,7 @@
+ //     --offscreen-scale N scale of the smaller render targets (default 1)
+ //     --stats             print what each flip cost the renderer, and totals
+ //     --analyze           do not render: list the draws (state summary)
++//     --zstats            with --analyze: one line per transformed draw with the view-space z range of its vertices
+ //     --regs              with --analyze: count the values the pixel, colour-test, stencil and logic-op
+ //                         registers had at each draw, over every flip replayed
+ //     --detail N,M        with --analyze: also print the vertices, matrices, fog and lights of draws N and M
+@@ -100,6 +101,7 @@ struct Options {
+     std::uint32_t offscreen_scale{1};
+     bool stats{};
+     bool analyze{};
++    bool zstats{};
+     bool regs{};
+     std::set<std::uint64_t> detail;
+     bool null_draw{};
+@@ -170,6 +172,7 @@ std::string with_flip(const std::string &pattern, std::uint64_t flip, const char
+ class AnalyzeRenderer final : public gpu::Renderer {
+ public:
+     std::set<std::uint64_t> detail;
++    bool zstats{};
+     static void print_matrix(const char *name, const std::array<float, 16> &m) {
+         std::printf("    %s:", name);
+         for (int row = 0; row < 4; ++row) {
+@@ -278,6 +281,19 @@ public:
+                     call.viewport.scissor_y2, call.lighting_enabled ? 1 : 0, call.fog.enabled ? 1 : 0,
+                     call.clear_mode ? 1 : 0, call.clear_flags, call.material_color);
+         if (detail.count(draws) != 0u) print_detail(call, memory);
++        if (zstats && !call.through && !call.vertices.empty()) {
++            // View-space z (world * view, row vectors) over every decoded vertex: how far from the camera this draw reaches.
++            float zmin = 1e30f, zmax = -1e30f;
++            for (const gpu::Vertex &v : call.vertices) {
++                float q[3];
++                for (int col = 0; col < 3; ++col)
++                    q[col] = v.position[0] * call.world[col] + v.position[1] * call.world[4 + col] + v.position[2] * call.world[8 + col] + call.world[12 + col];
++                const float z = q[0] * call.view[2] + q[1] * call.view[6] + q[2] * call.view[10] + call.view[14];
++                zmin = std::min(zmin, z);
++                zmax = std::max(zmax, z);
++            }
++            std::printf("    zrange %.2f %.2f (n=%zu)\n", zmin, zmax, call.vertices.size());
++        }
+     }
+     void write_back_frame(gpu::GuestMemory &) override {}
+     void read_back_framebuffer(std::uint32_t, gpu::GuestMemory &) override {}
+@@ -503,6 +519,7 @@ int main(int argc, char **argv) {
+         else if (arg == "--cpu-time") g_cpu_time = true;
+         else if (arg == "--shader-lint") options.shader_lint = true;
+         else if (arg == "--analyze") options.analyze = true;
++        else if (arg == "--zstats") options.zstats = true;
+         else if (arg == "--regs") options.regs = true;
+         else if (arg == "--detail") {
+             std::vector<std::uint64_t> list;
+@@ -634,6 +651,7 @@ int main(int argc, char **argv) {
+         auto made = std::make_unique<AnalyzeRenderer>();
+         analyze = made.get();
+         made->detail = options.detail;
++        made->zstats = options.zstats;
+         renderer = std::move(made);
+     } else {
+ #if defined(GE_REPLAY_HAS_GL)

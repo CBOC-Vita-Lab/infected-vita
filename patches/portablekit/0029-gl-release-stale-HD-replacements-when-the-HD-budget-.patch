@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 12:00:18 +0000
+Subject: [PATCH] gl: release stale HD replacements when the HD budget runs
+ short (hd_stale_frames)
+
+The replacement budget (32 MB for 2x, 48 MB for the mixed 4x) is smaller than the renderer's 96 MB texture budget, so the LRU eviction never touched it:
+the replacements of a level that was left (a retry, the next mission) and the colour variants of an animated palette held the budget for good
+(Vita3K: 2x resident 32.7 MB after three retries of mission 1, later textures kept their originals). Past 85 % of the HD budget the replacements nobody
+has drawn for hd_stale_frames (default 600, config key hd_stale_frames / <PREFIX>_HD_STALE_FRAMES) are released, oldest first, down to 70 %.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index b9f4477..5d60d59 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -44,6 +44,8 @@ public:
+     [[nodiscard]] HdMode mode() const noexcept { return config_.mode; }
+     // GPU bytes the replacements of the present mode may use (HdConfig::budget_for).
+     [[nodiscard]] std::uint64_t budget_bytes() const noexcept { return config_.budget_for(config_.mode); }
++    [[nodiscard]] bool logging() const noexcept { return config_.log; }
++    [[nodiscard]] std::uint64_t stale_frames() const noexcept { return config_.stale_frames; }
+     [[nodiscard]] bool has_pack() const noexcept { return pack_.is_open(); }
+     [[nodiscard]] std::uint32_t scale() const noexcept { return pack_.is_open() ? pack_.scale() : 1u; }
+     // Once per display list: looks at gfx.hd_textures when the port settings changed (HdConfig::follow_settings); true
+@@ -66,6 +68,9 @@ public:
+     [[nodiscard]] const HdStats &stats() const noexcept { return stats_; }
+     [[nodiscard]] std::string summary() const;
+     [[nodiscard]] const HdPackFile &pack() const noexcept { return pack_; }
++    // How much of the replacement budget is spent: the renderer releases replacements nobody has drawn for a while past 85 % (see
++    // GlRenderer::release_stale_hd), so a level that was left, or the colour variants of an animated palette, do not hold it for good.
++    [[nodiscard]] std::uint64_t resident_bytes() const noexcept { return stats_.resident_bytes; }
+ 
+ private:
+     void open_pack();
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index fd1189c..57a8958 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -218,6 +218,7 @@ constexpr std::uint32_t kHashPhases = 8u;
+ // full validation for a while.
+ constexpr std::uint32_t kYoungUses = 4u;
+ constexpr std::uint64_t kVolatileFrames = 240u;
++constexpr std::uint64_t kHdReleaseInterval = 30u;  // frames between two looks at the HD budget
+ 
+ struct TextureEntry {
+     GLuint id{};
+@@ -278,6 +279,7 @@ struct GlRenderer::Impl {
+     bool minmax_ok{true};
+     std::string description;
+     std::uint64_t frames{};
++    std::uint64_t hd_release_next{};   // the frame before which release_stale_hd does not look at the HD budget again
+     std::uint64_t next_stats_frame{};
+     std::uint64_t writeback_frames{};
+     std::uint64_t draws{};
+@@ -939,6 +941,34 @@ struct GlRenderer::Impl {
+         }
+     }
+ 
++    // The replacement budget of the HD pack is smaller than the texture budget, so the least-recently-used rule above never touches it:
++    // replacements of a level that was left (a retry or the next mission builds new ones) or the colour variants of an animated palette would
++    // hold it for good and every later texture would keep its original. Past 85 % of the HD budget the replacements nobody has drawn for
++    // hd_stale_frames (600) go, oldest first, down to 70 %; the textures are made again from the pack when they are drawn again.
++    void release_stale_hd() {
++        const std::uint64_t budget = hd.budget_bytes();
++        if (budget == 0u || hd.resident_bytes() <= budget / 100u * 85u || frames < hd_release_next) return;
++        hd_release_next = frames + kHdReleaseInterval;
++        std::vector<std::pair<std::uint64_t, TextureKey>> order;
++        for (const auto &entry : textures)
++            if (entry.second->hd.replaced && entry.second->last_used + hd.stale_frames() < frames) order.emplace_back(entry.second->last_used, entry.first);
++        std::sort(order.begin(), order.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
++        const std::uint64_t goal = budget / 100u * 70u;
++        std::uint64_t released = 0u;
++        for (const auto &[used, key] : order) {
++            if (hd.resident_bytes() <= goal) break;
++            const auto found = textures.find(key);
++            if (found == textures.end()) continue;
++            destroy_texture(*found->second);
++            textures.erase(found);
++            ++released;
++        }
++        if (released != 0u && hd.logging())
++            std::fprintf(stderr, "[hdtex] released %llu replacement textures nobody has drawn for %llu frames (resident now %llu KiB of %llu KiB)\n",
++                         static_cast<unsigned long long>(released), static_cast<unsigned long long>(hd.stale_frames()),
++                         static_cast<unsigned long long>(hd.resident_bytes() >> 10u), static_cast<unsigned long long>(budget >> 10u));
++    }
++
+     // ---- blending ---------------------------------------------------------------------------------
+ 
+     BlendPlan plan_blend(const BlendState &blend) {
+@@ -2111,6 +2141,7 @@ struct GlRenderer::Impl {
+         show(*target);
+         ++frames;
+         evict_textures();
++        release_stale_hd();
+         note_present(ge_draws);
+         scene_draws = 0u;
+         composite_seen = false;
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index e4e1b4a..a22222c 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -345,11 +345,12 @@ HdConfig hd_config_from_environment() {
+     config.follow_settings = true;
+     config.trace = env_any("HD_TRACE") != nullptr;
+     if (const char *text = env_any("HD_RECOLOUR_GUARD")) config.recolour_guard = !(std::strcmp(text, "off") == 0 || std::strcmp(text, "0") == 0);
+-    // Budgets in MB: one for every mode, or one per mode (the per-mode keys win for their mode). Without any, 2x gets 32 MB and 4x 48 MB.
++    // Budgets in MB: one for every mode (it wins), or one per mode. Without any, 2x gets 32 MB and 4x 48 MB.
+     const auto megabytes = [](const char *text) { return std::strtoull(text, nullptr, 10) * 1024ull * 1024ull; };
+     if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = megabytes(text);
+     if (const char *text = env_any("HD_BUDGET_2X_MB")) config.budget_2x_bytes = megabytes(text);
+     if (const char *text = env_any("HD_BUDGET_4X_MB")) config.budget_4x_bytes = megabytes(text);
++    if (const char *text = env_any("HD_STALE_FRAMES")) config.stale_frames = std::strtoull(text, nullptr, 10);
+     if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
+     config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
+     return config;
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index 9874673..d232b6c 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -132,6 +132,9 @@ struct HdConfig {
+     // The palette animation guard of the recolour records (gl_hd_textures.cpp). <PREFIX>_HD_RECOLOUR_GUARD=off turns it off, to measure
+     // what a texture whose palette changes every frame costs without it.
+     bool recolour_guard{true};
++    // Replacements nobody has drawn for this many frames can be released when the budget runs short (GlRenderer::release_stale_hd);
++    // <PREFIX>_HD_STALE_FRAMES (config.txt hd_stale_frames). 600 = 10 s at 60 fps.
++    std::uint64_t stale_frames{600};
+     // The mode follows gfx.hd_textures (host/settings/port_settings.hpp) while the program runs: GlHdTextures::tick() looks
+     // at the setting's generation and switches (every texture is uploaded again). A replayer that names the mode itself
+     // leaves this off.

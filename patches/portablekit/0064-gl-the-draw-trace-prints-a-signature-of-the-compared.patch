@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 14:29:24 +0000
+Subject: [PATCH] gl: the draw trace prints a signature of the compared state,
+ so a trace shows which draws could have shared a batch
+
+Used to price a reorder-merge of opaque draws on the mission-1 replay:
+draws only merge when the whole state matches, model matrix included,
+so grouping saves 41 of 410 batches (about 10 %), not the 95 first
+estimated from program and texture alone. The reorder was not built.
+Trace output only; no drawing changed. Tests: 45/45 on the desktop.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index f683ca5..2e7e6de 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2896,13 +2896,18 @@ struct GlRenderer::Impl {
+         if (merge && batch_indices.size() > 0u) ++st().merged;
+         ++target.draw_serial;
+         ++target.draws;
+-        if (settings.trace)
++        if (settings.trace) {
++            // sig: a hash of the compared words, so a trace shows which draws could have shared a batch.
++            std::uint64_t signature = 1469598103934665603ull;
++            const auto *words = reinterpret_cast<const std::uint32_t *>(&state);
++            for (std::size_t i = 0; i < kDrawStateCompared / 4u; ++i) signature = (signature ^ words[i]) * 1099511628211ull;
+             std::cerr << "[gl] draw " << draws << " " << glsl::describe(state.program_flags) << " prim "
+                       << static_cast<int>(call.primitive) << " vertices " << call.vertices.size() << " target 0x"
+                       << std::hex << target.address << " tex 0x" << call.texture.address << std::dec << " gl " << state.texture
+                       << " blend " << state.blend_enable << "/" << state.blend_source << "/" << state.blend_destination
+                       << " depth " << state.depth_test << "/" << state.depth_function << "/" << state.depth_write
+-                      << (merge ? " (merged)" : "") << "\n";
++                      << " sig " << std::hex << signature << std::dec << (merge ? " (merged)" : "") << "\n";
++        }
+         if (!settings.merge_draws) flush();
+     }
+ 

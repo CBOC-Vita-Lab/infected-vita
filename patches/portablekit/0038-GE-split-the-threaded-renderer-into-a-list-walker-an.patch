@@ -1,0 +1,618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:34:07 +0000
+Subject: [PATCH] GE: split the threaded renderer into a list walker and a GL
+ thread (GE_SPLIT)
+
+With GE_SPLIT=1 the GE worker walks display lists and decodes vertices on its own core and hands every renderer call, in order, to a GL thread that owns the context (SplitRenderer). A GE job counts as completed only once the GL thread has run what it queued, interrupts are raised from the GL thread at their place in the stream, and a block transfer waits for the GL thread before guest memory moves.
+Verified on desktop with the GE replay (same score and flips as the single GE thread) and screenshot comparison; on the PS Vita it ran a two-minute bot game in Vita3K. Not yet measured on a console. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bbaf1e9..073366c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -619,6 +619,7 @@ if(PORTABLEKIT_GE_REPLAY)
+         "${PORTABLEKIT_ROOT}/host/movie/hd_frame_store.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_dump.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_worker.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/split_renderer.cpp"
+         "${PORTABLEKIT_ROOT}/host/profile.cpp"
+         "${PORTABLEKIT_ROOT}/host/perf/frame_stats.cpp"
+         "${PORTABLEKIT_ROOT}/host/perf/bench.cpp"
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index 04bc573..796cc82 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -47,6 +47,7 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/gpu/ge_state.cpp
+     host/gpu/ge_dump.cpp
+     host/gpu/ge_worker.cpp
++    host/gpu/split_renderer.cpp
+     host/gpu/texture_decode.cpp
+     host/gpu/texture_key.cpp
+     host/gpu/hd_texture_pack.cpp
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+index 5e23be7..732ab25 100644
+--- a/host/gpu/ge_worker.cpp
++++ b/host/gpu/ge_worker.cpp
+@@ -173,6 +173,13 @@ void GeWorker::run_loop() {
+         if (g_platform.monotonic_us != nullptr)
+             busy_us_.fetch_add(g_platform.monotonic_us() - start, std::memory_order_relaxed);
+         head_.store(head + 1u, std::memory_order_release);
++        if (forwarder_ != nullptr) {
++            // Someone else finishes this job's work: they publish its completion (mark_completed). The producer may be
++            // waiting for ring space, which the head just made.
++            forwarder_(forwarder_context_, head + 1u);
++            if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++            continue;
++        }
+         completed_.store(head + 1u, std::memory_order_release);
+         // The guest may be waiting for this job (sceGeDrawSync, a full ring, a frame in flight): wake it.
+         if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
+@@ -180,6 +187,14 @@ void GeWorker::run_loop() {
+     }
+ }
+ 
++void GeWorker::mark_completed(std::uint64_t value) {
++    std::uint64_t current = completed_.load(std::memory_order_acquire);
++    while (current < value && !completed_.compare_exchange_weak(current, value, std::memory_order_acq_rel)) {
++    }
++    if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++    if (wake_hook_ != nullptr) wake_hook_();
++}
++
+ namespace {
+ struct GuestThreadArgs {
+     void (*fn)(void *);
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+index b520758..1c5b888 100644
+--- a/host/gpu/ge_worker.hpp
++++ b/host/gpu/ge_worker.hpp
+@@ -97,6 +97,18 @@ public:
+     // Marks the worker active for a caller that runs run_loop() itself.
+     void set_active(bool active) noexcept { active_.store(active, std::memory_order_release); }
+ 
++    // ---- completion that is decided elsewhere (gpu/split_renderer.hpp) ---------------------------------------------
++    // With a forwarder set, run_loop() does not publish completed() itself after a job: it hands the job's number to
++    // the forwarder, and whoever finishes the job's work later (the GL thread) calls mark_completed() with it. Set it
++    // before the loop runs and clear it after.
++    using CompletionForwarder = void (*)(void *context, std::uint64_t completed);
++    void set_completion_forwarder(CompletionForwarder forwarder, void *context) noexcept {
++        forwarder_ = forwarder;
++        forwarder_context_ = context;
++    }
++    // Publishes completed() = `value` (never backwards) and wakes the guest as run_loop() does. Any thread.
++    void mark_completed(std::uint64_t value);
++
+ private:
+     struct Slot {
+         Job job;
+@@ -114,6 +126,8 @@ private:
+     void *work_event_ = nullptr;      // the consumer sleeps here when the ring is empty
+     void *space_event_ = nullptr;     // the producer sleeps here when the ring is full
+     void (*wake_hook_)() = nullptr;
++    CompletionForwarder forwarder_ = nullptr;
++    void *forwarder_context_ = nullptr;
+ };
+ 
+ // The one worker of the process.
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+new file mode 100644
+index 0000000..8e1616c
+--- /dev/null
++++ b/host/gpu/split_renderer.cpp
+@@ -0,0 +1,299 @@
++#include "gpu/split_renderer.hpp"
++
++#include "perf/phase_timers.hpp"
++#include "profile.hpp"
++
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++#include <iostream>
++#include <string>
++#include <utility>
++
++namespace portablekit::gpu {
++namespace {
++
++// Which side of the split the calling thread is: the walker is the one producer of the GL queue, the GL thread runs it.
++// Anything else (the guest, a watchdog) never posts: the queue is single-producer.
++thread_local bool t_walker = false;
++thread_local bool t_gl = false;
++
++// The one SplitRenderer of the process (split_of() without RTTI).
++SplitRenderer *g_instance = nullptr;
++
++// At most this many presents queued and not yet shown: the walker runs at most about a frame ahead of the GL thread.
++constexpr std::uint64_t kPresentsAhead = 1u;
++
++void warn_foreign_thread(const char *what) {
++    static bool said = false;
++    if (said) return;
++    said = true;
++    std::cerr << "[split] " << what << " called from a thread that is neither the walker nor the GL thread: ignored"
++              << std::endl;
++}
++
++} // namespace
++
++bool ge_split_setting_enabled() {
++    const char *value = portablekit::env("GE_SPLIT");
++    if (value == nullptr || *value == '\0') return false;
++    std::string text(value);
++    for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    return text == "1" || text == "on" || text == "true" || text == "yes";
++}
++
++SplitRenderer::SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots)
++    : inner_(std::move(inner)), queue_(16384u), slots_(std::max<std::uint32_t>(draw_slots, 64u)) {
++    g_instance = this;
++}
++
++SplitRenderer::~SplitRenderer() {
++    if (g_instance == this) g_instance = nullptr;
++}
++
++void SplitRenderer::post(GeWorker::Job job) {
++    if (!forwarding() || t_gl) {
++        job();
++        return;
++    }
++    if (!t_walker) {
++        warn_foreign_thread("post");
++        return;
++    }
++    queue_.post(std::move(job));
++}
++
++void SplitRenderer::drain() {
++    if (!forwarding() || t_gl) return;
++    queue_.wait_completed(queue_.posted());
++}
++
++template <typename Fn> void SplitRenderer::call(Fn &&fn) {
++    if (!forwarding() || t_gl) {
++        fn();
++        return;
++    }
++    if (!t_walker) {
++        warn_foreign_thread("a renderer call with a result");
++        return;
++    }
++    // `fn` refers to the caller's locals: fine, the caller waits until it has run.
++    queue_.post(GeWorker::Job(std::forward<Fn>(fn)));
++    queue_.wait_completed(queue_.posted());
++}
++
++namespace {
++struct ThreadArgs {
++    void (*guest)(void *){};
++    void *arg{};
++    GeWorker *walker{};
++    SplitRenderer *self{};
++};
++
++void forward_completion(void *context, std::uint64_t completed) {
++    auto *args = static_cast<ThreadArgs *>(context);
++    GeWorker *walker = args->walker;
++    // Published when the GL thread reaches this point of its queue: everything the job queued has been drawn by then.
++    args->self->queue().post([walker, completed] { walker->mark_completed(completed); });
++}
++
++void walker_main(void *pointer) {
++    auto *args = static_cast<ThreadArgs *>(pointer);
++    t_walker = true;
++    args->walker->run_loop();
++    // Nothing more will be posted to the GL queue: it stops once it is empty.
++    args->self->queue().request_stop();
++}
++
++void guest_main(void *pointer) {
++    auto *args = static_cast<ThreadArgs *>(pointer);
++    args->guest(args->arg);
++    args->walker->request_stop();
++}
++} // namespace
++
++bool SplitRenderer::run(GeWorker &walker, void (*guest)(void *), void *arg, int guest_core, std::size_t guest_stack_bytes,
++                        int walker_core, std::size_t walker_stack_bytes, int gl_core) {
++    const GeWorkerPlatform &platform = ge_worker_platform();
++    if (platform.thread_start == nullptr || platform.thread_join == nullptr) return false;
++    if (platform.pin_current_thread != nullptr) platform.pin_current_thread(gl_core);
++    ThreadArgs args{guest, arg, &walker, this};
++    t_gl = true;
++    walker.set_completion_forwarder(&forward_completion, &args);
++    forwarding_.store(true, std::memory_order_release);
++    walker.set_active(true);
++    queue_.set_active(true);
++    void *walker_thread = platform.thread_start(&walker_main, &args, "ge-walker", walker_core, walker_stack_bytes);
++    void *guest_thread = walker_thread != nullptr
++                             ? platform.thread_start(&guest_main, &args, "infected-guest", guest_core, guest_stack_bytes)
++                             : nullptr;
++    if (guest_thread == nullptr) {
++        if (walker_thread != nullptr) {
++            walker.request_stop();
++            queue_.run_loop();   // the walker stops the GL queue when it leaves
++            platform.thread_join(walker_thread);
++        }
++        walker.set_active(false);
++        walker.set_completion_forwarder(nullptr, nullptr);
++        queue_.set_active(false);
++        forwarding_.store(false, std::memory_order_release);
++        t_gl = false;
++        return false;
++    }
++    queue_.run_loop();
++    platform.thread_join(guest_thread);
++    platform.thread_join(walker_thread);
++    walker.set_active(false);
++    walker.set_completion_forwarder(nullptr, nullptr);
++    queue_.set_active(false);
++    forwarding_.store(false, std::memory_order_release);
++    t_gl = false;
++    return true;
++}
++
++// ---- Renderer ----------------------------------------------------------------------------------------------------
++
++bool SplitRenderer::initialize(const RendererConfig &config, std::string &error) {
++    bool ok = false;
++    call([&] { ok = inner_->initialize(config, error); });
++    return ok;
++}
++
++void SplitRenderer::shutdown() {
++    call([&] { inner_->shutdown(); });
++}
++
++void SplitRenderer::begin_display_list() {
++    post([this] { inner_->begin_display_list(); });
++}
++
++void SplitRenderer::submit(const DrawCall &draw, const GuestMemory &memory) {
++    if (!forwarding() || t_gl) {
++        inner_->submit(draw, memory);
++        return;
++    }
++    if (!t_walker) {
++        warn_foreign_thread("submit");
++        return;
++    }
++    const std::uint64_t sequence = draws_posted_++;
++    const std::uint64_t count = slots_.size();
++    // The slot is free once the GL thread has drawn the draw that used it `count` draws ago.
++    while (sequence - draws_done_.load(std::memory_order_acquire) >= count)
++        queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    DrawSlot &slot = slots_[sequence % count];
++    slot.call = draw;   // the vertex vector keeps its capacity: after a few frames this copies, it does not allocate
++    slot.memory = &memory;
++    queue_.post([this, sequence] { run_draw(sequence); });
++}
++
++void SplitRenderer::run_draw(std::uint64_t sequence) {
++    DrawSlot &slot = slots_[sequence % slots_.size()];
++    {
++        const phase::Scope submit(phase::GlSubmit);
++        inner_->submit(slot.call, *slot.memory);
++    }
++    draws_done_.store(sequence + 1u, std::memory_order_release);
++}
++
++void SplitRenderer::write_back_frame(GuestMemory &memory) {
++    GuestMemory *target = &memory;
++    post([this, target] { inner_->write_back_frame(*target); });
++}
++
++void SplitRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &memory) {
++    // Waits: the walker moves guest memory right after this (a block transfer), and every draw queued before it must
++    // have read its textures first.
++    call([&] { inner_->read_back_framebuffer(source, memory); });
++}
++
++void SplitRenderer::upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
++                                 std::uint32_t height, std::uint32_t stride) {
++    if (!forwarding() || t_gl) {
++        inner_->upload_frame(display_address, pixels, width, height, stride);
++        return;
++    }
++    if (pixels == nullptr || width == 0u || height == 0u || stride < width) return;
++    // The caller's pixels are only valid during the call: copied.
++    const std::size_t bytes = static_cast<std::size_t>(stride) * height * 4u;
++    post([this, display_address, width, height, stride, copy = std::vector<std::uint8_t>(pixels, pixels + bytes)] {
++        inner_->upload_frame(display_address, copy.data(), width, height, stride);
++    });
++}
++
++bool SplitRenderer::present(std::uint32_t display_address, std::optional<std::chrono::steady_clock::time_point> moment) {
++    if (!forwarding() || t_gl) return inner_->present(display_address, moment);
++    if (!t_walker) {
++        warn_foreign_thread("present");
++        return false;
++    }
++    const std::uint64_t mine = ++presents_posted_;
++    while (mine - presents_done_.load(std::memory_order_acquire) > kPresentsAhead + 1u)
++        queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    post([this, display_address, moment] {
++        {
++            const phase::Scope present_scope(phase::Present);
++            (void)inner_->present(display_address, moment);
++        }
++        presents_done_.fetch_add(1u, std::memory_order_release);
++    });
++    return true;
++}
++
++bool SplitRenderer::capture_frame(const std::string &path) {
++    bool ok = false;
++    call([&] { ok = inner_->capture_frame(path); });
++    return ok;
++}
++
++void SplitRenderer::set_overlay(OverlayActive active, OverlayPaint paint) {
++    call([&] { inner_->set_overlay(std::move(active), std::move(paint)); });
++}
++
++bool SplitRenderer::present_overlay() {
++    bool shown = false;
++    call([&] { shown = inner_->present_overlay(); });
++    return shown;
++}
++
++void SplitRenderer::present_due() {
++    post([this] { inner_->present_due(); });
++}
++
++void SplitRenderer::present_until(std::chrono::steady_clock::time_point moment) {
++    post([this, moment] { inner_->present_until(moment); });
++}
++
++void SplitRenderer::pause_interpolation() {
++    post([this] { inner_->pause_interpolation(); });
++}
++
++void SplitRenderer::set_fast_forward(bool on) {
++    post([this, on] { inner_->set_fast_forward(on); });
++}
++
++bool SplitRenderer::pump_events() {
++    if (!forwarding() || t_gl) return inner_->pump_events();
++    // The answer of the last pump the GL thread ran; a thread that is not the walker only reads it.
++    if (t_walker) post([this] { window_open_.store(inner_->pump_events(), std::memory_order_release); });
++    return window_open_.load(std::memory_order_acquire);
++}
++
++void SplitRenderer::sample_pad() {
++    if (!forwarding() || t_gl) {
++        inner_->sample_pad();
++        return;
++    }
++    if (t_walker) post([this] { inner_->sample_pad(); });
++}
++
++SplitRenderer *split_of(Renderer *renderer) noexcept {
++    return renderer != nullptr && renderer == static_cast<Renderer *>(g_instance) ? g_instance : nullptr;
++}
++
++Renderer *innermost(Renderer *renderer) noexcept {
++    if (SplitRenderer *split = split_of(renderer)) return &split->inner();
++    return renderer;
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+new file mode 100644
+index 0000000..85f73e5
+--- /dev/null
++++ b/host/gpu/split_renderer.hpp
+@@ -0,0 +1,117 @@
++#pragma once
++
++#include "gpu/ge_worker.hpp"
++#include "gpu/renderer.hpp"
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++// The GE thread split in two (<PREFIX>_GE_SPLIT=1, config.txt ge_split=1; only with the threaded renderer):
++//
++//   guest (core 0) --jobs--> walker (core 2): display lists, vertex decode, block transfers
++//                                  | draws and every other renderer call, in order
++//                                  v
++//                            GL thread (core 1, owns the GL context): the renderer itself
++//
++// On the Vita one core did both halves of a frame: about half of its time went to walking the lists and decoding
++// (skinning) vertices, half to the renderer and the GL driver. SplitRenderer is the renderer the walker sees. It forwards
++// each call to the GL thread through a ring, in order: draws and other calls without a result are queued and the walker
++// goes on; calls with a result (a read-back, a capture, the overlay's present) wait for the GL thread. A draw's vertices
++// are copied into a slot of a reusable ring, so the walker never waits for the GL thread unless the ring is full.
++//
++// What the guest relies on keeps its meaning: a GE job counts as completed (sceGeDrawSync, the frames-in-flight limit)
++// only when the GL thread has run everything the job queued (GeWorker::set_completion_forwarder), and the GE's signal and
++// finish interrupts are raised from the GL thread at their place in the stream (post_interrupt). A block transfer reads
++// framebuffers back through read_back_framebuffer(), which waits, so the GL thread has used every texture the list read
++// before the transfer moves guest memory.
++//
++// Before start() every call goes straight to the wrapped renderer on the calling thread: the system install configures
++// it (overlay, settings) on the main thread before any thread is started.
++namespace portablekit::gpu {
++
++// <PREFIX>_GE_SPLIT: on, off (default off).
++[[nodiscard]] bool ge_split_setting_enabled();
++
++class SplitRenderer final : public Renderer {
++public:
++    explicit SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots = 2048u);
++    ~SplitRenderer() override;
++
++    [[nodiscard]] Renderer &inner() noexcept { return *inner_; }
++    [[nodiscard]] const Renderer &inner() const noexcept { return *inner_; }
++    // The GL thread's queue.
++    [[nodiscard]] GeWorker &queue() noexcept { return queue_; }
++    [[nodiscard]] bool forwarding() const noexcept { return forwarding_.load(std::memory_order_acquire); }
++
++    // Runs `guest(arg)` on a new thread (guest_core), `walker` (the GE worker's loop) on another (walker_core) and the
++    // GL queue on the calling thread, which owns the GL context. Returns when the guest has returned and both queues are
++    // empty. False if a thread could not be started (nothing ran).
++    bool run(GeWorker &walker, void (*guest)(void *), void *arg, int guest_core, std::size_t guest_stack_bytes,
++             int walker_core, std::size_t walker_stack_bytes, int gl_core);
++
++    // Waits until the GL thread has run everything queued so far (any thread but the GL thread).
++    void drain();
++    // Runs `job` on the GL thread after everything queued so far, and returns at once.
++    void post(GeWorker::Job job);
++
++    // ---- Renderer ------------------------------------------------------------------------------------------------
++    bool initialize(const RendererConfig &config, std::string &error) override;
++    void shutdown() override;
++    [[nodiscard]] bool available() const noexcept override { return inner_->available(); }
++    void begin_display_list() override;
++    [[nodiscard]] bool gpu_decode() const override { return inner_->gpu_decode(); }
++    [[nodiscard]] bool check_gpu_decode() const override { return inner_->check_gpu_decode(); }
++    void submit(const DrawCall &call, const GuestMemory &memory) override;
++    void write_back_frame(GuestMemory &memory) override;
++    void read_back_framebuffer(std::uint32_t source, GuestMemory &memory) override;
++    void upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
++                      std::uint32_t height, std::uint32_t stride) override;
++    [[nodiscard]] bool supports_hd_movies() const noexcept override { return inner_->supports_hd_movies(); }
++    bool present(std::uint32_t display_address,
++                 std::optional<std::chrono::steady_clock::time_point> moment = std::nullopt) override;
++    bool capture_frame(const std::string &path) override;
++    [[nodiscard]] bool has_overlay() const noexcept override { return inner_->has_overlay(); }
++    void set_overlay(OverlayActive active, OverlayPaint paint) override;
++    bool present_overlay() override;
++    void present_due() override;
++    void present_until(std::chrono::steady_clock::time_point moment) override;
++    void pause_interpolation() override;
++    void set_fast_forward(bool on) override;
++    bool pump_events() override;
++    [[nodiscard]] PadState pad() const noexcept override { return inner_->pad(); }
++    void sample_pad() override;
++    [[nodiscard]] MouseMotion take_mouse_motion() noexcept override { return inner_->take_mouse_motion(); }
++    [[nodiscard]] MouseMotion take_touch_motion() noexcept override { return inner_->take_touch_motion(); }
++    [[nodiscard]] float game_aspect() const noexcept override { return inner_->game_aspect(); }
++    [[nodiscard]] CameraReading camera() const noexcept override { return inner_->camera(); }
++    [[nodiscard]] std::uint64_t frames_presented() const noexcept override { return inner_->frames_presented(); }
++    [[nodiscard]] std::uint64_t draws_submitted() const noexcept override { return inner_->draws_submitted(); }
++
++private:
++    struct DrawSlot {
++        DrawCall call;
++        const GuestMemory *memory{};
++    };
++    // Runs `fn` on the GL thread and waits for it (on the calling thread before start()).
++    template <typename Fn> void call(Fn &&fn);
++    void run_draw(std::uint64_t sequence);
++
++    std::unique_ptr<Renderer> inner_;
++    GeWorker queue_;
++    std::vector<DrawSlot> slots_;
++    std::uint64_t draws_posted_{0u};                 // walker only
++    std::atomic<std::uint64_t> draws_done_{0u};      // GL thread
++    std::uint64_t presents_posted_{0u};              // walker only
++    std::atomic<std::uint64_t> presents_done_{0u};   // GL thread
++    std::atomic<bool> window_open_{true};
++    std::atomic<bool> forwarding_{false};
++};
++
++// The SplitRenderer in front of `renderer`, or null when there is none.
++[[nodiscard]] SplitRenderer *split_of(Renderer *renderer) noexcept;
++// The renderer that draws: the wrapped one of a SplitRenderer, else `renderer` itself.
++[[nodiscard]] Renderer *innermost(Renderer *renderer) noexcept;
++
++} // namespace portablekit::gpu
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 5ad569d..3c8da85 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -24,6 +24,7 @@
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_dump.hpp"
+ #include "gpu/ge_worker.hpp"
++#include "gpu/split_renderer.hpp"
+ #include "perf/bench.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "perf/phase_timers.hpp"
+@@ -216,6 +217,17 @@ void raise_ge_interrupt(InterruptCall call) {
+         kernel().queue_interrupt(std::move(call));
+         return;
+     }
++    // With the GE thread split (gpu/split_renderer.hpp) the walker is ahead of the drawing: the interrupt is raised by the
++    // GL thread when it reaches this point, so a handler that reuses buffers finds the draws before it done.
++#if defined(PORTABLEKIT_GPU_RENDERER)
++    if (gpu::SplitRenderer *split = gpu::split_of(media().renderer.get()); split != nullptr && split->forwarding()) {
++        split->post([split, call = std::move(call)] {
++            while (!kernel().post_interrupt_from_host(call.function, call.arguments, call.argument_count))
++                split->queue().nap_on_ge_thread(500u);   // the kernel has not drained for a while
++        });
++        return;
++    }
++#endif
+     while (!kernel().post_interrupt_from_host(call.function, call.arguments, call.argument_count))
+         gpu::ge_worker().nap_on_ge_thread(500u);   // the kernel has not drained for a while
+ }
+@@ -244,8 +256,13 @@ void execute_list(Runtime &rt, std::uint32_t id, GeList &list, const GeCallback
+         renderer.begin_display_list();
+         media().ge.set_raw_vertices(renderer.gpu_decode(), renderer.check_gpu_decode());
+         const bool statistics = bringup::wants_draws();
+-        media().ge.set_draw_sink([&renderer, &memory, statistics](const gpu::DrawCall &call) {
+-            {
++        // With the split GE thread the submission is timed where it runs (the GL thread, SplitRenderer::run_draw).
++        const bool split = gpu::split_of(&renderer) != nullptr && gpu::split_of(&renderer)->forwarding();
++        media().ge.set_draw_sink([&renderer, &memory, statistics, split](const gpu::DrawCall &call) {
++            if (split) {
++                bench::count_draw();
++                renderer.submit(call, memory);
++            } else {
+                 const phase::Scope submit(phase::GlSubmit);
+                 const bench::Scope gl(bench::Gl);
+                 bench::count_draw();
+@@ -1619,7 +1636,13 @@ static bool create_gl_renderer() {
+     // <prefix>_PREWARM_SHADERS=1: every program is built now (on the Vita this fills the shader cache with all variants).
+     if (const char *warm = portablekit::env("PREWARM_SHADERS"); warm != nullptr && *warm != '\0' && *warm != '0')
+         (void)renderer->prewarm_shaders();
+-    media().renderer = std::move(renderer);
++    // <prefix>_GE_SPLIT=1 (config.txt ge_split=1): the GE thread's work is split between a list walker and the GL thread.
++    if (gpu::ge_split_setting_enabled() && gpu::ge_worker_setting_enabled()) {
++        std::cout << "Renderer: split GE thread (the list walk on one thread, GL submission on the GL thread)\n";
++        media().renderer = std::make_unique<gpu::SplitRenderer>(std::unique_ptr<gpu::Renderer>(std::move(renderer)));
++    } else {
++        media().renderer = std::move(renderer);
++    }
+     overlay_host::attach(*media().renderer);
+     // While the settings menu holds the guest still the audio device is silenced, and afterwards the frame statistics
+     // start over so the pause does not read as a slow frame.
+diff --git a/host/main.cpp b/host/main.cpp
+index f8ea05e..9d34a7d 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -14,6 +14,8 @@
+ #include "install/user_data.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_worker.hpp"
++#include "gpu/split_renderer.hpp"
++#include "hle/hle_common.hpp"
+ #include "kernel/kernel.hpp"
+ #include "perf/bringup_stats.hpp"
+ 
+@@ -446,8 +448,13 @@ int main(int argc, char **argv) {
+                     portablekit::kernel().runtime().stop(std::string("exception: ") + e.what());
+                 }
+             };
+-            std::cout << "Threaded renderer: guest executor on its own thread, GE thread on this one\n";
+-            ran_threaded = portablekit::gpu::ge_worker().run_with_guest_thread(guest_main, &guest, 0, 8u << 20u, 1);
++            if (portablekit::gpu::SplitRenderer *split = portablekit::gpu::split_of(portablekit::media_renderer())) {
++                std::cout << "Threaded renderer: guest executor, GE list walker and GL thread (this one)\n";
++                ran_threaded = split->run(portablekit::gpu::ge_worker(), guest_main, &guest, 0, 8u << 20u, 2, 8u << 20u, 1);
++            } else {
++                std::cout << "Threaded renderer: guest executor on its own thread, GE thread on this one\n";
++                ran_threaded = portablekit::gpu::ge_worker().run_with_guest_thread(guest_main, &guest, 0, 8u << 20u, 1);
++            }
+             if (ran_threaded && !guest.error.empty()) throw std::runtime_error(guest.error);
+         }
+         if (!ran_threaded) portablekit::kernel().run_main();

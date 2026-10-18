@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:38:24 +0000
+Subject: [PATCH] split renderer: expand strips and fans on the walker's
+ thread; vitaGL redundant-state switch
+
+- Renderer::prepare_draw(): work on a draw that needs only the draw. The
+  GL renderer turns a transformed triangle strip or fan into the triangle
+  list submit() would build (triangle_indices order); SplitRenderer calls it
+  on the walker's thread in submit_taking(), so the GL thread only rebases the
+  indices (ARM count of the GL thread's work: 3.0 -> 2.6 million
+  instructions a frame). ge_replay --prepare does the same in the replay.
+- The viewport memo compares its key field by field (no key array).
+- GlSettings::vgl_skip_redundant (GL_VGL_SKIP_REDUNDANT, off): calls
+  vglSkipRedundantState, which a vitaGL with the port's patch 0003 has
+  (PORTABLEKIT_VITAGL_SKIP_REDUNDANT); nothing without it.
+
+Verified: 25 replayed gameplay frames byte-identical with --prepare and
+without; Vita3K: mission 1 with the split renderer and the vitaGL switch on
+drew menus, movies, the briefing and gameplay correctly. Not yet on a Vita.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index ae449db..607a81d 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -82,6 +82,15 @@ inline void buffer_use_mapped(GLenum target, const void *data) {
+ #endif
+ }
+ 
++// vitaGL (the port's patch 0003): leave out GXM state calls that set what is already set. Nothing elsewhere.
++inline void skip_redundant_state(bool on) {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_SKIP_REDUNDANT)
++    vglSkipRedundantState(on ? GL_TRUE : GL_FALSE);
++#else
++    (void)on;
++#endif
++}
++
+ inline void disable_dither() {
+ #if !defined(__vita__)
+     glDisable(GL_DITHER);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index b8bf2bd..9f7c7bc 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2228,10 +2228,12 @@ struct GlRenderer::Impl {
+         ViewMemo &m = view_memo;
+         std::uint32_t scale_bits{};
+         std::memcpy(&scale_bits, &target.scale, sizeof(scale_bits));
+-        const std::uint32_t key[7] = {target.address, scale_bits, target.width, target.height,
+-                                      target.psp_width, target.psp_height, through ? 1u : 0u};
+         static_assert(sizeof(ViewportState) % 4u == 0u);
+-        if (!m.valid || !same_words(&m.viewport, &vp, sizeof(ViewportState) / 4u) || !same_words(&m.target, key, 7u)) {
++        const bool same = m.valid && same_words(&m.viewport, &vp, sizeof(ViewportState) / 4u) &&
++                          m.target == target.address && m.scale_bits == scale_bits && m.width == target.width &&
++                          m.height == target.height && m.psp_width == target.psp_width &&
++                          m.psp_height == target.psp_height && m.through == (through ? 1u : 0u);
++        if (!same) {
+             // The GE maps ndc to the screen as ndc * scale + offset - region offset,
+             // with y pointing down on screen; the shader flips y so that GL's window rows are the PSP's.
+             const float scale = target.scale;
+@@ -2268,7 +2270,13 @@ struct GlRenderer::Impl {
+             m.scissor_px[2] = round_away(static_cast<float>(sx2 + 1u) * scale) - m.scissor_px[0];
+             m.scissor_px[3] = round_away(static_cast<float>(sy2 + 1u) * scale) - m.scissor_px[1];
+             m.viewport = vp;
+-            std::memcpy(&m.target, key, sizeof(key));
++            m.target = target.address;
++            m.scale_bits = scale_bits;
++            m.width = target.width;
++            m.height = target.height;
++            m.psp_width = target.psp_width;
++            m.psp_height = target.psp_height;
++            m.through = through ? 1u : 0u;
+             m.valid = true;
+         }
+         std::memcpy(state.viewport, m.viewport_px, sizeof(state.viewport));
+@@ -2773,6 +2781,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "fill_test") settings.fill_test = flag;
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
++    else if (name == "vgl_skip_redundant") settings.vgl_skip_redundant = flag;
+     else if (name == "depth_bits") settings.depth_bits = u32;
+     else if (name == "target_textures") settings.target_textures = flag;
+     else if (name == "use_glclear") settings.use_glclear = flag;
+@@ -2795,7 +2804,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+@@ -2813,6 +2822,8 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     impl.minmax_ok = caps.blend_minmax;
+     impl.description = caps.renderer + " (" + caps.vendor + ", " + caps.version + ")";
+     glp::disable_dither();
++    glp::skip_redundant_state(impl.settings.vgl_skip_redundant);
++    if (impl.settings.vgl_skip_redundant) std::cout << "[gl] vitaGL: GXM state the previous draw set is not set again\n";
+     glEnable(GL_SCISSOR_TEST);
+     glEnableVertexAttribArray(0u);
+     glEnableVertexAttribArray(1u);
+@@ -2883,6 +2894,19 @@ void GlRenderer::begin_display_list() {
+ 
+ void GlRenderer::submit(const DrawCall &call, const GuestMemory &memory) { impl_->submit(call, memory); }
+ 
++void GlRenderer::prepare_draw(DrawCall &call) const {
++    // Only transformed draws: through-mode strips keep their shape for the sprite and picture clamps of submit().
++    if (call.through || (call.primitive != PrimitiveType::TriangleStrip && call.primitive != PrimitiveType::TriangleFan))
++        return;
++    const std::size_t vertex_total = call.vertices.size();
++    const std::size_t count = call.indices.empty() ? vertex_total : call.indices.size();
++    if (vertex_total == 0u || vertex_total > 65535u || count < 3u) return;
++    thread_local std::vector<std::uint16_t> list;
++    if (!triangle_indices(call.primitive, count, call.indices, vertex_total, list) || list.empty()) return;
++    call.indices.swap(list);
++    call.primitive = PrimitiveType::Triangles;
++}
++
+ void GlRenderer::write_back_frame(GuestMemory &memory) {
+     Impl &impl = *impl_;
+     if (!impl.ready || !impl.has_presented || impl.settings.writeback == 0u) return;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 5ba2ae4..63dbcd3 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -56,6 +56,10 @@ struct GlSettings {
+     bool texture_always_validate{false};
+     // Merge consecutive draws with the same state into one GL draw.
+     bool merge_draws{true};
++    // vitaGL only (vglSkipRedundantState, the port's vitaGL patch 0003): a draw does not set the GXM programs, fragment
++    // texture or vertex streams the previous draw set. An experiment (off): on the Vita each glDrawElements took about
++    // 15 us, and most of what it sets is what the draw before it set.
++    bool vgl_skip_redundant{false};
+     // Count, for each draw that could not join the batch in flight, which group of state kept it out (GlStats::
+     // merge_breaks; ge_replay --stats). Off in a game: it compares the state a second time for each batch.
+     bool merge_break_stats{false};
+@@ -199,6 +203,9 @@ public:
+ 
+     void begin_display_list() override;
+     void submit(const DrawCall &call, const GuestMemory &memory) override;
++    // Turns a transformed triangle strip or fan into the triangle list submit() would make of it (indices in the
++    // order of triangle_indices()), so that the GL thread only rebases them.
++    void prepare_draw(DrawCall &call) const override;
+     void write_back_frame(GuestMemory &memory) override;
+     void read_back_framebuffer(std::uint32_t source, GuestMemory &memory) override;
+     void upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+diff --git a/host/gpu/renderer.hpp b/host/gpu/renderer.hpp
+index ea0d561..d417e12 100644
+--- a/host/gpu/renderer.hpp
++++ b/host/gpu/renderer.hpp
+@@ -85,6 +85,10 @@ public:
+     // it for its GL thread) may take its vertex and index storage instead of copying it, leaving storage of its own
+     // (with capacity) in its place.
+     virtual void submit_taking(DrawCall &call, const GuestMemory &memory) { submit(call, memory); }
++    // Work on a draw that needs nothing but the draw itself, done where the draw is made before it reaches submit():
++    // SplitRenderer calls it on the walker's thread, so that the GL thread has less to do. The draw must come out
++    // equivalent (the same pictures); a renderer that has nothing to move there leaves it alone.
++    virtual void prepare_draw(DrawCall &call) const { (void)call; }
+     // Writes the framebuffer shown a frame or two ago back to guest VRAM, in
+     // the guest's pixel format at 480x272, so game code that copies a frame
+     // out of VRAM with the CPU or DMA finds the picture instead of stale
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 091aeb2..6304e2b 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -195,6 +195,8 @@ void SplitRenderer::submit_taking(DrawCall &draw, const GuestMemory &memory) {
+     // The vertices and indices change hands instead of being copied (most of a draw's bytes; on the Vita the copy was
+     // a measurable part of the walker's frame): the slot takes the draw's, the draw gets the slot's old ones (emptied,
+     // with their capacity) for the walker's next draw. The rest of the call is copied.
++    // The GL thread's work that needs nothing but the draw is done here, on the walker's thread.
++    inner_->prepare_draw(draw);
+     DrawSlot &slot = claim_slot(memory);
+     VertexList vertices;
+     std::vector<std::uint16_t> indices;
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+index 93162cd..4dae4cd 100644
+--- a/host/gpu/split_renderer.hpp
++++ b/host/gpu/split_renderer.hpp
+@@ -65,6 +65,7 @@ public:
+     [[nodiscard]] bool check_gpu_decode() const override { return inner_->check_gpu_decode(); }
+     void submit(const DrawCall &call, const GuestMemory &memory) override;
+     void submit_taking(DrawCall &call, const GuestMemory &memory) override;
++    void prepare_draw(DrawCall &call) const override { inner_->prepare_draw(call); }
+     void write_back_frame(GuestMemory &memory) override;
+     void read_back_framebuffer(std::uint32_t source, GuestMemory &memory) override;
+     void upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 2b2b4c5..9038289 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -12,6 +12,7 @@
+ //     --scale N           display framebuffer scale (default 2)
+ //     --offscreen-scale N scale of the smaller render targets (default 1)
+ //     --stats             print what each flip cost the renderer, and totals
++//     --prepare           pass every draw through Renderer::prepare_draw first (the split renderer's walker side)
+ //     --analyze           do not render: list the draws (state summary)
+ //     --zstats            with --analyze: one line per transformed draw with the view-space z range of its vertices
+ //     --regs              with --analyze: count the values the pixel, colour-test, stencil and logic-op
+@@ -109,6 +110,7 @@ struct Options {
+     std::uint32_t scale{2};
+     std::uint32_t offscreen_scale{1};
+     bool stats{};
++    bool prepare{};  // Renderer::prepare_draw before submit, as the split renderer does
+     bool analyze{};
+     bool zstats{};
+     bool regs{};
+@@ -527,6 +529,7 @@ int main(int argc, char **argv) {
+         else if (arg == "--scale") options.scale = static_cast<std::uint32_t>(std::atoi(value().c_str()));
+         else if (arg == "--offscreen-scale") options.offscreen_scale = static_cast<std::uint32_t>(std::atoi(value().c_str()));
+         else if (arg == "--stats") options.stats = true;
++        else if (arg == "--prepare") options.prepare = true;
+         else if (arg == "--cpu-time") g_cpu_time = true;
+         else if (arg == "--shader-lint") options.shader_lint = true;
+         else if (arg == "--analyze") options.analyze = true;
+@@ -801,7 +804,10 @@ int main(int argc, char **argv) {
+                     renderer->begin_display_list();
+                     if (options.no_submit) ge.set_draw_sink([](const gpu::DrawCall &) {});
+                     else
+-                        ge.set_draw_sink([&](const gpu::DrawCall &call) {
++                        ge.set_draw_sink([&](gpu::DrawCall &call) {
++                            // --prepare: the draw goes through Renderer::prepare_draw first, as the split renderer
++                            // does on the walker's thread (the replay must draw the same pictures).
++                            if (options.prepare) renderer->prepare_draw(call);
+                             if (options.regs) {
+                                 static const std::uint32_t watched[] = {0x1Cu, 0x20u, 0x24u, 0x25u, 0x26u, 0x27u, 0x28u,
+                                                                        0xD8u, 0xD9u, 0xDAu, 0xDBu, 0xDCu, 0xDDu, 0xE2u,

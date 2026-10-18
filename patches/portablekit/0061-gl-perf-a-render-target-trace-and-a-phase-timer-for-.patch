@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 11:04:24 +0000
+Subject: [PATCH] gl, perf: a render-target trace, and a phase timer for how
+ much of the list walk is vertex decoding
+
+- GlSettings::trace_targets (GL_TRACE_TARGETS=1, ge_replay --set trace_targets=1): one line for every change of the render target
+  drawn into: the draw's number in the frame, the target's address and PSP size, and why (draw, clear, feedback copy, readback,
+  movie).
+- phase::GeVertex: the time GeState spends decoding and skinning a draw's vertices, reported inside GeWalk (not beside it) so a
+  platform's status line can say how much of the walker's busy time that is.
+
+Found with the trace (mission 1, three frames): a mission frame switches target six times after the first, and all six are
+the game's own glow chain (scene target, 480x272 copy, 240x136, 120x68, back up to 240x136, composited into 480x272, then the
+display target for the HUD), with 7, 1, 1, 4, 1 and 4 draws between the switches. None can be merged or reordered by the renderer.
+
+Verified on x86-64: the trace prints as described; framework tests 45 of 45; the Vita package builds. Not verified: the timer's
+numbers (only a platform that installs a phase clock reads it; nothing has run it on the console).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index e8b1e2d..ee919f0 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "perf/bench.hpp"
+ #include "perf/frame_stats.hpp"
++#include "perf/phase_timers.hpp"
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
+@@ -1159,6 +1160,8 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
+     const std::uint64_t split_start = split ? perf::split_ticks() : 0u;
+     std::optional<bench::Scope> decode_scope;  // <prefix>_BENCH: the same stretch, restored on every return
+     decode_scope.emplace(bench::Decode);
++    std::optional<phase::Scope> vertex_phase;  // the status line's gevert=: the same stretch
++    vertex_phase.emplace(phase::GeVertex);
+     std::uint32_t vertex_count = count;
+     std::uint32_t first_vertex = 0u;
+     if (index_type != 0u && index_address_ != 0u) {
+@@ -1243,6 +1246,7 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
+                                  bone_matrices_.data());
+     if (split) perf::add_split(perf::Split::Decode, perf::split_ticks() - split_start);
+     decode_scope.reset();
++    vertex_phase.reset();
+     if (stride == 0u || (call.vertices.empty() && call.raw_vertices == nullptr)) return;
+     // A prim leaves VADDR/IADDR alone but advances the pointer it consumed, so
+     // a run of prims can share one setup. An indexed prim consumes indices, not
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index cf8e2e4..7ac1281 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -833,8 +833,11 @@ struct GlRenderer::Impl {
+         gt = GlTimes{};
+     }
+ 
+-    void bind_target(const Target &target) {
++    void bind_target(const Target &target, const char *why = "draw") {
+         if (cache.fbo == target.fbo) return;
++        if (settings.trace_targets)
++            std::fprintf(stderr, "[gl-target] draw %llu: 0x%08x %ux%u (%s)\n", static_cast<unsigned long long>(frame_draws),
++                         target.address, target.psp_width, target.psp_height, why);
+         glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+         cache.fbo = target.fbo;
+         ++st().target_switches;
+@@ -1858,7 +1861,7 @@ struct GlRenderer::Impl {
+             rect[0] = rect[1] = 0;
+             rect[2] = rect[3] = 2;
+         }
+-        bind_target(*target);
++        bind_target(*target, "clear");
+         if (!same_words(cache.scissor, rect, 4u)) {
+             glScissor(rect[0], rect[1], rect[2], rect[3]);
+             std::memcpy(cache.scissor, rect, sizeof(rect));
+@@ -2327,7 +2330,7 @@ struct GlRenderer::Impl {
+                     from.copy_serial = ~0ull;
+                 }
+                 if (from.copy_serial != from.draw_serial) {
+-                    bind_target(from);
++                    bind_target(from, "feedback copy");
+                     bind_texture(from.copy);
+                     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, static_cast<GLsizei>(from.width),
+                                         static_cast<GLsizei>(from.height));
+@@ -2798,7 +2801,7 @@ struct GlRenderer::Impl {
+         } timing_scope{*this, timing_start};
+         resolve_picture(target);
+         flush();
+-        bind_target(target);
++        bind_target(target, "readback");
+         rgba.resize(static_cast<std::size_t>(target.width) * target.height * 4u);
+         glPixelStorei(GL_PACK_ALIGNMENT, 1);
+         glReadPixels(0, 0, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height), GL_RGBA,
+@@ -2903,7 +2906,7 @@ struct GlRenderer::Impl {
+         }
+         st().texture_upload_bytes += static_cast<std::uint64_t>(width) * height * 4u;
+         ++st().uploads_frames;
+-        bind_target(target);
++        bind_target(target, "movie");
+         movie_blit(target, width, height);
+         ++target.draw_serial;
+         target.guest_words.clear();
+@@ -3036,6 +3039,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "depth_test") settings.depth_test = flag;
+     else if (name == "flip_winding") settings.flip_winding = flag;
+     else if (name == "trace") settings.trace = flag;
++    else if (name == "trace_targets") settings.trace_targets = flag;
+     else if (name == "draw_first") settings.draw_first = u32;
+     else if (name == "draw_last") settings.draw_last = u32;
+     else return false;
+@@ -3047,7 +3051,7 @@ const std::vector<std::string> &gl_setting_names() {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+         "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+-        "trace", "draw_first", "draw_last"};
++        "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+ }
+ 
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 1797c29..c3df002 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -120,6 +120,8 @@ struct GlSettings {
+     bool flip_winding{false};
+     // Print what each draw was turned into.
+     bool trace{false};
++    // Print every change of the render target being drawn into (which, how large, which draw of the frame, why).
++    bool trace_targets{false};
+     // Debugging: only the draws numbered draw_first..draw_last (1-based, per presented frame;
+     // draw_last 0: to the end) are drawn.
+     std::uint32_t draw_first{0};
+diff --git a/host/perf/phase_timers.hpp b/host/perf/phase_timers.hpp
+index 7a79df0..f5547c7 100644
+--- a/host/perf/phase_timers.hpp
++++ b/host/perf/phase_timers.hpp
+@@ -9,8 +9,9 @@
+ // while the owners of the phases write them.
+ //
+ // Phases are leaves of the guest's work and do not nest into each other except GeWalk, which contains the GlSubmit of
+-// its draws. What is left of a frame is the guest's own code and the HLE calls that were not timed. GeSync and FlipWait
+-// are waits, not work: they overlap the Idle of the kernel that sleeps meanwhile, and say what the guest waited for.
++// its draws and GeVertex (a report of how much of the walk is vertex decoding: never add it to GeWalk). What is left of a
++// frame is the guest's own code and the HLE calls that were not timed. GeSync and FlipWait are waits, not work: they overlap
++// the Idle of the kernel that sleeps meanwhile, and say what the guest waited for.
+ namespace portablekit::phase {
+ 
+ enum Phase : unsigned {
+@@ -27,6 +28,7 @@ enum Phase : unsigned {
+     SplitWait, // with the split GE thread: the walker waiting for the GL thread (draw ring full, presents ahead, a result)
+     WalkIdle,  // with the GE thread: the GE thread (the walker when split) asleep with no job to run
+     GlIdle,    // with the split GE thread: the GL thread asleep with no job to run
++    GeVertex,  // of GeWalk: decoding (and skinning) a draw's vertices from guest memory; counted inside GeWalk, never beside it
+     kCount
+ };
+ 

@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 23:02:55 +0000
+Subject: [PATCH] Kernel tests: lean entries, forced interpretation, lean-only
+
+A lean function that waits in the middle of itself and calls back into the
+interpreter, reached by jal from interpreted code and by call_guest; the same
+function forced into the interpreter (INTERP_ONLY) logs the same thing; with
+LEAN_ONLY the first interpreted entry ends the run.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b1d6ccd..9838f08 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -537,7 +537,7 @@ if(PSPRECOMP_BUILD_TESTS)
+     target_link_libraries(portablekit_kernel_tests PRIVATE pk_runtime psprecomp_core ${CMAKE_DL_LIBS})
+     _portablekit_link_hle_extensions(portablekit_kernel_tests)
+     set_target_properties(portablekit_kernel_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+-    foreach(_scenario RANGE 0 8)
++    foreach(_scenario RANGE 0 11)
+         add_test(NAME portablekit_kernel_tests_${_scenario} COMMAND portablekit_kernel_tests ${_scenario})
+     endforeach()
+ endif()
+diff --git a/tests/kernel_tests.cpp b/tests/kernel_tests.cpp
+index 3a7033c..c19cf05 100644
+--- a/tests/kernel_tests.cpp
++++ b/tests/kernel_tests.cpp
+@@ -168,6 +168,9 @@ struct Code {
+     Code &terminate(std::int32_t uid, bool remove) { li(4u, static_cast<std::uint32_t>(uid)); li(5u, remove ? 1u : 0u); call(kTerminate); return *this; }
+     Code &priority(std::uint32_t value) { li(4u, value); call(kPriority); return *this; }
+     Code &set_v0(std::uint32_t value) { li(2u, value); return *this; }
++    Code &log_v0() { op(0x00022021u); call(kLog); return *this; }              // addu a0, zero, v0; log(a0)
++    Code &add_v0(std::uint32_t value) { op(i_type(0x09u, 2u, 2u, value)); return *this; }  // addiu v0, v0, value
++    Code &jal(std::uint32_t target) { call(target); return *this; }
+ };
+ 
+ // A guest function: a frame, the steps, a return. A step may set v0 last to answer.
+@@ -374,6 +377,85 @@ void stop_from_deep_inside() {
+     check(f.runtime.stopped() && f.runtime.stop_reason() == "test finished", "the run ended with the guest's reason");
+ }
+ 
++// ---------------------------------------------------------------------------
++// Lean (function-granular) code. A lean entry is a plain C++ function over g_cpu; it
++// runs on the calling thread's host stack, so a system call in the middle of it can
++// block and the thread comes back to the same C++ frame.
++
++int g_lean_wait_runs = 0;
++
++// The lean twin of code slot 2: delay, log 11, call the interpreted slot 3, add one to its answer.
++void lean_wait() {
++    ++g_lean_wait_runs;
++    g_cpu.gpr[4] = 500u;
++    pk_hle_call(kDelay);
++    g_cpu.gpr[4] = 11u;
++    pk_hle_call(kLog);
++    pk_guest_call(slot_address(3));
++    g_cpu.gpr[2] += 1u;
++}
++
++psprecomp::LeanEntry g_lean_table[0x3000];
++
++// Slot 2 is the same function twice: the interpreted words and the lean entry. Both must do
++// the same things in the same order.
++void install_lean_program(Fixture &f) {
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID a = f.create("a", 4, 40u);
++    const SceUID b = f.create("b", 5, 40u);
++    install(f.runtime, 0, Code().start(a).start(b).exit(0u, false));
++    install(f.runtime, 2, Code().delay(500u).log(11u).jal(slot_address(3)).add_v0(1u));
++    install(f.runtime, 3, Code().log(12u).set_v0(77u));
++    install(f.runtime, 4, Code().log(10u).jal(slot_address(2)).log_v0().log(13u)
++                              .call_guest(slot_address(2), 0u).log(14u).stop());
++    install(f.runtime, 5, Code().log(20u).delay(100u).log(21u).exit(0u, false));
++    g_lean_table[(slot_address(2) - kCodeBase) >> 2u] = &lean_wait;
++    psprecomp::exec_set_lean_table(g_lean_table, 0x3000u, kCodeBase);
++    f.start(starter);
++}
++
++const std::vector<std::uint32_t> kLeanProgramLog{10u, 20u, 21u, 11u, 12u, 78u, 13u, 11u, 12u, 78u, 14u};
++
++// Interpreted code calls a lean function that waits in the middle of itself and calls back
++// into the interpreter; another thread runs while it waits. Reached by jal and by call_guest.
++void lean_entry_from_interpreter() {
++    Fixture f;
++    install_lean_program(f);
++    f.run();
++    log_is(kLeanProgramLog, "a lean function that waits and calls the interpreter runs to its end, twice");
++    check(g_lean_wait_runs == 2, "the lean entry ran twice, the interpreted twin never");
++    const psprecomp::ExecStats stats = psprecomp::exec_stats();
++    check(stats.interpreter_to_lean == 1u, "one jal from interpreted code reached the lean entry");
++    check(stats.lean_calls == 1u, "one pk_guest_call (call_guest) ran a lean entry");
++}
++
++// INTERP_ONLY: the same program with that function forced into the interpreter. Same log.
++void lean_entry_forced_to_interpreter() {
++    Fixture f;
++    install_lean_program(f);
++    psprecomp::ExecOptions options;
++    options.interp_only = "0x08A08000";
++    psprecomp::exec_configure(options);
++    f.run();
++    log_is(kLeanProgramLog, "forced into the interpreter the function does what its lean twin did");
++    check(g_lean_wait_runs == 0, "the lean entry did not run");
++    const psprecomp::ExecStats stats = psprecomp::exec_stats();
++    check(stats.interpreter_to_lean == 0u && stats.lean_calls == 0u, "no call reached a lean entry");
++}
++
++// LEAN_ONLY: the first guest code that would be interpreted ends the run, with its address.
++void lean_only_refuses_the_interpreter() {
++    Fixture f;
++    install_lean_program(f);
++    psprecomp::ExecOptions options;
++    options.lean_only = true;
++    psprecomp::exec_configure(options);
++    f.run();
++    check(g_log.empty(), "nothing ran in the interpreter");
++    check(f.runtime.stopped() && f.runtime.stop_reason().find("lean-only") != std::string::npos,
++          "the run stopped, saying why");
++}
++
+ struct Scenario {
+     const char *name;
+     void (*run)();
+@@ -389,6 +471,9 @@ const Scenario kScenarios[] = {
+     {"terminate and delete", &terminate_and_delete},
+     {"many short lives", &many_short_lives},
+     {"stop from deep inside", &stop_from_deep_inside},
++    {"lean entry from the interpreter", &lean_entry_from_interpreter},
++    {"lean entry forced to the interpreter", &lean_entry_forced_to_interpreter},
++    {"lean only refuses the interpreter", &lean_only_refuses_the_interpreter},
+ };
+ constexpr std::size_t kScenarioCount = sizeof(kScenarios) / sizeof(kScenarios[0]);
+ 

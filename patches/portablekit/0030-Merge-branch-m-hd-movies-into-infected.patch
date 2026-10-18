@@ -1,0 +1,2163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 12:51:27 +0000
+Subject: [PATCH] Merge branch 'm-hd-movies' into infected
+
+Brings in:
+* HD replacement movies: MP4 reader, frame store, session, software source, GL marker hook
+* HD movies: CPU time statistics, quiet fallback trace
+* HD movies: platform source factory and native-frame binder
+* tests: HD movie MP4 reader, library, marker, frame store and session
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ec33579..bbaf1e9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -333,6 +333,24 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_settings_tests COMMAND portablekit_settings_tests)
+ endif()
+ 
++# HD replacement movies: the MP4 reader, the library, the marker and the frame store, a session with a fake source.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_hd_movie_tests
++        "${PORTABLEKIT_ROOT}/tests/hd_movie_tests.cpp"
++        "${PORTABLEKIT_ROOT}/tests/test_profile.cpp"
++        "${PORTABLEKIT_ROOT}/host/profile.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/hd_movie.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/hd_frame_store.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/hd_source_software.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/avc_decoder.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/mp4_reader.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/psmf_header.cpp")
++    target_include_directories(portablekit_hd_movie_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    target_link_libraries(portablekit_hd_movie_tests PRIVATE psprecomp_core)
++    set_target_properties(portablekit_hd_movie_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_hd_movie_tests COMMAND portablekit_hd_movie_tests)
++endif()
++
+ # The port settings (host/settings/port_settings.hpp): the key table, settings.txt, overrides, the restart rule.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_port_settings_tests
+@@ -598,6 +616,7 @@ if(PORTABLEKIT_GE_REPLAY)
+         "${PORTABLEKIT_ROOT}/host/gpu/texture_decode.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/texture_key.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/hd_texture_pack.cpp"
++        "${PORTABLEKIT_ROOT}/host/movie/hd_frame_store.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_dump.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_worker.cpp"
+         "${PORTABLEKIT_ROOT}/host/profile.cpp"
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index c36a40c..04bc573 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -38,6 +38,10 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/movie/avc_decoder.cpp
+     host/movie/psmf_demuxer.cpp
+     host/movie/psmf_header.cpp
++    host/movie/mp4_reader.cpp
++    host/movie/hd_frame_store.cpp
++    host/movie/hd_movie.cpp
++    host/movie/hd_source_software.cpp
+     host/audio/audio_sink.cpp
+     host/audio/sas_core.cpp
+     host/gpu/ge_state.cpp
+@@ -172,6 +176,7 @@ set(PORTABLEKIT_GL_RENDERER_SOURCES
+     host/gpu/mip_chain.cpp
+     host/gpu/gl/gl_png.cpp
+     host/gpu/gl/gl_hd_textures.cpp
++    host/gpu/gl/gl_hd_movie.cpp
+     host/gpu/gl/gl_platform_egl.cpp
+     CACHE INTERNAL "PortableKit GLES2 renderer sources, relative to PORTABLEKIT_ROOT")
+ 
+diff --git a/host/gpu/gl/gl_hd_movie.cpp b/host/gpu/gl/gl_hd_movie.cpp
+new file mode 100644
+index 0000000..22b4d6e
+--- /dev/null
++++ b/host/gpu/gl/gl_hd_movie.cpp
+@@ -0,0 +1,93 @@
++#include "gl_hd_movie.hpp"
++
++#include <algorithm>
++
++namespace portablekit::gpu {
++
++namespace {
++inline std::uint8_t clamp8(int value) { return static_cast<std::uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value)); }
++} // namespace
++
++void hd_picture_to_rgba(const movie::Picture &picture, std::uint8_t *out) {
++    const std::uint32_t width = picture.width, height = picture.height;
++    const std::uint32_t chroma_width = (width + 1u) / 2u;
++    const bool full = picture.full_range;
++    // Q8 BT.601: limited range (Y 16..235, C 16..240) and full range (the movies of the disc are full range).
++    const int y_scale = full ? 256 : 298, y_bias = full ? 0 : 16;
++    const int r_v = full ? 359 : 409, g_u = full ? 88 : 100, g_v = full ? 183 : 208, b_u = full ? 454 : 516;
++    for (std::uint32_t row = 0; row < height; ++row) {
++        const std::uint8_t *luma = picture.y.data() + static_cast<std::size_t>(row) * width;
++        const std::uint8_t *cb = picture.cb.data() + static_cast<std::size_t>(row / 2u) * chroma_width;
++        const std::uint8_t *cr = picture.cr.data() + static_cast<std::size_t>(row / 2u) * chroma_width;
++        std::uint8_t *pixel = out + static_cast<std::size_t>(row) * width * 4u;
++        for (std::uint32_t x = 0; x < width; ++x) {
++            const int u = cb[x >> 1u] - 128, v = cr[x >> 1u] - 128;
++            const int c = y_scale * (luma[x] - y_bias) + 128;
++            pixel[0] = clamp8((c + r_v * v) >> 8);
++            pixel[1] = clamp8((c - g_u * u - g_v * v) >> 8);
++            pixel[2] = clamp8((c + b_u * u) >> 8);
++            pixel[3] = 255u;
++            pixel += 4;
++        }
++    }
++}
++
++namespace {
++HdNativeBinder *g_binder = nullptr;
++} // namespace
++
++void set_hd_native_binder(HdNativeBinder *binder) { g_binder = binder; }
++
++GLuint GlHdMovieTexture::update(const movie::HdPicture &picture) {
++    if (picture.native) {
++        if (g_binder == nullptr || picture.width == 0u || picture.height == 0u) return 0u;
++        const std::uint64_t begin = movie::thread_cpu_us();
++        const GLuint texture = g_binder->texture_for(picture);
++        if (texture == 0u) return 0u;
++        release();  // an own texture of an earlier software picture
++        texture_ = texture;
++        native_ = true;
++        width_ = picture.width;
++        height_ = picture.height;
++        upload_us_ += movie::thread_cpu_us() - begin;
++        ++uploads_;
++        glBindTexture(GL_TEXTURE_2D, texture_);
++        return texture_;
++    }
++    if (picture.yuv.y.empty() || picture.width == 0u || picture.height == 0u) return 0u;
++    if (native_) {
++        texture_ = 0u;
++        native_ = false;
++    }
++    if (texture_ == 0u || width_ != picture.width || height_ != picture.height) {
++        release();
++        glGenTextures(1, &texture_);
++        glBindTexture(GL_TEXTURE_2D, texture_);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(picture.width), static_cast<GLsizei>(picture.height), 0, GL_RGBA,
++                     GL_UNSIGNED_BYTE, nullptr);
++        width_ = picture.width;
++        height_ = picture.height;
++    } else {
++        glBindTexture(GL_TEXTURE_2D, texture_);
++    }
++    const std::uint64_t begin = movie::thread_cpu_us();
++    rgba_.resize(static_cast<std::size_t>(width_) * height_ * 4u);
++    hd_picture_to_rgba(picture.yuv, rgba_.data());
++    const std::uint64_t converted = movie::thread_cpu_us();
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(width_), static_cast<GLsizei>(height_), GL_RGBA, GL_UNSIGNED_BYTE,
++                    rgba_.data());
++    convert_us_ += converted - begin;
++    upload_us_ += movie::thread_cpu_us() - converted;
++    ++uploads_;
++    return texture_;
++}
++
++void GlHdMovieTexture::release() {
++    if (texture_ != 0u && !native_) glDeleteTextures(1, &texture_);
++    texture_ = 0u;
++    native_ = false;
++    width_ = height_ = 0u;
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_hd_movie.hpp b/host/gpu/gl/gl_hd_movie.hpp
+new file mode 100644
+index 0000000..82f9e29
+--- /dev/null
++++ b/host/gpu/gl/gl_hd_movie.hpp
+@@ -0,0 +1,55 @@
++#pragma once
++
++// The GL side of the HD replacement movies (host/movie/hd_movie.hpp): one texture that always holds the replacement picture
++// the game is showing, and the conversion that fills it.
++//
++// Desktop (and any platform without a video decoder of its own that hands over GPU frames): the picture is planar 4:2:0 in
++// system memory; it is converted to RGBA on the CPU and uploaded. A platform whose HdSource delivers a native frame
++// (HdPicture::native) registers an HdNativeBinder that makes a GL texture sample it (on the Vita the texture unit does the
++// conversion; vita/app/src/app_hd_movie.cpp).
++
++#include "../../movie/hd_movie.hpp"
++#include "gl_platform.h"
++
++#include <cstdint>
++#include <vector>
++
++namespace portablekit::gpu {
++
++// 4:2:0 planar to 32-bit RGBA (R first), BT.601 as the original movies are shown; `picture.full_range` selects the range.
++// `out` holds width * height * 4 bytes.
++void hd_picture_to_rgba(const movie::Picture &picture, std::uint8_t *out);
++
++// Makes the frame of a native HdPicture sampleable. Called on the render thread (GL calls are allowed).
++class HdNativeBinder {
++public:
++    virtual ~HdNativeBinder() = default;
++    // The GL texture that samples `picture.native` as a 2D texture of picture.width x picture.height; 0 when it cannot. The
++    // binder owns the texture; the same frame may be asked for again and again.
++    virtual GLuint texture_for(const movie::HdPicture &picture) = 0;
++};
++// Registers the binder of this platform (null: none; a native picture then cannot be shown and the original movie plays).
++void set_hd_native_binder(HdNativeBinder *binder);
++
++class GlHdMovieTexture {
++public:
++    ~GlHdMovieTexture() { release(); }
++    // Makes `picture` the content of the texture. Returns the texture name, 0 when it cannot be shown. The caller has
++    // flushed the draws that use the old content, and treats the texture binding as changed.
++    GLuint update(const movie::HdPicture &picture);
++    void release();
++    [[nodiscard]] GLuint id() const noexcept { return texture_; }
++    [[nodiscard]] std::uint64_t uploads() const noexcept { return uploads_; }
++    // CPU time of the render thread in the conversion and in the upload call, in microseconds, over all uploads.
++    [[nodiscard]] std::uint64_t convert_microseconds() const noexcept { return convert_us_; }
++    [[nodiscard]] std::uint64_t upload_microseconds() const noexcept { return upload_us_; }
++
++private:
++    GLuint texture_{};
++    bool native_{};  // texture_ belongs to the HdNativeBinder
++    std::uint32_t width_{}, height_{};
++    std::vector<std::uint8_t> rgba_;
++    std::uint64_t uploads_{}, convert_us_{}, upload_us_{};
++};
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 57a8958..6ce626d 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -18,7 +18,9 @@
+ #include "../texture_decode.hpp"
+ #include "../triangle_indices.hpp"
+ #include "gl_overlay.hpp"
++#include "gl_hd_movie.hpp"
+ #include "gl_hd_textures.hpp"
++#include "../../profile.hpp"
+ #include "gl_platform.h"
+ #include "gl_shaders.hpp"
+ 
+@@ -257,6 +259,7 @@ struct TextureBinding {
+     float offset[2]{};
+     bool from_target{};
+     bool opaque{};
++    bool hd_movie{};         // the picture of an HD replacement movie (gfx.hd_movies): not the game's texels
+     std::uint8_t hd_mips{};  // mip levels of an HD replacement (0: the original texture)
+ };
+ 
+@@ -313,6 +316,8 @@ struct GlRenderer::Impl {
+     std::vector<std::uint32_t> decode_buffer;
+     std::vector<std::uint8_t> wrap_scratch;  // a texture that wraps the end of VRAM, gathered into one run
+     GlHdTextures hd;          // HD texture pack (gfx.hd_textures) and the texture dump
++    GlHdMovieTexture hd_movie_texture;                       // the replacement picture of an HD movie (gfx.hd_movies)
++    std::shared_ptr<const movie::HdPicture> hd_movie_shown;  // the picture the texture holds
+     bool hd_configured{};
+     GLuint upload_texture{};  // for upload_frame
+     GLuint clear_texture{};   // 1x1 transparent black for quad_clear
+@@ -1613,6 +1618,47 @@ struct GlRenderer::Impl {
+         material_version = call.material_version;
+     }
+ 
++    // gfx.hd_movies: the texture of this draw starts with the marker of the movie player (host/movie/hd_movie.hpp), so what
++    // the game means to show is picture n of the replacement, not the pixels in memory. The replacement lives in one GL
++    // texture that is updated when the picture changes; the draws in flight are ended first, they may still use the
++    // previous one. The texture coordinates count the original's texels (480x272), the replacement has twice as many.
++    bool resolve_hd_movie(const GuestMemory &memory, const DrawCall &call, TextureBinding &out) {
++        movie::HdMarker marker;
++        if (!movie::read_hd_marker(memory, call.texture.address, marker) || marker.width == 0u || marker.height == 0u) return false;
++        std::shared_ptr<const movie::HdPicture> picture = movie::HdFrameStore::instance().find(marker.session, marker.index);
++        if (!picture) return false;
++        if (picture != hd_movie_shown || hd_movie_texture.id() == 0u) {
++            flush();
++            if (hd_movie_texture.update(*picture) == 0u) return false;
++            cache.texture = ~0u;  // the update bound the texture itself
++            hd_movie_shown = picture;
++            static const bool trace = portablekit::env("TRACE_HDMOVIE") != nullptr;
++            if (trace) {
++                const auto uploads = hd_movie_texture.uploads();
++                std::fprintf(stderr, "[hdmovie] draw: session %u picture %u, %ux%u, upload %llu\n", marker.session, marker.index,
++                             picture->width, picture->height, static_cast<unsigned long long>(uploads));
++                if (uploads % 256u == 0u)
++                    std::fprintf(stderr, "[hdmovie] render thread CPU a picture over %llu: %.2f ms conversion, %.2f ms upload call\n",
++                                 static_cast<unsigned long long>(uploads), static_cast<double>(hd_movie_texture.convert_microseconds()) / 1000.0 / static_cast<double>(uploads),
++                                 static_cast<double>(hd_movie_texture.upload_microseconds()) / 1000.0 / static_cast<double>(uploads));
++            }
++        }
++        out.id = hd_movie_texture.id();
++        out.hd_movie = true;
++        out.opaque = true;
++        const float width = static_cast<float>(marker.width), height = static_cast<float>(marker.height);
++        if (call.through) {
++            out.scale[0] = 1.0f / width;
++            out.scale[1] = 1.0f / height;
++        } else {
++            out.scale[0] = call.texture.scale_u * static_cast<float>(call.texture.width) / width;
++            out.scale[1] = call.texture.scale_v * static_cast<float>(call.texture.height) / height;
++            out.offset[0] = call.texture.offset_u;
++            out.offset[1] = call.texture.offset_v;
++        }
++        return true;
++    }
++
+     // Resolves the texture of a draw: the target it lies in, or a decoded and cached one.
+     // Returns false when the draw cannot be drawn.
+     bool resolve_texture(const DrawCall &call, const GuestMemory &memory, Target &drawn, TextureBinding &out) {
+@@ -1665,6 +1711,10 @@ struct GlRenderer::Impl {
+             }
+             return true;
+         }
++        // An HD replacement movie: the buffer the movie player decoded into carries a marker instead of a picture.
++        if (movie::HdFrameStore::instance().in_use() && !texture.swizzled && texture.format == TextureFormat::Rgba8888 &&
++            resolve_hd_movie(memory, call, out))
++            return true;
+         TextureEntry *entry = acquire_texture(memory, texture);
+         if (entry == nullptr) return false;
+         out.id = entry->id;
+@@ -1802,7 +1852,7 @@ struct GlRenderer::Impl {
+         }
+         const bool rect_clamp = through && textured && settings.rect_clamp;
+         float picture_rect[4] = {};
+-        const bool sharpen = opt.movie_sharp && rect_clamp && !binding.from_target && picture_draw(call, target, picture_rect);
++        const bool sharpen = opt.movie_sharp && rect_clamp && !binding.from_target && !binding.hd_movie && picture_draw(call, target, picture_rect);
+         if (sharpen) ++st().sharp_draws;
+         // gfx.antialiasing=fxaa: the 3D picture of the display ends where the HUD begins.
+         if (opt.fxaa && !fxaa_done && target.stride >= 512u) fxaa_scene_step(target, through, textured && binding.from_target);
+@@ -1902,6 +1952,7 @@ struct GlRenderer::Impl {
+                     ++st().mip_draws;
+                 }
+             }
++            if (binding.hd_movie) linear_min = linear_mag = true;  // a picture with its own detail is always sampled smoothly
+             state.min_filter = with_mips ? GL_LINEAR_MIPMAP_LINEAR : (linear_min ? GL_LINEAR : GL_NEAREST);
+             state.mag_filter = linear_mag ? GL_LINEAR : GL_NEAREST;
+             if (binding.hd_mips != 0u) {
+@@ -1925,8 +1976,8 @@ struct GlRenderer::Impl {
+                 state.inv_size[2] = texture_w;
+                 state.inv_size[3] = texture_h;
+             }
+-            state.wrap_s = binding.from_target || call.texture.wrap_s != 0u ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+-            state.wrap_t = binding.from_target || call.texture.wrap_t != 0u ? GL_CLAMP_TO_EDGE : GL_REPEAT;
++            state.wrap_s = binding.from_target || binding.hd_movie || call.texture.wrap_s != 0u ? GL_CLAMP_TO_EDGE : GL_REPEAT;
++            state.wrap_t = binding.from_target || binding.hd_movie || call.texture.wrap_t != 0u ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+             state.uv[0] = binding.scale[0];
+             state.uv[1] = binding.scale[1];
+             state.uv[2] = binding.offset[0];
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index d29e81b..78bcab6 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -179,6 +179,7 @@ public:
+                       std::uint32_t height, std::uint32_t stride) override;
+     bool present(std::uint32_t display_address,
+                  std::optional<std::chrono::steady_clock::time_point> moment = std::nullopt) override;
++    [[nodiscard]] bool supports_hd_movies() const noexcept override { return true; }
+     [[nodiscard]] bool has_overlay() const noexcept override { return true; }
+     void set_overlay(OverlayActive active, OverlayPaint paint) override;
+     bool present_overlay() override;
+diff --git a/host/gpu/renderer.hpp b/host/gpu/renderer.hpp
+index 96bf333..eb34ee1 100644
+--- a/host/gpu/renderer.hpp
++++ b/host/gpu/renderer.hpp
+@@ -97,6 +97,9 @@ public:
+     // it at most once per presented frame.
+     virtual void upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+                               std::uint32_t height, std::uint32_t stride) = 0;
++    // Whether the backend shows HD replacement movies (host/movie/hd_movie.hpp): it recognises the marker the movie player
++    // leaves in a picture buffer and draws the replacement picture instead. The movie player replaces nothing otherwise.
++    [[nodiscard]] virtual bool supports_hd_movies() const noexcept { return false; }
+ 
+     // ---- presenting ----------------------------------------------------
+ 
+diff --git a/host/hle/hle_io.cpp b/host/hle/hle_io.cpp
+index 63173f8..cce9a46 100644
+--- a/host/hle/hle_io.cpp
++++ b/host/hle/hle_io.cpp
+@@ -8,6 +8,7 @@
+ #include "kernel/fast_loading.hpp"
+ #include "kernel/load_trace.hpp"
+ #include "kernel/iso_image.hpp"
++#include "movie/hd_movie.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ #include "portablekit/hle_extension.hpp"
+@@ -270,6 +271,8 @@ std::int64_t open_file(const std::string &full_path, std::uint32_t flags) {
+     } else {
+         return static_cast<std::int32_t>(io_error::kDeviceNotFound);
+     }
++    // gfx.hd_movies identifies a movie by its PSMF header and, failing that, by the name of the movie file opened last.
++    movie::HdLibrary::instance().note_file_opened(full_path);
+     const std::uint32_t fd = io().next_fd++;
+     io().files.emplace(fd, std::move(file));
+     return fd;
+diff --git a/host/hle/hle_mpeg.cpp b/host/hle/hle_mpeg.cpp
+index 677752f..e527c85 100644
+--- a/host/hle/hle_mpeg.cpp
++++ b/host/hle/hle_mpeg.cpp
+@@ -17,9 +17,13 @@
+ #include "hle_common.hpp"
+ 
+ #include "audio/atrac_decoder.hpp"
++#include "gpu/hd_texture_pack.hpp"
++#include "gpu/renderer.hpp"
+ #include "perf/bench.hpp"
+ #include "movie/avc_decoder.hpp"
++#include "movie/hd_movie.hpp"
+ #include "movie/psmf_demuxer.hpp"
++#include "settings/port_settings.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ 
+@@ -130,11 +134,14 @@ struct MpegState {
+     // (the GE's colour formats: 0 5650, 1 5551, 2 4444, 3 8888).
+     std::uint32_t default_frame_width{};
+     std::uint32_t pixel_mode{3u};
++    // gfx.hd_movies: the replacement of the movie being played, if there is one (hd_movie.hpp).
++    std::unique_ptr<movie::HdSession> hd;
+ };
+ 
+ struct MpegModule {
+     std::map<std::uint32_t, std::unique_ptr<MpegState>> instances;  // by SceMpeg address
+     std::uint32_t pending_stream_packets{};  // from the last header the game queried
++    std::vector<std::uint8_t> pending_header;  // the PSMF header the game queried before there was a SceMpeg to give it to
+     // YCbCr buffer -> the picture written into it, for sceJpegCsc.
+     std::map<std::uint32_t, movie::Picture> ycbcr;
+ };
+@@ -149,6 +156,33 @@ MpegState *find_mpeg(std::uint32_t address) {
+     return found != module().instances.end() ? found->second.get() : nullptr;
+ }
+ 
++// ---- HD replacement movies (gfx.hd_movies, movie/hd_movie.hpp) ------------------------------------------------------------
++
++// Looks for the replacement of the movie whose PSMF header the game just showed the library. No replacement installed, or
++// none for this movie: the session stays empty and the original plays as before.
++void attach_hd_session(MpegState &state, std::span<const std::uint8_t> header) {
++    state.hd.reset();
++    movie::HdLibrary &library = movie::HdLibrary::instance();
++    if (!library.installed()) return;
++    std::string why;
++    const movie::HdMovie *replacement = library.identify(header, &why);
++    movie::PsmfTiming timing;
++    if (replacement == nullptr || !movie::parse_psmf_timing(header, timing)) {
++        if (portablekit::env("TRACE_HDMOVIE") != nullptr) std::cerr << "[hdmovie] no replacement: " << why << "\n";
++        return;
++    }
++    state.hd = std::make_unique<movie::HdSession>(*replacement, timing);
++}
++
++// Whether the replacement should stand in for the decoder now: the setting is on, the renderer shows replacements, and the
++// game decodes into main memory as 32-bit pixels (a picture in VRAM goes to the renderer by another way).
++bool hd_movies_wanted(const MpegState &state, std::uint32_t destination, std::uint32_t stride) {
++    if (!port::hd_movies() || state.pixel_mode != 3u || stride == 0u) return false;
++    if ((destination & 0x1F000000u) == 0x04000000u) return false;
++    const gpu::Renderer *renderer = media_renderer();
++    return renderer != nullptr && renderer->available() && renderer->supports_hd_movies();
++}
++
+ void finish_traced(AllegrexContext &ctx, const char *name, std::uint32_t result, const std::string &details = {},
+                    unsigned arguments = 4u) {
+     if (trace_mpeg()) {
+@@ -364,6 +398,10 @@ void register_library(HleRegistrar &hle) {
+             log_once("mpeg-avc", "[mpeg] the H.264 decoder could not be opened; movies will be black");
+         state->started_us = kernel().now_us();
+         state->started_real = std::chrono::steady_clock::now();
++        if (!module().pending_header.empty()) {
++            attach_hd_session(*state, module().pending_header);
++            module().pending_header.clear();
++        }
+         module().instances[mpeg] = std::move(state);
+         finish_traced(ctx, "sceMpegCreate", 0u, {}, 7u);
+     });
+@@ -393,6 +431,16 @@ void register_library(HleRegistrar &hle) {
+         const std::uint32_t offset = load_be32(memory, header + 8u);
+         module().pending_stream_packets = load_be32(memory, header + 12u) / static_cast<std::uint32_t>(movie::kPackSize);
+         if (MpegState *state = find_mpeg(arg(ctx, 0))) state->stream_packets = module().pending_stream_packets;
++        if (memory.contains(header, movie::kPsmfHeaderBytes)) {
++            std::vector<std::uint8_t> bytes(movie::kPsmfHeaderBytes);
++            memory.copy_out(header, bytes);
++            if (MpegState *state = find_mpeg(arg(ctx, 0))) {
++                attach_hd_session(*state, bytes);
++                module().pending_header.clear();
++            } else {
++                module().pending_header = std::move(bytes);
++            }
++        }
+         memory.store32(arg(ctx, 2), offset);
+         finish_traced(ctx, "sceMpegQueryStreamOffset", 0u, "offset=" + std::to_string(offset), 3u);
+     });
+@@ -462,6 +510,7 @@ void register_library(HleRegistrar &hle) {
+             state->video.reset();
+             state->video_unit.reset();
+             state->audio_unit.reset();
++            if (state->hd) state->hd->restart();
+         }
+         finish_traced(ctx, "sceMpegFlushAllStream", 0u, {}, 1u);
+     });
+@@ -599,22 +648,32 @@ void register_decoding(HleRegistrar &hle) {
+         }
+         auto &memory = rt.memory();
+         bool produced = false;
++        bool replaced = false;  // gfx.hd_movies: the picture of the replacement stands in, the decoder did not run
++        std::uint32_t width = arg(ctx, 2);
++        if (width == 0u) width = state->default_frame_width != 0u ? state->default_frame_width : state->picture.width;
++        const std::uint32_t destination = memory.load32(arg(ctx, 3));
+         if (state->video_unit) {
+-            produced = state->video.decode(state->video_unit->data, state->picture);
++            if (state->hd) {
++                replaced = state->hd->show(memory, destination, width, state->video_unit->data, state->video_unit->pts,
++                                           hd_movies_wanted(*state, destination, width));
++                // Back to the original in the middle of a movie: its decoder has not seen the units since the last IDR.
++                if (!replaced)
++                    for (const auto &unit : state->hd->take_replay()) state->video.decode(unit, state->picture);
++            }
++            produced = replaced || state->video.decode(state->video_unit->data, state->picture);
+             state->video_unit.reset();
+         }
+-        std::uint32_t width = arg(ctx, 2);
+-        if (width == 0u) width = state->default_frame_width != 0u ? state->default_frame_width : state->picture.width;
+         if (produced) {
+             ++state->pictures;
+-            const std::uint32_t destination = memory.load32(arg(ctx, 3));
+-            store_pixels(memory, destination, width, state->pixel_mode, state->picture);
+-            show_cpu_picture_in_vram(rt, destination, state->picture.width, state->picture.height, width,
+-                                     state->pixel_mode);
++            if (!replaced) {
++                store_pixels(memory, destination, width, state->pixel_mode, state->picture);
++                show_cpu_picture_in_vram(rt, destination, state->picture.width, state->picture.height, width,
++                                         state->pixel_mode);
++            }
+         }
+         if (arg(ctx, 4) != 0u) memory.store32(arg(ctx, 4), produced ? 1u : 0u);
+         finish_traced(ctx, "sceMpegAvcDecode", 0u,
+-                      produced ? "picture " + std::to_string(state->pictures) + " width " + std::to_string(width) + " mode " +
++                      produced ? "picture " + std::to_string(state->pictures) + (replaced ? " (HD)" : "") + " width " + std::to_string(width) + " mode " +
+                                      std::to_string(state->pixel_mode) + " to " + psprecomp::hex32(memory.load32(arg(ctx, 3)))
+                                : "none",
+                       5u);
+@@ -823,6 +882,17 @@ void register_movie_skip(HleRegistrar &hle) {
+ 
+ } // namespace
+ 
++// gfx.hd_movies: reads the replacement index of the data directory; the setting is offered when there is something to show
++// and the renderer can show it. A guest pause (the settings menu) stops a replacement source that runs on its own clock.
++static void configure_hd_movies() {
++    movie::HdLibrary &library = movie::HdLibrary::instance();
++    library.configure(gpu::hd_data_root().string());
++    const gpu::Renderer *renderer = media_renderer();
++    if (library.installed() && renderer != nullptr && renderer->supports_hd_movies())
++        port::settings().set_unavailable(port::Key::GfxHdMovies, nullptr);
++    kernel().add_pause_listener([](bool paused) { movie::HdSession::pause_all(paused); });
++}
++
+ bool mpeg_active() { return !module().instances.empty(); }
+ 
+ void register_mpeg(HleRegistrar &hle) {
+@@ -834,6 +904,7 @@ void register_mpeg(HleRegistrar &hle) {
+     register_library(hle);
+     register_decoding(hle);
+     register_jpeg(hle);
++    configure_hd_movies();
+ }
+ 
+ } // namespace portablekit
+diff --git a/host/movie/hd_frame_store.cpp b/host/movie/hd_frame_store.cpp
+new file mode 100644
+index 0000000..40de9df
+--- /dev/null
++++ b/host/movie/hd_frame_store.cpp
+@@ -0,0 +1,95 @@
++// The part of the HD movie module the renderer needs: the store the movie player publishes pictures into and the marker the
++// player leaves in the picture buffer (see movie/hd_movie.hpp).
++#include "movie/hd_movie.hpp"
++
++#include "psprecomp/guest_memory.hpp"
++
++#include <chrono>
++#if defined(__linux__)
++#include <time.h>
++#endif
++
++namespace portablekit::movie {
++
++std::uint64_t thread_cpu_us() noexcept {
++#if defined(__linux__)
++    timespec now{};
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) == 0) return static_cast<std::uint64_t>(now.tv_sec) * 1000000u + static_cast<std::uint64_t>(now.tv_nsec) / 1000u;
++#endif
++    return static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++namespace {
++
++constexpr std::uint32_t kMagicA = 0x564D4448u;  // "HDMV" read as a little-endian word
++constexpr std::uint32_t kMagicB = 0x49564F4Du;  // "MOVI"
++constexpr std::uint32_t kCheckKey = 0xA5C3E1F7u;
++
++} // namespace
++
++// ---- the frame store -----------------------------------------------------------------------------------------------------
++
++HdFrameStore &HdFrameStore::instance() {
++    static HdFrameStore store;
++    return store;
++}
++
++void HdFrameStore::publish(std::uint32_t session, std::uint64_t index, std::shared_ptr<const HdPicture> picture) {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    Slot *target = &slots_[0];
++    for (Slot &slot : slots_) {
++        if (slot.session == session && slot.index == index && slot.picture) {
++            target = &slot;
++            break;
++        }
++        if (!slot.picture || slot.serial < target->serial) target = &slot;
++    }
++    target->session = session;
++    target->index = index;
++    target->serial = ++serial_;
++    target->picture = std::move(picture);
++    published_.store(true, std::memory_order_relaxed);
++}
++
++std::shared_ptr<const HdPicture> HdFrameStore::find(std::uint32_t session, std::uint64_t index) const {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    const Slot *newest = nullptr;
++    for (const Slot &slot : slots_) {
++        if (!slot.picture || slot.session != session) continue;
++        if (slot.index == index) return slot.picture;
++        if (newest == nullptr || slot.serial > newest->serial) newest = &slot;
++    }
++    return newest != nullptr ? newest->picture : nullptr;
++}
++
++void HdFrameStore::clear() {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    for (Slot &slot : slots_) slot = Slot{};
++}
++
++// ---- the marker ----------------------------------------------------------------------------------------------------------
++
++void write_hd_marker(psprecomp::GuestMemory &memory, std::uint32_t address, const HdMarker &marker) {
++    memory.store32(address + 0u, kMagicA);
++    memory.store32(address + 4u, kMagicB);
++    memory.store32(address + 8u, marker.session);
++    memory.store32(address + 12u, marker.index);
++    memory.store32(address + 16u, marker.width | marker.height << 16u);
++    memory.store32(address + 20u, marker.session ^ marker.index ^ kCheckKey);
++    memory.store32(address + 24u, 0u);
++    memory.store32(address + 28u, 0u);
++}
++
++bool read_hd_marker(const psprecomp::GuestMemory &memory, std::uint32_t address, HdMarker &marker) {
++    if (!memory.contains(address, kHdMarkerBytes)) return false;
++    if (memory.load32(address) != kMagicA || memory.load32(address + 4u) != kMagicB) return false;
++    marker.session = memory.load32(address + 8u);
++    marker.index = memory.load32(address + 12u);
++    const std::uint32_t size = memory.load32(address + 16u);
++    marker.width = size & 0xFFFFu;
++    marker.height = size >> 16u;
++    return memory.load32(address + 20u) == (marker.session ^ marker.index ^ kCheckKey);
++}
++
++} // namespace portablekit::movie
+diff --git a/host/movie/hd_movie.cpp b/host/movie/hd_movie.cpp
+new file mode 100644
+index 0000000..f0afcf5
+--- /dev/null
++++ b/host/movie/hd_movie.cpp
+@@ -0,0 +1,327 @@
++#include "movie/hd_movie.hpp"
++
++#include "movie/psmf_header.hpp"
++#include "profile.hpp"
++
++#include "psprecomp/guest_memory.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <sstream>
++
++namespace portablekit::movie {
++namespace {
++
++bool trace_enabled() {
++    static const bool enabled = portablekit::env("TRACE_HDMOVIE") != nullptr;
++    return enabled;
++}
++
++std::string lower(std::string text) {
++    for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    return text;
++}
++
++bool file_exists(const std::string &path) {
++    std::FILE *file = std::fopen(path.c_str(), "rb");
++    if (file == nullptr) return false;
++    std::fclose(file);
++    return true;
++}
++
++bool read_text_file(const std::string &path, std::string &out) {
++    std::FILE *file = std::fopen(path.c_str(), "rb");
++    if (file == nullptr) return false;
++    char buffer[4096];
++    std::size_t count;
++    out.clear();
++    while ((count = std::fread(buffer, 1, sizeof(buffer), file)) != 0u) out.append(buffer, count);
++    std::fclose(file);
++    return true;
++}
++
++std::string join(const std::string &directory, const std::string &name) {
++    if (directory.empty()) return name;
++    const char last = directory.back();
++    return last == '/' || last == ':' || last == '\\' ? directory + name : directory + "/" + name;
++}
++
++// The live sessions, for the pause listener.
++std::mutex &session_mutex() {
++    static std::mutex mutex;
++    return mutex;
++}
++std::vector<HdSession *> &live_sessions() {
++    static std::vector<HdSession *> sessions;
++    return sessions;
++}
++
++} // namespace
++
++// ---- helpers -------------------------------------------------------------------------------------------------------------
++
++std::uint32_t crc32(std::span<const std::uint8_t> bytes) noexcept {
++    static const auto table = [] {
++        struct Table {
++            std::uint32_t entry[256];
++        } t{};
++        for (std::uint32_t i = 0; i < 256u; ++i) {
++            std::uint32_t c = i;
++            for (int k = 0; k < 8; ++k) c = (c & 1u) != 0u ? 0xEDB88320u ^ (c >> 1u) : c >> 1u;
++            t.entry[i] = c;
++        }
++        return t;
++    }();
++    std::uint32_t crc = 0xFFFFFFFFu;
++    for (const std::uint8_t byte : bytes) crc = table.entry[(crc ^ byte) & 0xFFu] ^ (crc >> 8u);
++    return ~crc;
++}
++
++bool parse_psmf_timing(std::span<const std::uint8_t> header, PsmfTiming &timing) {
++    const auto parsed = parse_psmf_header(header);
++    if (!parsed || parsed->end_time <= parsed->start_time) return false;
++    timing.start = parsed->start_time;
++    timing.end = parsed->end_time;
++    timing.width = timing.height = 0u;
++    for (const PsmfStream &stream : parsed->streams) {
++        if (stream.type() == 0) {
++            timing.width = static_cast<std::uint32_t>(stream.info[0]) * 16u;
++            timing.height = static_cast<std::uint32_t>(stream.info[1]) * 16u;
++            break;
++        }
++    }
++    return timing.frames() != 0u && timing.width != 0u && timing.height != 0u;
++}
++
++bool is_idr_unit(std::span<const std::uint8_t> unit) noexcept {
++    for (std::size_t i = 0; i + 3u < unit.size(); ++i) {
++        if (unit[i] == 0u && unit[i + 1u] == 0u && unit[i + 2u] == 1u) {
++            if ((unit[i + 3u] & 0x1Fu) == 5u) return true;
++            i += 2u;
++        }
++    }
++    return false;
++}
++
++// ---- the library ---------------------------------------------------------------------------------------------------------
++
++HdLibrary &HdLibrary::instance() {
++    static HdLibrary library;
++    return library;
++}
++
++void HdLibrary::configure(const std::string &root) {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    root_ = join(root, "movies_hd");
++    movies_.clear();
++    std::string text;
++    if (!read_text_file(join(root_, "index.txt"), text)) return;
++    std::istringstream lines(text);
++    std::string line;
++    while (std::getline(lines, line)) {
++        if (line.empty() || line[0] == '#') continue;
++        std::istringstream fields(line);
++        HdMovie movie;
++        std::string crc;
++        std::string size;
++        if (!(fields >> movie.name >> movie.frames >> crc)) continue;
++        movie.crc = static_cast<std::uint32_t>(std::strtoul(crc.c_str(), nullptr, 16));
++        movie.path = join(root_, movie.name + ".mp4");
++        if (movie.frames == 0u || !file_exists(movie.path)) continue;  // not installed: the original plays
++        movies_.push_back(std::move(movie));
++    }
++    if (trace_enabled()) std::cerr << "[hdmovie] " << movies_.size() << " replacement(s) in " << root_ << "\n";
++}
++
++const HdMovie *HdLibrary::identify(std::span<const std::uint8_t> header, std::string *why) const {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    const auto reject = [why](const char *text) -> const HdMovie * {
++        if (why != nullptr) *why = text;
++        return nullptr;
++    };
++    if (movies_.empty() && root_.empty()) return reject("no replacement movies installed");
++    if (header.size() < kPsmfHeaderBytes) return reject("short header");
++    PsmfTiming timing;
++    if (!parse_psmf_timing(header.first(kPsmfHeaderBytes), timing)) return reject("not a PSMF header");
++    const std::uint32_t crc = crc32(header.first(kPsmfHeaderBytes));
++    for (const HdMovie &movie : movies_) {
++        if (movie.crc != crc) continue;
++        if (movie.frames != timing.frames()) return reject("the index lists another picture count for this header");
++        return &movie;
++    }
++    // Not in the index: the movie the game opened last, if a file of that name is there and the count agrees.
++    std::string stem = lower(last_opened_);
++    if (stem.empty()) return reject("unknown header and no movie file name");
++    for (const HdMovie &movie : movies_)
++        if (lower(movie.name) == stem && movie.frames == timing.frames()) return &movie;
++    return reject("no replacement for this movie");
++}
++
++void HdLibrary::note_file_opened(const std::string &path) {
++    // Only the name of a movie: "disc0:/PSP_GAME/USRDIR/IMAGE/movies/intro.pmf" -> "intro".
++    const std::size_t dot = path.rfind('.');
++    if (dot == std::string::npos || dot + 4u != path.size()) return;
++    const std::string extension = lower(path.substr(dot + 1u));
++    if (extension != "pmf") return;
++    std::size_t begin = path.find_last_of("/:\\");
++    begin = begin == std::string::npos ? 0u : begin + 1u;
++    const std::lock_guard<std::mutex> lock(mutex_);
++    last_opened_ = path.substr(begin, dot - begin);
++}
++
++std::string HdLibrary::last_opened() const {
++    const std::lock_guard<std::mutex> lock(mutex_);
++    return last_opened_;
++}
++
++// ---- a session -----------------------------------------------------------------------------------------------------------
++
++HdSession::HdSession(const HdMovie &movie, const PsmfTiming &timing) : movie_(movie), timing_(timing) {
++    static std::atomic<std::uint32_t> next_id{1u};
++    id_ = next_id.fetch_add(1u);
++    const std::lock_guard<std::mutex> lock(session_mutex());
++    live_sessions().push_back(this);
++    if (trace_enabled()) std::cerr << "[hdmovie] session " << id_ << ": " << movie_.name << ", " << movie_.frames << " pictures\n";
++}
++
++HdSession::~HdSession() {
++    {
++        const std::lock_guard<std::mutex> lock(session_mutex());
++        auto &sessions = live_sessions();
++        sessions.erase(std::remove(sessions.begin(), sessions.end(), this), sessions.end());
++    }
++    if (trace_enabled() || shown_ != 0u) std::cerr << "[hdmovie] session " << id_ << " ended: " << summary() << "\n";
++    if (source_) source_->close();
++}
++
++std::string HdSession::summary() const {
++    std::ostringstream text;
++    text << movie_.name << ": " << shown_ << " replacement pictures, " << original_ << " original";
++    if (source_) {
++        text << ", " << source_->pictures_decoded() << " decoded, " << source_->seeks() << " seek(s)";
++        if (source_->pictures_decoded() != 0u && source_->decode_cpu_us() != 0u)
++            text << ", decode " << static_cast<double>(source_->decode_cpu_us()) / 1000.0 / static_cast<double>(source_->pictures_decoded())
++                 << " ms CPU a picture";
++    }
++    return text.str();
++}
++
++bool HdSession::ensure_source() {
++    if (source_) return true;
++    if (source_failed_) return false;
++    source_ = make_hd_source();
++    if (!source_ || !source_->open(movie_.path)) {
++        std::cerr << "[hdmovie] " << movie_.name << ": " << (source_ ? source_->error() : std::string("no decoder in this build"))
++                  << "; the original movie plays\n";
++        source_.reset();
++        source_failed_ = true;
++        return false;
++    }
++    if (source_->frame_count() != movie_.frames) {
++        std::cerr << "[hdmovie] " << movie_.name << ": the replacement has " << source_->frame_count() << " pictures, the movie "
++                  << movie_.frames << "; the original movie plays\n";
++        source_.reset();
++        source_failed_ = true;
++        return false;
++    }
++    if (paused_) source_->pause();
++    return true;
++}
++
++void HdSession::remember(std::span<const std::uint8_t> unit) {
++    if (is_idr_unit(unit)) {
++        history_.clear();
++        history_bytes_ = 0u;
++        history_lost_ = false;
++    }
++    // A movie whose pictures depend on far more than a second of earlier ones is not replayed: past this the original
++    // decoder starts again at the next IDR picture after a switch.
++    if (history_.size() >= 240u || history_bytes_ + unit.size() > 8u * 1024u * 1024u) {
++        history_.clear();
++        history_bytes_ = 0u;
++        history_lost_ = true;
++        return;
++    }
++    history_.emplace_back(unit.begin(), unit.end());
++    history_bytes_ += unit.size();
++}
++
++bool HdSession::show(psprecomp::GuestMemory &memory, std::uint32_t destination, std::uint32_t stride, std::span<const std::uint8_t> unit,
++                     std::int64_t pts, bool want) {
++    const std::int64_t relative = pts - static_cast<std::int64_t>(timing_.start);
++    const std::int64_t index = (relative + kTicksPerPicture / 2) / kTicksPerPicture;
++    const bool in_range = relative >= -kTicksPerPicture / 2 && index >= 0 && index < static_cast<std::int64_t>(movie_.frames);
++    std::shared_ptr<const HdPicture> picture;
++    if (want && in_range && ensure_source()) picture = source_->frame_for(index * kTicksPerPicture);
++    if (!picture) {
++        // The original decoder shows this one. If the replacement showed the units before it, it has not seen them.
++        if (!history_.empty()) {
++            replay_ = std::move(history_);
++            history_.clear();
++            history_bytes_ = 0u;
++        }
++        history_lost_ = false;
++        blackened_.clear();
++        ++original_;
++        if (last_state_ == 1) ++switches_;
++        if (trace_enabled() && want && in_range && !source_failed_ && last_state_ != 2)
++            std::cerr << "[hdmovie] session " << id_ << ": no replacement picture " << index << ", the original shows it\n";
++        last_state_ = 2;
++        return false;
++    }
++    remember(unit);
++    HdFrameStore::instance().publish(id_, static_cast<std::uint64_t>(index), picture);
++    // Black everywhere except the marker: if a renderer did not understand it, the movie would be dark, not garbage.
++    if (std::find(blackened_.begin(), blackened_.end(), destination) == blackened_.end()) {
++        const std::uint32_t rows = timing_.height;
++        const std::size_t bytes = static_cast<std::size_t>(stride) * rows * 4u;
++        if (std::uint8_t *pixels = memory.raw_pointer(destination, bytes)) {
++            auto *words = reinterpret_cast<std::uint32_t *>(pixels);
++            std::fill(words, words + static_cast<std::size_t>(stride) * rows, 0xFF000000u);
++        }
++        if (blackened_.size() < 16u) blackened_.push_back(destination);
++    }
++    write_hd_marker(memory, destination, HdMarker{id_, static_cast<std::uint32_t>(index), timing_.width, timing_.height});
++    ++shown_;
++    if (last_state_ == 2) ++switches_;
++    last_state_ = 1;
++    return true;
++}
++
++std::vector<std::vector<std::uint8_t>> HdSession::take_replay() {
++    std::vector<std::vector<std::uint8_t>> units;
++    units.swap(replay_);
++    return units;
++}
++
++void HdSession::restart() {
++    history_.clear();
++    history_bytes_ = 0u;
++    history_lost_ = false;
++    replay_.clear();
++}
++
++void HdSession::pause() {
++    paused_ = true;
++    if (source_) source_->pause();
++}
++
++void HdSession::resume() {
++    paused_ = false;
++    if (source_) source_->resume();
++}
++
++void HdSession::pause_all(bool paused) {
++    const std::lock_guard<std::mutex> lock(session_mutex());
++    for (HdSession *session : live_sessions()) {
++        if (paused) session->pause();
++        else session->resume();
++    }
++}
++
++} // namespace portablekit::movie
+diff --git a/host/movie/hd_movie.hpp b/host/movie/hd_movie.hpp
+new file mode 100644
+index 0000000..c97e187
+--- /dev/null
++++ b/host/movie/hd_movie.hpp
+@@ -0,0 +1,234 @@
++#pragma once
++
++// HD replacement movies (gfx.hd_movies; docs: proj/docs/HD_MOVIES.md).
++//
++// A game's pre-rendered movies are 480x272. A replacement is a 960x544 H.264 file, made offline from the same movie, that
++// stands in for the PICTURE: the movie player of the game runs exactly as before (ring buffer, audio, pacing, skipping),
++// and every time it asks the library for the picture of an access unit, the replacement supplies the one with the same
++// number instead of the original decoder. How the picture gets to the screen:
++//
++//   1. sceMpegAvcDecode (host/hle/hle_mpeg.cpp) asks HdSession::show(). The session finds the picture of the access unit
++//      in its HdSource, publishes it in the HdFrameStore under (session, picture number) and writes a MARKER into the
++//      first 32 bytes of the buffer the game gave the decoder. The rest of the buffer is black. The original decode is
++//      skipped.
++//   2. The game does with its buffer whatever it does: Infected copies it into VRAM and draws it as a textured screen
++//      quad. The marker travels with the pixels, so the replacement is shown exactly when, and only when, the original
++//      would have been: the game's own timing, double buffering and pausing decide, not this module.
++//   3. The renderer (host/gpu/gl) sees the marker in the first words of a texture it is about to sample, finds the
++//      picture in the store and samples that instead (GlRenderer::resolve_texture).
++//
++// Nothing here knows which game it is: the marker, the files and the identification are the framework's.
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <span>
++#include <string>
++#include <vector>
++
++#include "movie/avc_decoder.hpp"
++
++namespace psprecomp {
++class GuestMemory;
++}
++
++namespace portablekit::movie {
++
++// CPU time of the calling thread in microseconds (the statistics of the replacement path). Wall time where the platform has no
++// per-thread clock.
++[[nodiscard]] std::uint64_t thread_cpu_us() noexcept;
++
++// ---- the pictures --------------------------------------------------------------------------------------------------------
++
++// One replacement picture. A software decoder (desktop, or a Vita without the hardware path) fills `yuv`; a platform's own
++// decoder keeps its frame in `native`, which only that platform's renderer understands, and leaves `yuv` empty.
++struct HdPicture {
++    std::uint32_t width{};
++    std::uint32_t height{};
++    Picture yuv;                    // planar 4:2:0, `full_range` says which range
++    std::shared_ptr<void> native;   // a platform frame, kept alive for as long as the picture is
++    std::uint32_t native_kind{};    // what `native` is (platform-specific, 0: none)
++};
++
++// The pictures published and not yet shown. The movie player (the guest's thread) publishes; the renderer (its own thread
++// when the GE has one) looks up.
++class HdFrameStore {
++public:
++    static HdFrameStore &instance();
++    void publish(std::uint32_t session, std::uint64_t index, std::shared_ptr<const HdPicture> picture);
++    // The picture of (session, index); when the exact one is gone, the newest of the session; null when there is none.
++    [[nodiscard]] std::shared_ptr<const HdPicture> find(std::uint32_t session, std::uint64_t index) const;
++    void clear();
++    // Whether a picture was ever published: the renderer looks for markers only after the first.
++    [[nodiscard]] bool in_use() const noexcept { return published_.load(std::memory_order_relaxed); }
++
++private:
++    struct Slot {
++        std::uint32_t session{};
++        std::uint64_t index{};
++        std::uint64_t serial{};
++        std::shared_ptr<const HdPicture> picture;
++    };
++    static constexpr std::size_t kSlots = 8;
++    mutable std::mutex mutex_;
++    Slot slots_[kSlots];
++    std::uint64_t serial_{};
++    std::atomic<bool> published_{false};
++};
++
++// ---- the marker ----------------------------------------------------------------------------------------------------------
++
++// What a session leaves in the first 32 bytes of the picture buffer (8 little-endian words):
++//   0 "HDMV"   1 "MOVI"   2 session   3 picture number   4 original width | height << 16   5 check   6, 7 zero
++struct HdMarker {
++    std::uint32_t session{};
++    std::uint32_t index{};
++    std::uint32_t width{};   // of the original picture: what the game's texture coordinates count in
++    std::uint32_t height{};
++};
++inline constexpr std::size_t kHdMarkerBytes = 32u;
++void write_hd_marker(psprecomp::GuestMemory &memory, std::uint32_t address, const HdMarker &marker);
++// True when `address` starts with a marker (and fills it). Cheap: two words are compared first.
++[[nodiscard]] bool read_hd_marker(const psprecomp::GuestMemory &memory, std::uint32_t address, HdMarker &marker);
++
++// ---- the source of the pictures ------------------------------------------------------------------------------------------
++
++// Where the replacement pictures come from. The desktop's is a software H.264 decoder reading the MP4
++// (hd_source_software.cpp); the Vita's is its hardware decoder (vita/app/src/app_hd_movie.cpp, registered with
++// set_hd_source_factory).
++class HdSource {
++public:
++    virtual ~HdSource() = default;
++    // Opens a replacement file. False (and error()) when it is not a file this source can play.
++    virtual bool open(const std::string &path) = 0;
++    virtual void close() = 0;
++    [[nodiscard]] virtual const std::string &error() const = 0;
++    [[nodiscard]] virtual std::uint32_t width() const = 0;
++    [[nodiscard]] virtual std::uint32_t height() const = 0;
++    [[nodiscard]] virtual std::uint32_t frame_count() const = 0;
++    // The picture shown at `time`: 90 kHz ticks from the start of the movie (picture n is at n * 3003). Null when the
++    // source cannot deliver it (decoder error): the caller shows the original.
++    virtual std::shared_ptr<const HdPicture> frame_for(std::int64_t time) = 0;
++    // The guest is suspended (the settings menu) or carries on: a source that runs on its own clock stops and starts.
++    virtual void pause() {}
++    virtual void resume() {}
++    // For the statistics line: how often the source had to seek, and pictures it decoded to catch up.
++    [[nodiscard]] virtual std::uint64_t seeks() const { return 0u; }
++    [[nodiscard]] virtual std::uint64_t pictures_decoded() const { return 0u; }
++    // CPU time the calling thread spent in frame_for() so far, in microseconds (software decoders; 0 when it is not known).
++    [[nodiscard]] virtual std::uint64_t decode_cpu_us() const { return 0u; }
++};
++// A platform with a decoder of its own (the Vita's hardware decoder) registers a factory for its source at start-up; null
++// removes it. A platform that registers none gets the software decoder's source.
++using HdSourceFactory = std::unique_ptr<HdSource> (*)();
++void set_hd_source_factory(HdSourceFactory factory);
++// A new source of this platform; null when there is none.
++[[nodiscard]] std::unique_ptr<HdSource> make_hd_source();
++// The software decoder's source (FFmpeg's H.264 decoder on the CPU), for a platform that wants it as a fallback.
++[[nodiscard]] std::unique_ptr<HdSource> make_software_hd_source();
++
++// ---- which movie is playing ----------------------------------------------------------------------------------------------
++
++inline constexpr std::size_t kPsmfHeaderBytes = 2048u;
++inline constexpr std::int64_t kTicksPerPicture = 3003;  // 29.97 fps at 90 kHz
++
++struct HdMovie {
++    std::string name;       // "intro": the original's name without extension
++    std::string path;       // <root>/movies_hd/intro.mp4
++    std::uint32_t frames{};  // pictures, from the header of the original
++    std::uint32_t crc{};     // CRC-32 of the first 2048 bytes of the original
++};
++
++// movies_hd/index.txt of the data directory: one line per replacement, "name pictures crc32 WxH" (build_movies.sh writes it).
++class HdLibrary {
++public:
++    static HdLibrary &instance();
++    // Reads the index of <root>/movies_hd/. Safe to call again; a missing index means no replacements.
++    void configure(const std::string &root);
++    // Whether at least one replacement is installed (the setting is greyed otherwise).
++    [[nodiscard]] bool installed() const { return !movies_.empty(); }
++    [[nodiscard]] const std::vector<HdMovie> &movies() const { return movies_; }
++    // The replacement for the original whose first 2048 bytes are `header`, or null. A movie whose CRC is not in the index
++    // is looked for by the name of the PMF the game opened last (note_file_opened), if the picture count agrees.
++    [[nodiscard]] const HdMovie *identify(std::span<const std::uint8_t> header, std::string *why = nullptr) const;
++    // The game opened `path`: remembered when it is a movie.
++    void note_file_opened(const std::string &path);
++    [[nodiscard]] std::string last_opened() const;
++
++private:
++    std::string root_;
++    std::vector<HdMovie> movies_;
++    mutable std::mutex mutex_;
++    std::string last_opened_;
++};
++
++// PSMF header fields the session needs.
++struct PsmfTiming {
++    std::uint64_t start{};  // 90 kHz
++    std::uint64_t end{};
++    std::uint32_t width{}, height{};
++    [[nodiscard]] std::uint32_t frames() const { return static_cast<std::uint32_t>((end - start) / kTicksPerPicture); }
++};
++[[nodiscard]] bool parse_psmf_timing(std::span<const std::uint8_t> header, PsmfTiming &timing);
++[[nodiscard]] std::uint32_t crc32(std::span<const std::uint8_t> bytes) noexcept;
++
++// ---- a movie being played ------------------------------------------------------------------------------------------------
++
++// One per sceMpegCreate that is playing a movie with a replacement. Holds the source, and the access units the original
++// decoder missed while the replacement was shown, so that the setting can be switched off in the middle of a movie.
++class HdSession {
++public:
++    HdSession(const HdMovie &movie, const PsmfTiming &timing);
++    ~HdSession();
++    HdSession(const HdSession &) = delete;
++    HdSession &operator=(const HdSession &) = delete;
++
++    [[nodiscard]] std::uint32_t id() const { return id_; }
++    [[nodiscard]] const HdMovie &movie() const { return movie_; }
++
++    // The game decodes the access unit `unit` (Annex B, time stamp `pts`) into the buffer at `destination`, `stride` pixels
++    // a row (32-bit pixels). When `want`,
++    // the replacement stands in: the buffer gets the marker and black, and true comes back. False: the caller decodes the
++    // unit with the original decoder, after feeding it take_replay() (the units it did not see).
++    bool show(psprecomp::GuestMemory &memory, std::uint32_t destination, std::uint32_t stride, std::span<const std::uint8_t> unit,
++              std::int64_t pts, bool want);
++    // The access units the original decoder has to see before the unit of the last show() that returned false.
++    [[nodiscard]] std::vector<std::vector<std::uint8_t>> take_replay();
++    // The stream was flushed or restarted: nothing is pending for the original decoder.
++    void restart();
++    // The guest is paused or resumed (kernel pause listeners call this).
++    void pause();
++    void resume();
++    // Counters for the end-of-movie line.
++    [[nodiscard]] std::uint64_t shown() const { return shown_; }
++    [[nodiscard]] std::uint64_t original() const { return original_; }
++    [[nodiscard]] std::string summary() const;
++    // The pause listener of the kernel reaches every live session.
++    static void pause_all(bool paused);
++
++private:
++    bool ensure_source();
++    void remember(std::span<const std::uint8_t> unit);
++
++    HdMovie movie_;
++    PsmfTiming timing_;
++    std::uint32_t id_{};
++    std::unique_ptr<HdSource> source_;
++    bool source_failed_{};
++    bool paused_{};
++    // The units since the last IDR that the replacement showed and the original decoder has not seen.
++    std::vector<std::vector<std::uint8_t>> history_;
++    std::size_t history_bytes_{};
++    bool history_lost_{};
++    std::vector<std::vector<std::uint8_t>> replay_;
++    std::vector<std::uint32_t> blackened_;  // destinations already filled with black
++    std::uint64_t shown_{}, original_{}, switches_{};
++    int last_state_{0};  // 0 none yet, 1 replacement, 2 original
++};
++
++// The unit is an IDR picture (NAL type 5 somewhere in it).
++[[nodiscard]] bool is_idr_unit(std::span<const std::uint8_t> unit) noexcept;
++
++} // namespace portablekit::movie
+diff --git a/host/movie/hd_source_software.cpp b/host/movie/hd_source_software.cpp
+new file mode 100644
+index 0000000..8626d05
+--- /dev/null
++++ b/host/movie/hd_source_software.cpp
+@@ -0,0 +1,119 @@
++// The HD movie source that decodes on the CPU with FFmpeg's H.264 decoder: the desktop's. (A platform with a decoder of its
++// own registers a factory with set_hd_source_factory; this source stays available through make_software_hd_source().)
++// It reads the MP4 itself (mp4_reader) and decodes in the thread that asks, which is the guest's: one picture per call in
++// the usual case (the game asks for picture n+1 after picture n), a short run of pictures after a skip or a seek (from the
++// sync sample before the one asked for).
++#include "movie/avc_decoder.hpp"
++#include "movie/hd_movie.hpp"
++#include "movie/mp4_reader.hpp"
++
++#include <algorithm>
++#include <atomic>
++
++namespace portablekit::movie {
++namespace {
++
++class SoftwareHdSource final : public HdSource {
++public:
++    bool open(const std::string &path) override {
++        close();
++        if (!AvcDecoder::available()) return fail("this build has no H.264 decoder");
++        if (!mp4_.open(path)) return fail(mp4_.error());
++        if (mp4_.longest_gop() > 600u) return fail("sync samples are too far apart (more than 600 pictures)");
++        if (!decoder_.open()) {
++            mp4_.close();
++            return fail("the H.264 decoder could not be opened");
++        }
++        next_ = 0;
++        last_.reset();
++        last_index_ = -1;
++        return true;
++    }
++
++    void close() override {
++        decoder_.close();
++        mp4_.close();
++        last_.reset();
++        last_index_ = -1;
++    }
++
++    const std::string &error() const override { return error_; }
++    std::uint32_t width() const override { return mp4_.width(); }
++    std::uint32_t height() const override { return mp4_.height(); }
++    std::uint32_t frame_count() const override { return static_cast<std::uint32_t>(mp4_.sample_count()); }
++    std::uint64_t seeks() const override { return seeks_; }
++    std::uint64_t pictures_decoded() const override { return decoded_; }
++    std::uint64_t decode_cpu_us() const override { return cpu_us_; }
++
++    std::shared_ptr<const HdPicture> frame_for(std::int64_t time) override {
++        if (!mp4_.is_open() || mp4_.sample_count() == 0u) return nullptr;
++        std::int64_t index = (time + kTicksPerPicture / 2) / kTicksPerPicture;
++        index = std::clamp<std::int64_t>(index, 0, static_cast<std::int64_t>(mp4_.sample_count()) - 1);
++        if (index == last_index_ && last_) return last_;
++        const std::uint64_t cpu_begin = thread_cpu_us();
++        // The decoder holds pictures up to next_ - 1. Going on from there is right unless a sync sample lies between
++        // (or the picture asked for is behind): then it is cheaper, and the only way for a backward step, to start over. A sync
++        // sample exactly at next_ needs no reset: an IDR picture starts afresh.
++        const std::size_t sync = mp4_.sync_at_or_before(static_cast<std::size_t>(index));
++        if (index < next_ || static_cast<std::int64_t>(sync) > next_) {
++            decoder_.reset();
++            ++seeks_;
++            next_ = static_cast<std::int64_t>(sync);
++        }
++        bool got = false;
++        for (; next_ <= index; ++next_) {
++            if (!mp4_.read_annex_b(static_cast<std::size_t>(next_), unit_)) {
++                got = false;
++                continue;
++            }
++            got = decoder_.decode(unit_, scratch_);
++            ++decoded_;
++        }
++        cpu_us_ += thread_cpu_us() - cpu_begin;
++        if (!got) return nullptr;
++        auto picture = std::make_shared<HdPicture>();
++        picture->width = scratch_.width;
++        picture->height = scratch_.height;
++        picture->yuv = std::move(scratch_);
++        scratch_ = Picture{};
++        last_ = picture;
++        last_index_ = index;
++        return picture;
++    }
++
++private:
++    bool fail(const std::string &text) {
++        error_ = text;
++        return false;
++    }
++
++    Mp4Reader mp4_;
++    AvcDecoder decoder_;
++    std::string error_;
++    std::int64_t next_{0};  // the sample the decoder gets next
++    std::shared_ptr<const HdPicture> last_;
++    std::int64_t last_index_{-1};
++    std::vector<std::uint8_t> unit_;
++    Picture scratch_;
++    std::uint64_t seeks_{}, decoded_{}, cpu_us_{};
++};
++
++} // namespace
++
++namespace {
++std::atomic<HdSourceFactory> g_factory{nullptr};
++} // namespace
++
++void set_hd_source_factory(HdSourceFactory factory) { g_factory.store(factory); }
++
++std::unique_ptr<HdSource> make_software_hd_source() {
++    if (!AvcDecoder::available()) return nullptr;
++    return std::make_unique<SoftwareHdSource>();
++}
++
++std::unique_ptr<HdSource> make_hd_source() {
++    if (const HdSourceFactory factory = g_factory.load()) return factory();
++    return make_software_hd_source();
++}
++
++} // namespace portablekit::movie
+diff --git a/host/movie/mp4_reader.cpp b/host/movie/mp4_reader.cpp
+new file mode 100644
+index 0000000..05022b2
+--- /dev/null
++++ b/host/movie/mp4_reader.cpp
+@@ -0,0 +1,311 @@
++#include "movie/mp4_reader.hpp"
++
++#include <algorithm>
++#include <climits>
++#include <cstring>
++
++namespace portablekit::movie {
++namespace {
++
++constexpr std::uint32_t fourcc(char a, char b, char c, char d) {
++    return static_cast<std::uint32_t>(static_cast<unsigned char>(a)) << 24u | static_cast<std::uint32_t>(static_cast<unsigned char>(b)) << 16u |
++           static_cast<std::uint32_t>(static_cast<unsigned char>(c)) << 8u | static_cast<std::uint32_t>(static_cast<unsigned char>(d));
++}
++
++struct View {
++    const std::uint8_t *data{};
++    std::size_t size{};
++};
++
++std::uint32_t be32(const std::uint8_t *p) {
++    return static_cast<std::uint32_t>(p[0]) << 24u | static_cast<std::uint32_t>(p[1]) << 16u | static_cast<std::uint32_t>(p[2]) << 8u | p[3];
++}
++std::uint64_t be64(const std::uint8_t *p) { return static_cast<std::uint64_t>(be32(p)) << 32u | be32(p + 4); }
++std::uint32_t be16(const std::uint8_t *p) { return static_cast<std::uint32_t>(p[0]) << 8u | p[1]; }
++
++struct Box {
++    std::uint32_t type{};
++    View payload;
++};
++
++// The box that starts at `pos` of `in`; moves `pos` past it. False at the end of the data or on a box that does not fit.
++bool next_box(View in, std::size_t &pos, Box &box) {
++    if (pos + 8u > in.size) return false;
++    std::uint64_t size = be32(in.data + pos);
++    const std::uint32_t type = be32(in.data + pos + 4u);
++    std::size_t header = 8u;
++    if (size == 1u) {
++        if (pos + 16u > in.size) return false;
++        size = be64(in.data + pos + 8u);
++        header = 16u;
++    } else if (size == 0u) {
++        size = in.size - pos;
++    }
++    if (size < header || size > in.size - pos) return false;
++    box.type = type;
++    box.payload = {in.data + pos + header, static_cast<std::size_t>(size - header)};
++    pos += static_cast<std::size_t>(size);
++    return true;
++}
++
++bool find_box(View in, std::uint32_t type, View &out) {
++    std::size_t pos = 0;
++    Box box;
++    while (next_box(in, pos, box))
++        if (box.type == type) {
++            out = box.payload;
++            return true;
++        }
++    return false;
++}
++
++} // namespace
++
++void Mp4Reader::close() {
++    if (file_ != nullptr) std::fclose(file_);
++    file_ = nullptr;
++    samples_.clear();
++    parameter_sets_.clear();
++    width_ = height_ = timescale_ = profile_ = level_ = 0u;
++}
++
++bool Mp4Reader::open(const std::string &path) {
++    close();
++    error_.clear();
++    file_ = std::fopen(path.c_str(), "rb");
++    if (file_ == nullptr) return fail("cannot open the file");
++    // The top level: skip to the moov box (the tool writes it first, faststart; a file that has it last works too).
++    std::vector<std::uint8_t> moov;
++    std::uint64_t position = 0u;
++    for (;;) {
++        std::uint8_t header[16];
++        if (std::fseek(file_, static_cast<long>(position), SEEK_SET) != 0) break;
++        if (std::fread(header, 1, 8, file_) != 8u) break;
++        std::uint64_t size = be32(header);
++        const std::uint32_t type = be32(header + 4);
++        std::uint64_t header_size = 8u;
++        if (size == 1u) {
++            if (std::fread(header + 8, 1, 8, file_) != 8u) break;
++            size = be64(header + 8);
++            header_size = 16u;
++        } else if (size == 0u) {
++            break;  // a box that runs to the end of the file is not a moov
++        }
++        if (size < header_size) break;
++        if (type == fourcc('m', 'o', 'o', 'v')) {
++            const std::uint64_t payload = size - header_size;
++            if (payload > 64u * 1024u * 1024u) {
++                close();
++                return fail("moov box too large");
++            }
++            moov.resize(static_cast<std::size_t>(payload));
++            if (std::fread(moov.data(), 1, moov.size(), file_) != moov.size()) {
++                close();
++                return fail("truncated moov box");
++            }
++            break;
++        }
++        position += size;
++        if (position > static_cast<std::uint64_t>(LONG_MAX)) break;
++    }
++    if (moov.empty()) {
++        close();
++        return fail("no moov box");
++    }
++    if (!parse(moov)) {
++        const std::string text = error_;
++        close();
++        error_ = text;
++        return false;
++    }
++    return true;
++}
++
++bool Mp4Reader::parse(const std::vector<std::uint8_t> &moov_bytes) {
++    const View moov{moov_bytes.data(), moov_bytes.size()};
++    // The first video track.
++    std::size_t pos = 0;
++    Box trak;
++    View mdia{}, stbl{};
++    bool found = false;
++    while (next_box(moov, pos, trak)) {
++        if (trak.type != fourcc('t', 'r', 'a', 'k')) continue;
++        View media;
++        if (!find_box(trak.payload, fourcc('m', 'd', 'i', 'a'), media)) continue;
++        View handler;
++        if (!find_box(media, fourcc('h', 'd', 'l', 'r'), handler) || handler.size < 12u) continue;
++        if (be32(handler.data + 8) != fourcc('v', 'i', 'd', 'e')) continue;
++        mdia = media;
++        found = true;
++        break;
++    }
++    if (!found) return fail("no video track");
++
++    View mdhd;
++    if (!find_box(mdia, fourcc('m', 'd', 'h', 'd'), mdhd) || mdhd.size < 24u) return fail("no mdhd");
++    timescale_ = mdhd.data[0] == 1u ? (mdhd.size >= 32u ? be32(mdhd.data + 20) : 0u) : be32(mdhd.data + 12);
++    if (timescale_ == 0u) return fail("timescale 0");
++
++    View minf;
++    if (!find_box(mdia, fourcc('m', 'i', 'n', 'f'), minf) || !find_box(minf, fourcc('s', 't', 'b', 'l'), stbl)) return fail("no sample table");
++
++    // stsd: avc1 and its avcC.
++    View stsd;
++    if (!find_box(stbl, fourcc('s', 't', 's', 'd'), stsd) || stsd.size < 16u) return fail("no stsd");
++    {
++        std::size_t at = 8u;  // version/flags, entry count
++        Box entry;
++        View whole{stsd.data, stsd.size};
++        if (!next_box(whole, at, entry) || (entry.type != fourcc('a', 'v', 'c', '1') && entry.type != fourcc('a', 'v', 'c', '3')) || entry.payload.size < 78u)
++            return fail("the video is not H.264 (avc1)");
++        width_ = be16(entry.payload.data + 24);
++        height_ = be16(entry.payload.data + 26);
++        View children{entry.payload.data + 78u, entry.payload.size - 78u};
++        View avcc;
++        if (!find_box(children, fourcc('a', 'v', 'c', 'C'), avcc) || avcc.size < 7u) return fail("no avcC");
++        profile_ = avcc.data[1];
++        level_ = avcc.data[3];
++        nal_length_size_ = (avcc.data[4] & 3u) + 1u;
++        if (nal_length_size_ == 3u) return fail("odd NAL length size");
++        parameter_sets_.clear();
++        std::size_t cursor = 5u;
++        const auto add_sets = [&](std::uint32_t count) {
++            for (std::uint32_t i = 0; i < count; ++i) {
++                if (cursor + 2u > avcc.size) return false;
++                const std::size_t length = be16(avcc.data + cursor);
++                cursor += 2u;
++                if (cursor + length > avcc.size) return false;
++                static const std::uint8_t kStart[4] = {0, 0, 0, 1};
++                parameter_sets_.insert(parameter_sets_.end(), kStart, kStart + 4);
++                parameter_sets_.insert(parameter_sets_.end(), avcc.data + cursor, avcc.data + cursor + length);
++                cursor += length;
++            }
++            return true;
++        };
++        if (!add_sets(avcc.data[cursor++] & 0x1Fu)) return fail("bad avcC");
++        if (cursor >= avcc.size) return fail("bad avcC");
++        if (!add_sets(avcc.data[cursor++])) return fail("bad avcC");
++    }
++
++    // Sample sizes.
++    View stsz;
++    if (!find_box(stbl, fourcc('s', 't', 's', 'z'), stsz) || stsz.size < 12u) return fail("no stsz");
++    const std::uint32_t fixed_size = be32(stsz.data + 4);
++    const std::uint32_t count = be32(stsz.data + 8);
++    if (count == 0u || count > 4u * 1024u * 1024u) return fail("bad sample count");
++    if (fixed_size == 0u && stsz.size < 12u + static_cast<std::size_t>(count) * 4u) return fail("short stsz");
++    samples_.assign(count, Sample{});
++    for (std::uint32_t i = 0; i < count; ++i) samples_[i].size = fixed_size != 0u ? fixed_size : be32(stsz.data + 12u + static_cast<std::size_t>(i) * 4u);
++
++    // Decoding times.
++    View stts;
++    if (!find_box(stbl, fourcc('s', 't', 't', 's'), stts) || stts.size < 8u) return fail("no stts");
++    {
++        const std::uint32_t entries = be32(stts.data + 4);
++        if (stts.size < 8u + static_cast<std::size_t>(entries) * 8u) return fail("short stts");
++        std::size_t index = 0;
++        std::uint64_t time = 0;
++        for (std::uint32_t e = 0; e < entries && index < samples_.size(); ++e) {
++            const std::uint32_t run = be32(stts.data + 8u + static_cast<std::size_t>(e) * 8u);
++            const std::uint32_t delta = be32(stts.data + 12u + static_cast<std::size_t>(e) * 8u);
++            for (std::uint32_t k = 0; k < run && index < samples_.size(); ++k, ++index) {
++                samples_[index].time = time;
++                samples_[index].duration = delta;
++                time += delta;
++            }
++        }
++        if (index != samples_.size()) return fail("stts does not cover the samples");
++    }
++
++    // No composition offsets: with B-frames the decode order is not the picture order, and this player has no use for them.
++    View ctts;
++    if (find_box(stbl, fourcc('c', 't', 't', 's'), ctts) && ctts.size >= 8u) {
++        const std::uint32_t entries = be32(ctts.data + 4);
++        if (ctts.size < 8u + static_cast<std::size_t>(entries) * 8u) return fail("short ctts");
++        for (std::uint32_t e = 0; e < entries; ++e)
++            if (be32(ctts.data + 12u + static_cast<std::size_t>(e) * 8u) != 0u) return fail("composition offsets (B-frames) are not supported");
++    }
++
++    // Sync samples.
++    View stss;
++    if (find_box(stbl, fourcc('s', 't', 's', 's'), stss) && stss.size >= 8u) {
++        const std::uint32_t entries = be32(stss.data + 4);
++        if (stss.size < 8u + static_cast<std::size_t>(entries) * 4u) return fail("short stss");
++        for (auto &sample : samples_) sample.sync = false;
++        for (std::uint32_t e = 0; e < entries; ++e) {
++            const std::uint32_t number = be32(stss.data + 8u + static_cast<std::size_t>(e) * 4u);
++            if (number >= 1u && number <= samples_.size()) samples_[number - 1u].sync = true;
++        }
++        if (!samples_[0].sync) return fail("the first sample is not a sync sample");
++    }
++
++    // Where the samples are: chunk offsets and how many samples each chunk holds.
++    View stco, co64, stsc;
++    const bool wide = !find_box(stbl, fourcc('s', 't', 'c', 'o'), stco) && find_box(stbl, fourcc('c', 'o', '6', '4'), co64);
++    const View &offsets = wide ? co64 : stco;
++    if (offsets.size < 8u) return fail("no chunk offsets");
++    if (!find_box(stbl, fourcc('s', 't', 's', 'c'), stsc) || stsc.size < 8u) return fail("no stsc");
++    const std::uint32_t chunks = be32(offsets.data + 4);
++    const std::size_t entry_bytes = wide ? 8u : 4u;
++    if (offsets.size < 8u + static_cast<std::size_t>(chunks) * entry_bytes) return fail("short chunk offsets");
++    const std::uint32_t runs = be32(stsc.data + 4);
++    if (runs == 0u || stsc.size < 8u + static_cast<std::size_t>(runs) * 12u) return fail("short stsc");
++    std::size_t index = 0;
++    for (std::uint32_t chunk = 1; chunk <= chunks && index < samples_.size(); ++chunk) {
++        // The run of stsc that covers this chunk: the last whose first_chunk is not past it.
++        std::uint32_t per_chunk = 0;
++        for (std::uint32_t r = 0; r < runs; ++r) {
++            const std::uint8_t *entry = stsc.data + 8u + static_cast<std::size_t>(r) * 12u;
++            if (be32(entry) <= chunk) per_chunk = be32(entry + 4);
++        }
++        std::uint64_t offset = wide ? be64(offsets.data + 8u + static_cast<std::size_t>(chunk - 1u) * 8u)
++                                    : be32(offsets.data + 8u + static_cast<std::size_t>(chunk - 1u) * 4u);
++        for (std::uint32_t k = 0; k < per_chunk && index < samples_.size(); ++k, ++index) {
++            samples_[index].offset = offset;
++            offset += samples_[index].size;
++        }
++    }
++    if (index != samples_.size()) return fail("the chunk tables do not cover the samples");
++    return true;
++}
++
++std::size_t Mp4Reader::sync_at_or_before(std::size_t index) const noexcept {
++    if (samples_.empty()) return 0u;
++    index = std::min(index, samples_.size() - 1u);
++    while (index > 0u && !samples_[index].sync) --index;
++    return index;
++}
++
++std::size_t Mp4Reader::longest_gop() const noexcept {
++    std::size_t longest = 0, last = 0;
++    for (std::size_t i = 1; i < samples_.size(); ++i)
++        if (samples_[i].sync) {
++            longest = std::max(longest, i - last);
++            last = i;
++        }
++    return std::max(longest, samples_.size() - last);
++}
++
++bool Mp4Reader::read_annex_b(std::size_t index, std::vector<std::uint8_t> &out) {
++    out.clear();
++    if (file_ == nullptr || index >= samples_.size()) return false;
++    const Sample &sample = samples_[index];
++    if (sample.offset > static_cast<std::uint64_t>(LONG_MAX) || std::fseek(file_, static_cast<long>(sample.offset), SEEK_SET) != 0) return false;
++    scratch_.resize(sample.size);
++    if (sample.size != 0u && std::fread(scratch_.data(), 1, sample.size, file_) != sample.size) return false;
++    if (sample.sync) out = parameter_sets_;
++    std::size_t pos = 0;
++    while (pos + nal_length_size_ <= scratch_.size()) {
++        std::size_t length = 0;
++        for (std::uint32_t i = 0; i < nal_length_size_; ++i) length = length << 8u | scratch_[pos + i];
++        pos += nal_length_size_;
++        if (length == 0u || pos + length > scratch_.size()) return false;
++        static const std::uint8_t kStart[4] = {0, 0, 0, 1};
++        out.insert(out.end(), kStart, kStart + 4);
++        out.insert(out.end(), scratch_.begin() + static_cast<std::ptrdiff_t>(pos), scratch_.begin() + static_cast<std::ptrdiff_t>(pos + length));
++        pos += length;
++    }
++    return !out.empty();
++}
++
++} // namespace portablekit::movie
+diff --git a/host/movie/mp4_reader.hpp b/host/movie/mp4_reader.hpp
+new file mode 100644
+index 0000000..ffb79a6
+--- /dev/null
++++ b/host/movie/mp4_reader.hpp
+@@ -0,0 +1,85 @@
++#pragma once
++
++// A small ISO base media (MP4) reader for the HD replacement movies (docs: proj/docs/HD_MOVIES.md): the sample tables of
++// the first video track, and the samples themselves read one at a time from the file, converted to Annex B so that the
++// H.264 decoder of host/movie/avc_decoder takes them as it takes the access units of a PSMF movie.
++//
++// Why not FFmpeg's demuxer: the FFmpeg the port bundles has the decoders it needs and nothing else (no libavformat), and
++// the Vita has no FFmpeg at all. What the reader understands is what the offline tool writes (build_movies.sh): a
++// "moov" box with one track, avc1 + avcC, stts, stsz, stsc, stco or co64, stss, no edit list that matters, no
++// composition offsets. A file that is something else is refused by open(), which is the port's cue to play the original
++// movie.
++//
++// File access is plain stdio (a ux0: path works on the Vita).
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++namespace portablekit::movie {
++
++class Mp4Reader {
++public:
++    Mp4Reader() = default;
++    ~Mp4Reader() { close(); }
++    Mp4Reader(const Mp4Reader &) = delete;
++    Mp4Reader &operator=(const Mp4Reader &) = delete;
++
++    // Reads the sample tables. Returns false and sets error() when the file is not a movie this reader understands.
++    bool open(const std::string &path);
++    void close();
++    [[nodiscard]] bool is_open() const noexcept { return file_ != nullptr; }
++    [[nodiscard]] const std::string &error() const noexcept { return error_; }
++
++    [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
++    [[nodiscard]] std::uint32_t height() const noexcept { return height_; }
++    [[nodiscard]] std::uint32_t timescale() const noexcept { return timescale_; }
++    [[nodiscard]] std::uint32_t profile() const noexcept { return profile_; }  // profile_idc of the SPS
++    [[nodiscard]] std::uint32_t level() const noexcept { return level_; }      // level_idc, 31 is 3.1
++    [[nodiscard]] std::size_t sample_count() const noexcept { return samples_.size(); }
++    // Decoding time of a sample, in timescale() ticks, and its duration.
++    [[nodiscard]] std::uint64_t sample_time(std::size_t index) const noexcept { return samples_[index].time; }
++    [[nodiscard]] std::uint32_t sample_duration(std::size_t index) const noexcept { return samples_[index].duration; }
++    [[nodiscard]] bool is_sync(std::size_t index) const noexcept { return samples_[index].sync; }
++    [[nodiscard]] std::uint32_t sample_bytes(std::size_t index) const noexcept { return samples_[index].size; }
++    // The last sync sample at or before `index` (0 when the file says nothing: the first sample is always a sync).
++    [[nodiscard]] std::size_t sync_at_or_before(std::size_t index) const noexcept;
++    // The largest gap between two sync samples, for the format check of the tools.
++    [[nodiscard]] std::size_t longest_gop() const noexcept;
++    // The biggest sample in bytes (Annex B adds the parameter sets and start codes: at most 64 more), for a decoder with a fixed buffer.
++    [[nodiscard]] std::uint32_t largest_sample() const noexcept {
++        std::uint32_t largest = 0u;
++        for (const Sample &sample : samples_) largest = sample.size > largest ? sample.size : largest;
++        return largest;
++    }
++
++    // Sample `index` as Annex B (start codes), with the SPS and PPS in front of a sync sample.
++    bool read_annex_b(std::size_t index, std::vector<std::uint8_t> &out);
++
++private:
++    struct Sample {
++        std::uint64_t offset{};
++        std::uint64_t time{};
++        std::uint32_t size{};
++        std::uint32_t duration{};
++        bool sync{true};
++    };
++
++    bool parse(const std::vector<std::uint8_t> &moov);
++    bool fail(const char *text) {
++        error_ = text;
++        return false;
++    }
++
++    std::FILE *file_{};
++    std::string error_;
++    std::uint32_t width_{}, height_{}, timescale_{}, profile_{}, level_{};
++    std::uint32_t nal_length_size_{4u};
++    std::vector<std::uint8_t> parameter_sets_;  // SPS and PPS, Annex B
++    std::vector<Sample> samples_;
++    std::vector<std::uint8_t> scratch_;
++};
++
++} // namespace portablekit::movie
+diff --git a/tests/hd_movie_tests.cpp b/tests/hd_movie_tests.cpp
+new file mode 100644
+index 0000000..70ff92a
+--- /dev/null
++++ b/tests/hd_movie_tests.cpp
+@@ -0,0 +1,384 @@
++// HD replacement movies (host/movie/hd_movie.hpp, mp4_reader.hpp): everything that needs no decoder and no game. The MP4 is
++// built here byte by byte (the layout the offline tool writes), the PSMF header in the layout of psmf_tests.cpp, the picture
++// source is a fake that hands out numbered pictures.
++
++#include "movie/hd_movie.hpp"
++#include "movie/mp4_reader.hpp"
++#include "movie/psmf_header.hpp"
++
++#include "psprecomp/guest_memory.hpp"
++
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace {
++
++namespace fs = std::filesystem;
++using namespace portablekit::movie;
++using Bytes = std::vector<std::uint8_t>;
++
++int g_failures = 0;
++
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++// ---- a PSMF header with a given picture count -------------------------------------------------------------------------------
++
++void put_be(Bytes &bytes, std::size_t at, std::uint64_t value, std::size_t width) {
++    for (std::size_t i = 0; i < width; ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (8u * (width - 1u - i)));
++}
++
++Bytes psmf_header(std::uint32_t pictures, std::uint8_t salt = 0u) {
++    Bytes bytes(2048u, 0u);
++    const char magic[] = "PSMF0014";
++    for (std::size_t i = 0; i < 8u; ++i) bytes[i] = static_cast<std::uint8_t>(magic[i]);
++    put_be(bytes, 0x08u, 0x800u, 4u);
++    put_be(bytes, 0x0Cu, 0x870800u, 4u);
++    put_be(bytes, 0x54u, 90000u, 6u);
++    put_be(bytes, 0x5Au, 90000u + 3003u * pictures, 6u);
++    put_be(bytes, 0x80u, 1u, 2u);
++    bytes[0x82u] = 0xE0u;
++    bytes[0x82u + 12u] = 30u;  // 480
++    bytes[0x82u + 13u] = 17u;  // 272
++    bytes[0x400u] = salt;      // anything else that makes two headers differ
++    return bytes;
++}
++
++// ---- an MP4 as build_movies.sh writes it ------------------------------------------------------------------------------------
++
++Bytes box(const char type[5], const Bytes &payload) {
++    Bytes out(8u, 0u);
++    put_be(out, 0u, 8u + payload.size(), 4u);
++    std::memcpy(out.data() + 4, type, 4);
++    out.insert(out.end(), payload.begin(), payload.end());
++    return out;
++}
++Bytes cat(std::initializer_list<Bytes> parts) {
++    Bytes out;
++    for (const Bytes &part : parts) out.insert(out.end(), part.begin(), part.end());
++    return out;
++}
++Bytes be32s(std::initializer_list<std::uint32_t> values) {
++    Bytes out;
++    for (const std::uint32_t value : values)
++        for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(value >> shift));
++    return out;
++}
++
++struct Fixture {
++    Bytes file;
++    std::vector<Bytes> nals;  // the NAL unit of every sample (without length or start code)
++};
++
++// `count` samples, a sync sample at 0, 4, 8 ...; sample i is one NAL of the type 5 (sync) or 1, 6 + i bytes long. `ctts`
++// gives the samples composition offsets (what a stream with B-frames has).
++Fixture make_mp4(std::uint32_t count, bool ctts = false) {
++    Fixture fixture;
++    Bytes mdat_payload;
++    std::vector<std::uint32_t> sizes;
++    for (std::uint32_t i = 0; i < count; ++i) {
++        Bytes nal(6u + i, static_cast<std::uint8_t>(0x10u + i));
++        nal[0] = (i % 4u == 0u) ? 0x65u : 0x41u;  // nal_ref_idc 3 type 5, or 2 type 1
++        fixture.nals.push_back(nal);
++        Bytes sample = be32s({static_cast<std::uint32_t>(nal.size())});
++        sample.insert(sample.end(), nal.begin(), nal.end());
++        sizes.push_back(static_cast<std::uint32_t>(sample.size()));
++        mdat_payload.insert(mdat_payload.end(), sample.begin(), sample.end());
++    }
++    const Bytes ftyp = box("ftyp", cat({Bytes{'i', 's', 'o', 'm'}, be32s({512u}), Bytes{'i', 's', 'o', 'm'}}));
++    // avcC: version 1, High profile, level 3.1, 4 byte lengths, one SPS and one PPS.
++    const Bytes sps{0x67u, 0x64u, 0x00u, 0x1Fu, 0xACu};
++    const Bytes pps{0x68u, 0xEEu, 0x3Cu};
++    Bytes avcc_payload{1u, 100u, 0u, 31u, 0xFFu, 0xE1u};
++    avcc_payload.push_back(0u);
++    avcc_payload.push_back(static_cast<std::uint8_t>(sps.size()));
++    avcc_payload.insert(avcc_payload.end(), sps.begin(), sps.end());
++    avcc_payload.push_back(1u);
++    avcc_payload.push_back(0u);
++    avcc_payload.push_back(static_cast<std::uint8_t>(pps.size()));
++    avcc_payload.insert(avcc_payload.end(), pps.begin(), pps.end());
++    Bytes avc1_payload(78u, 0u);
++    put_be(avc1_payload, 24u, 960u, 2u);
++    put_be(avc1_payload, 26u, 544u, 2u);
++    const Bytes avcc = box("avcC", avcc_payload);
++    avc1_payload.insert(avc1_payload.end(), avcc.begin(), avcc.end());
++    const Bytes stsd = box("stsd", cat({be32s({0u, 1u}), box("avc1", avc1_payload)}));
++    const Bytes stts = box("stts", be32s({0u, 1u, count, 1001u}));
++    Bytes stsz_payload = be32s({0u, 0u, count});
++    for (const std::uint32_t size : sizes) {
++        const Bytes one = be32s({size});
++        stsz_payload.insert(stsz_payload.end(), one.begin(), one.end());
++    }
++    const Bytes stsz = box("stsz", stsz_payload);
++    // Two chunks: the first holds three samples, the second the rest.
++    const Bytes stsc = box("stsc", be32s({0u, 2u, 1u, 3u, 1u, 2u, count - 3u, 1u}));
++    Bytes stss_payload = be32s({0u, (count + 3u) / 4u});
++    for (std::uint32_t i = 0; i < count; i += 4u) {
++        const Bytes one = be32s({i + 1u});
++        stss_payload.insert(stss_payload.end(), one.begin(), one.end());
++    }
++    const Bytes stss = box("stss", stss_payload);
++    const Bytes ctts_box = ctts ? box("ctts", be32s({0u, 1u, count, 2002u})) : Bytes{};
++    // The offsets of the two chunks are only known when the moov box has its final size: build it twice.
++    std::uint32_t chunk1 = 0, chunk2 = 0;
++    Bytes moov;
++    for (int pass = 0; pass < 2; ++pass) {
++        const Bytes stco = box("stco", be32s({0u, 2u, chunk1, chunk2}));
++        const Bytes stbl = box("stbl", cat({stsd, stts, stsz, stsc, stss, ctts_box, stco}));
++        const Bytes mdhd = box("mdhd", cat({be32s({0u, 0u, 0u, 30000u, count * 1001u}), Bytes{0u, 0u, 0u, 0u}}));
++        const Bytes hdlr = box("hdlr", cat({be32s({0u, 0u}), Bytes{'v', 'i', 'd', 'e'}, Bytes(13u, 0u)}));
++        const Bytes minf = box("minf", stbl);
++        const Bytes mdia = box("mdia", cat({mdhd, hdlr, minf}));
++        moov = box("moov", box("trak", mdia));
++        const std::uint32_t mdat_start = static_cast<std::uint32_t>(ftyp.size() + moov.size() + 8u);
++        chunk1 = mdat_start;
++        chunk2 = mdat_start + sizes[0] + sizes[1] + sizes[2];
++    }
++    fixture.file = cat({ftyp, moov, box("mdat", mdat_payload)});
++    return fixture;
++}
++
++void write_file(const fs::path &path, const Bytes &bytes) {
++    std::ofstream out(path, std::ios::binary);
++    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++}
++
++void test_mp4(const fs::path &dir) {
++    const Fixture fixture = make_mp4(10u);
++    write_file(dir / "ten.mp4", fixture.file);
++    Mp4Reader reader;
++    check(reader.open((dir / "ten.mp4").string()), "an MP4 of the shape build_movies.sh writes opens");
++    if (!reader.is_open()) {
++        std::printf("     %s\n", reader.error().c_str());
++        return;
++    }
++    check(reader.sample_count() == 10u && reader.width() == 960u && reader.height() == 544u, "sample count and picture size");
++    check(reader.timescale() == 30000u && reader.sample_duration(3) == 1001u && reader.sample_time(3) == 3003u, "time scale and sample times");
++    check(reader.profile() == 100u && reader.level() == 31u, "profile High, level 3.1 from the avcC");
++    check(reader.is_sync(0) && reader.is_sync(4) && reader.is_sync(8) && !reader.is_sync(5), "sync samples from stss");
++    check(reader.sync_at_or_before(0) == 0u && reader.sync_at_or_before(3) == 0u && reader.sync_at_or_before(4) == 4u && reader.sync_at_or_before(7) == 4u &&
++              reader.sync_at_or_before(9) == 8u,
++          "the sync sample before a sample");
++    check(reader.longest_gop() == 4u, "longest distance between sync samples (the last GOP counts to the end)");
++    check(reader.largest_sample() == 4u + 6u + 9u, "the largest sample");
++    Bytes unit;
++    bool all = true;
++    for (std::size_t i = 0; i < 10u; ++i) {
++        all = all && reader.read_annex_b(i, unit);
++        Bytes expected;
++        if (reader.is_sync(i)) {
++            const Bytes sets{0, 0, 0, 1, 0x67u, 0x64u, 0x00u, 0x1Fu, 0xACu, 0, 0, 0, 1, 0x68u, 0xEEu, 0x3Cu};
++            expected = sets;
++        }
++        const Bytes start{0, 0, 0, 1};
++        expected.insert(expected.end(), start.begin(), start.end());
++        expected.insert(expected.end(), fixture.nals[i].begin(), fixture.nals[i].end());
++        all = all && unit == expected;
++    }
++    check(all, "every sample as Annex B, with the parameter sets in front of a sync sample only");
++    check(is_idr_unit(unit) == false, "a P sample is not an IDR unit");
++    reader.read_annex_b(4, unit);
++    check(is_idr_unit(unit), "a sync sample is an IDR unit");
++    check(!reader.read_annex_b(10, unit), "no sample past the end");
++
++    const Fixture b_frames = make_mp4(10u, true);
++    write_file(dir / "bframes.mp4", b_frames.file);
++    Mp4Reader refused;
++    check(!refused.open((dir / "bframes.mp4").string()) && refused.error().find("B-frames") != std::string::npos, "composition offsets are refused");
++    Bytes cut(fixture.file.begin(), fixture.file.begin() + 60);
++    write_file(dir / "cut.mp4", cut);
++    check(!Mp4Reader().open((dir / "cut.mp4").string()), "a truncated file is refused");
++    check(!Mp4Reader().open((dir / "missing.mp4").string()), "a missing file is refused");
++}
++
++// ---- the library --------------------------------------------------------------------------------------------------------------
++
++void test_library(const fs::path &dir) {
++    check(crc32(Bytes{'1', '2', '3', '4', '5', '6', '7', '8', '9'}) == 0xCBF43926u, "CRC-32 check value");
++    const Bytes header_a = psmf_header(100u, 1u), header_b = psmf_header(200u, 2u), header_c = psmf_header(300u, 3u);
++    PsmfTiming timing;
++    check(parse_psmf_timing(header_a, timing) && timing.frames() == 100u && timing.width == 480u && timing.height == 272u, "picture count and size from the PSMF header");
++    check(!parse_psmf_timing(Bytes(2048u, 0u), timing), "a header that is not PSMF");
++
++    fs::create_directories(dir / "movies_hd");
++    for (const char *name : {"alpha", "beta"}) write_file(dir / "movies_hd" / (std::string(name) + ".mp4"), Bytes{1, 2, 3});
++    char line[128];
++    std::string index = "# comment\n";
++    std::snprintf(line, sizeof(line), "alpha 100 %08x 960x544\n", crc32(header_a));
++    index += line;
++    std::snprintf(line, sizeof(line), "beta 200 %08X 960x544\n", crc32(header_b));
++    index += line;
++    index += "gone 10 00000001 960x544\n";  // listed, file not there
++    {
++        std::ofstream out(dir / "movies_hd" / "index.txt");
++        out << index;
++    }
++    HdLibrary &library = HdLibrary::instance();
++    library.configure(dir.string());
++    check(library.installed() && library.movies().size() == 2u, "the index lists what is installed (a missing file is skipped)");
++    std::string why;
++    const HdMovie *movie = library.identify(header_a, &why);
++    check(movie != nullptr && movie->name == "alpha" && movie->frames == 100u, "a movie is found by the CRC of its header");
++    movie = library.identify(header_b, &why);
++    check(movie != nullptr && movie->name == "beta", "another one");
++    check(library.identify(header_c, &why) == nullptr, "an unknown header has no replacement");
++
++    library.note_file_opened("disc0:/PSP_GAME/USRDIR/IMAGE/movies/Alpha.PMF");
++    check(library.last_opened() == "Alpha", "the name of the movie the game opened last");
++    const Bytes header_d = psmf_header(100u, 9u);  // another CRC, same count, the file name says alpha
++    movie = library.identify(header_d, &why);
++    check(movie != nullptr && movie->name == "alpha", "an unknown header is looked up by the file name when the picture count agrees");
++    const Bytes header_e = psmf_header(101u, 9u);
++    check(library.identify(header_e, &why) == nullptr, "...and not when it does not");
++    library.note_file_opened("disc0:/something.bin");
++    check(library.last_opened() == "Alpha", "only movie files are remembered");
++
++    library.configure((dir / "nowhere").string());
++    check(!library.installed(), "no index, no replacements");
++}
++
++// ---- the frame store and the marker -------------------------------------------------------------------------------------------
++
++void test_store_and_marker() {
++    HdFrameStore &store = HdFrameStore::instance();
++    auto first = std::make_shared<HdPicture>();
++    first->width = 1;
++    auto second = std::make_shared<HdPicture>();
++    second->width = 2;
++    store.publish(7u, 10u, first);
++    store.publish(7u, 11u, second);
++    check(store.in_use(), "the store knows a picture was published");
++    check(store.find(7u, 10u) == first && store.find(7u, 11u) == second, "a picture is found by session and number");
++    check(store.find(7u, 99u) == second, "a number that is gone gives the newest of the session");
++    check(store.find(8u, 10u) == nullptr, "another session has none");
++    for (std::uint64_t i = 0; i < 20u; ++i) store.publish(7u, 100u + i, first);
++    check(store.find(7u, 119u) == first, "the newest pictures are kept");
++    store.clear();
++    check(store.find(7u, 119u) == nullptr, "clear empties the store");
++
++    psprecomp::GuestMemory memory;
++    const std::uint32_t at = 0x08400000u;
++    HdMarker marker;
++    check(!read_hd_marker(memory, at, marker), "plain memory is not a marker");
++    write_hd_marker(memory, at, HdMarker{5u, 1234u, 480u, 272u});
++    check(read_hd_marker(memory, at, marker) && marker.session == 5u && marker.index == 1234u && marker.width == 480u && marker.height == 272u,
++          "a marker reads back");
++    memory.store32(at + 12u, 1235u);
++    check(!read_hd_marker(memory, at, marker), "a marker whose check word is wrong is not one");
++}
++
++// ---- a session with a fake source ---------------------------------------------------------------------------------------------
++
++bool g_closed = false;
++
++class FakeSource final : public HdSource {
++public:
++    bool open(const std::string &) override { return true; }
++    void close() override { g_closed = true; }
++    const std::string &error() const override { return error_; }
++    std::uint32_t width() const override { return 960u; }
++    std::uint32_t height() const override { return 544u; }
++    std::uint32_t frame_count() const override { return frames; }
++    std::shared_ptr<const HdPicture> frame_for(std::int64_t time) override {
++        asked.push_back(time);
++        if (fail_from >= 0 && time >= fail_from) return nullptr;
++        auto picture = std::make_shared<HdPicture>();
++        picture->width = 960u;
++        picture->height = 544u;
++        picture->yuv.width = 960u;
++        return picture;
++    }
++    std::vector<std::int64_t> asked;
++    std::int64_t fail_from{-1};
++    std::uint32_t frames{10u};
++
++private:
++    std::string error_;
++};
++
++FakeSource *g_fake = nullptr;
++std::unique_ptr<HdSource> make_fake() {
++    auto source = std::make_unique<FakeSource>();
++    g_fake = source.get();
++    return source;
++}
++
++Bytes unit_of(bool idr) {
++    return idr ? Bytes{0, 0, 0, 1, 0x65u, 1, 2, 3} : Bytes{0, 0, 0, 1, 0x41u, 1, 2, 3};
++}
++
++void test_session(const fs::path &dir) {
++    set_hd_source_factory(&make_fake);
++    HdMovie movie;
++    movie.name = "alpha";
++    movie.path = (dir / "movies_hd" / "alpha.mp4").string();
++    movie.frames = 10u;
++    PsmfTiming timing;
++    timing.start = 90000u;
++    timing.end = 90000u + 3003u * 10u;
++    timing.width = 480u;
++    timing.height = 272u;
++    psprecomp::GuestMemory memory;
++    const std::uint32_t destination = 0x08500000u, stride = 512u;
++    {
++        HdSession session(movie, timing);
++        const auto pts_of = [&](int index) { return static_cast<std::int64_t>(90000 + 3003 * index); };
++        // Pictures 0..3 replaced; 0 and 4 are IDR units.
++        bool all_replaced = true;
++        for (int i = 0; i < 4; ++i) all_replaced = all_replaced && session.show(memory, destination, stride, unit_of(i == 0), pts_of(i), true);
++        check(all_replaced, "with the setting on, the replacement stands in");
++        check(g_fake != nullptr && g_fake->asked.size() == 4u && g_fake->asked[0] == 0 && g_fake->asked[3] == 3 * 3003,
++              "the picture asked for is the one of the access unit's time stamp");
++        HdMarker marker;
++        check(read_hd_marker(memory, destination, marker) && marker.session == session.id() && marker.index == 3u && marker.width == 480u && marker.height == 272u,
++              "the buffer holds the marker of the last picture");
++        check(HdFrameStore::instance().find(session.id(), 3u) != nullptr, "the picture is in the store");
++        check(memory.load32(destination + 32u) == 0xFF000000u && memory.load32(destination + (stride * 271u + 479u) * 4u) == 0xFF000000u,
++              "the rest of the buffer is black");
++
++        // The setting is switched off before picture 4: the original decoder needs the units since the last IDR (0..3).
++        check(!session.show(memory, destination, stride, unit_of(true), pts_of(4), false), "with the setting off the original decodes");
++        const auto replay = session.take_replay();
++        check(replay.size() == 4u && replay[0] == unit_of(true) && replay[3] == unit_of(false), "it is fed the units it has not seen first");
++        check(session.take_replay().empty(), "the replay is taken once");
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(5), false) && session.take_replay().empty(), "nothing is pending later");
++
++        // On again at picture 6.
++        check(session.show(memory, destination, stride, unit_of(false), pts_of(6), true), "switched on again");
++        // The next original after that needs only the units the replacement showed since (an IDR starts afresh).
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(7), false), "off again");
++        check(session.take_replay().size() == 1u, "the replay holds the one unit shown in between (no IDR since)");
++
++        // A time stamp outside the movie is left to the original.
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(40), true), "a time stamp past the end is not replaced");
++        // The source gives up: the original plays.
++        g_fake->fail_from = 8 * 3003;
++        check(!session.show(memory, destination, stride, unit_of(false), pts_of(8), true), "a picture the source cannot give is shown by the original");
++        session.restart();
++        check(session.take_replay().empty(), "restart forgets what is pending");
++    }
++    check(g_closed, "the source is closed with the session");
++    set_hd_source_factory(nullptr);
++}
++
++} // namespace
++
++int main() {
++    const fs::path dir = fs::temp_directory_path() / ("hd_movie_tests_" + std::to_string(static_cast<unsigned long long>(std::hash<std::string>{}(__FILE__))));
++    fs::remove_all(dir);
++    fs::create_directories(dir);
++    test_mp4(dir);
++    test_library(dir);
++    test_store_and_marker();
++    test_session(dir);
++    fs::remove_all(dir);
++    if (g_failures != 0) std::printf("%d failed\n", g_failures);
++    return g_failures == 0 ? 0 : 1;
++}

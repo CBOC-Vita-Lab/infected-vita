@@ -1,0 +1,2155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 18:59:23 +0000
+Subject: [PATCH] Coroutine kernel: every guest thread on its own host stack;
+ pk_runtime library
+
+The kernel no longer blocks by saving a context and unwinding native frames to a
+dispatcher. The scheduler runs on the program's stack, each guest thread runs on a
+host stack of its own (psprecomp::Coroutine), and a thread that waits, is pre-empted
+or ends switches back to the scheduler from wherever it is, in the middle of a system
+call, a guest function called from the system, a callback or an interrupt handler.
+Threads are never unwound across stacks. docs of the contract: pk_guest_call,
+pk_hle_call, pk_fatal, pk_yield.
+
+* Scheduling follows ThreadMan: a pre-empted thread goes to the front of its priority
+  queue, a woken or started one to the back, equal priorities are not time-sliced
+  (<prefix>_STARVE_EQUAL=1 restores the first kernel's rotation in the spin hook).
+* Interrupts run nested on the running thread, or on a coroutine of their own when no
+  thread runs; they cannot wait (SCE_KERNEL_ERROR_CAN_NOT_WAIT).
+* Two clocks: virtual (default, repeatable, <prefix>_CPU_NS_PER_INSN and
+  <prefix>_FRAME_LIMIT_US as before) and realtime (<prefix>_CLOCK=realtime) on the
+  new KernelPlatform interface (monotonic clock, wait on a signalable event, signal).
+* <prefix>_CO_STACK_KB (default 256), <prefix>_SPIN_INSNS, <prefix>_SPIN_REPORT,
+  <prefix>_STACK_REPORT, <prefix>_TRACE_SWITCH.
+* pk_runtime: the system layer without a window, renderer, installer screens or input
+  devices, as a static library (PORTABLEKIT_BUILD_RUNTIME_LIBRARY, always built with
+  the tests). It links with only a profile; the tests no longer compile the host
+  sources a second time.
+* tests/kernel_tests.cpp: hand-assembled guest code in the interpreter, nine
+  scenarios (equal priorities, pre-emption to the front of the queue, priority change,
+  waiting inside a guest function called from the system, interrupts nested and while
+  idle, terminate and delete, 300 short lives, a stop from three calls deep), each in
+  a process of its own.
+
+Verified: ctest 31/31 on x86-64 Linux (virtual clock). Not verified on a Vita.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e085748..b1d6ccd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -50,6 +50,7 @@ endif()
+ set_property(GLOBAL APPEND PROPERTY JOB_POOLS psprecomp_generated=${PSPRECOMP_GENERATED_JOBS})
+ 
+ option(PSPRECOMP_BUILD_TESTS "Build reusable PSPRecomp tests" ON)
++option(PORTABLEKIT_BUILD_RUNTIME_LIBRARY "Build pk_runtime (the system layer without a window, renderer or installer) as a static library" OFF)
+ 
+ set(PSPRECOMP_GENERATED_OPT_LEVEL "2" CACHE STRING
+     "Optimization level for generated AOT units (0, 1, 2 or 3)")
+@@ -442,6 +443,32 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_hle_extension_tests COMMAND portablekit_hle_extension_tests)
+ endif()
+ 
++# pk_runtime: the part of the system layer that runs the guest and answers its
++# system calls (cmake/PortableKit.cmake lists it): kernel, HLE modules, GE state,
++# texture decoding, SAS, the ATRAC and MPEG players, save data, the disc image
++# reader, with the interpreter and memory in psprecomp_core. It needs no SDL3,
++# Vulkan or ImGui, and FFmpeg only behind the decoder classes (without it they
++# report that they cannot decode). A platform layer for a target without a
++# desktop links it with its own window, renderer, audio device and input.
++# The tests below link it instead of compiling the sources again.
++if(PSPRECOMP_BUILD_TESTS OR PORTABLEKIT_BUILD_RUNTIME_LIBRARY)
++    set(_runtime_sources)
++    foreach(_source IN LISTS PORTABLEKIT_RUNTIME_SOURCES)
++        list(APPEND _runtime_sources "${PORTABLEKIT_ROOT}/${_source}")
++    endforeach()
++    # tiny-AES-c is C; the project only enables C++, which compiles it unchanged.
++    set_source_files_properties("${PORTABLEKIT_ROOT}/third_party/tiny_aes/aes.c" PROPERTIES LANGUAGE CXX)
++    add_library(pk_runtime STATIC ${_runtime_sources})
++    target_compile_features(pk_runtime PUBLIC cxx_std_20)
++    target_include_directories(pk_runtime PUBLIC "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party")
++    target_link_libraries(pk_runtime PUBLIC psprecomp_core)
++    find_package(Threads REQUIRED)
++    target_link_libraries(pk_runtime PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
++    if(WIN32)
++        target_link_libraries(pk_runtime PUBLIC ws2_32 iphlpapi)
++    endif()
++endif()
++
+ # The system layer belongs to a game's target, so nothing above compiles
+ # host/main.cpp or most of host/. That let two compile errors through until a
+ # second game was built. This target builds the whole backend-independent
+@@ -457,54 +484,64 @@ if(PSPRECOMP_BUILD_TESTS)
+         DEPENDS "${PORTABLEKIT_ROOT}/configs/nids.csv" "${PORTABLEKIT_ROOT}/tools/embed_nids.cmake"
+         COMMENT "Embedding the NID table for the host check")
+ 
+-    set(_check_sources
+-        "${PORTABLEKIT_ROOT}/host/main.cpp"
++    # What a program has beside pk_runtime: the stand-in profile (what a port's own
++    # sources provide), and for a desktop program the desktop-only part of the system
++    # layer (input devices, camera, texture packs, installer screens, overlay). The
++    # tests that link no more than the stand-in profile show that pk_runtime needs
++    # nothing of the desktop.
++    set(_desktop_sources)
++    foreach(_source IN LISTS PORTABLEKIT_DESKTOP_SOURCES)
++        list(APPEND _desktop_sources "${PORTABLEKIT_ROOT}/${_source}")
++    endforeach()
++    set(_profile_support
+         "${PORTABLEKIT_ROOT}/host/generated_stub.cpp"
+         "${PORTABLEKIT_ROOT}/tests/test_profile.cpp"
+-        "${PORTABLEKIT_ROOT}/host/crypto_keys_builtin.cpp"
+-        "${_check_nids}")
+-    foreach(_source IN LISTS PORTABLEKIT_HOST_SOURCES)
+-        list(APPEND _check_sources "${PORTABLEKIT_ROOT}/${_source}")
+-    endforeach()
++        "${PORTABLEKIT_ROOT}/host/crypto_keys_builtin.cpp")
++    set(_check_support ${_profile_support} ${_desktop_sources})
+ 
+-    # tiny-AES-c is C; the project only enables C++, which compiles it unchanged.
+-    set_source_files_properties("${PORTABLEKIT_ROOT}/third_party/tiny_aes/aes.c" PROPERTIES LANGUAGE CXX)
+-    add_executable(portablekit_host_check ${_check_sources})
++    add_executable(portablekit_host_check "${PORTABLEKIT_ROOT}/host/main.cpp" ${_check_support} "${_check_nids}")
+     target_compile_features(portablekit_host_check PRIVATE cxx_std_20)
+     target_include_directories(portablekit_host_check PRIVATE
+         "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party"
+         "${CMAKE_CURRENT_BINARY_DIR}/host_check_nids")
+-    target_link_libraries(portablekit_host_check PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
++    target_link_libraries(portablekit_host_check PRIVATE pk_runtime psprecomp_core ${CMAKE_DL_LIBS})
+     _portablekit_link_hle_extensions(portablekit_host_check)
+-    find_package(Threads REQUIRED)
+-    target_link_libraries(portablekit_host_check PRIVATE Threads::Threads)
+-    if(WIN32)
+-        target_link_libraries(portablekit_host_check PRIVATE ws2_32 iphlpapi)
+-    endif()
+     set_target_properties(portablekit_host_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+ endif()
+ 
+ # A read filter on an open file, through the real IoFileMgrForUser handlers:
+ # the system layer the check above builds, with a test's main.
+ if(PSPRECOMP_BUILD_TESTS)
+-    set(_io_test_sources ${_check_sources})
+-    list(REMOVE_ITEM _io_test_sources "${PORTABLEKIT_ROOT}/host/main.cpp")
+-    add_executable(portablekit_io_filter_tests "${PORTABLEKIT_ROOT}/tests/io_filter_tests.cpp" ${_io_test_sources})
++    add_executable(portablekit_io_filter_tests "${PORTABLEKIT_ROOT}/tests/io_filter_tests.cpp" ${_profile_support})
+     target_compile_features(portablekit_io_filter_tests PRIVATE cxx_std_20)
+     target_compile_definitions(portablekit_io_filter_tests PRIVATE
+         PORTABLEKIT_NIDS_CSV="${PORTABLEKIT_ROOT}/configs/nids.csv")
+     target_include_directories(portablekit_io_filter_tests PRIVATE
+         "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party"
+         "${CMAKE_CURRENT_BINARY_DIR}/host_check_nids")
+-    target_link_libraries(portablekit_io_filter_tests PRIVATE psprecomp_core Threads::Threads ${CMAKE_DL_LIBS})
++    target_link_libraries(portablekit_io_filter_tests PRIVATE pk_runtime psprecomp_core ${CMAKE_DL_LIBS})
+     _portablekit_link_hle_extensions(portablekit_io_filter_tests)
+-    if(WIN32)
+-        target_link_libraries(portablekit_io_filter_tests PRIVATE ws2_32 iphlpapi)
+-    endif()
+     set_target_properties(portablekit_io_filter_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+     add_test(NAME portablekit_io_filter_tests COMMAND portablekit_io_filter_tests)
+ endif()
+ 
++# The coroutine kernel (host/kernel): scheduling order, pre-emption, waits in
++# the middle of nested guest calls, interrupts, deleting threads, a stop from
++# deep inside. Hand-assembled guest code in the interpreter. The kernel is a
++# process-wide object, so every scenario runs in a process of its own.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_kernel_tests "${PORTABLEKIT_ROOT}/tests/kernel_tests.cpp" ${_profile_support})
++    target_compile_features(portablekit_kernel_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_kernel_tests PRIVATE
++        "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party")
++    target_link_libraries(portablekit_kernel_tests PRIVATE pk_runtime psprecomp_core ${CMAKE_DL_LIBS})
++    _portablekit_link_hle_extensions(portablekit_kernel_tests)
++    set_target_properties(portablekit_kernel_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    foreach(_scenario RANGE 0 8)
++        add_test(NAME portablekit_kernel_tests_${_scenario} COMMAND portablekit_kernel_tests ${_scenario})
++    endforeach()
++endif()
++
+ # The desktop app's keys file as extension modules look keys up in it. The
+ # values of PortableKit's own keys come from crypto_keys_builtin.cpp, compiled
+ # under other names (tests/builtin_keys_renamed.cpp) beside the app's own.
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index be6bfd4..348dccf 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -22,7 +22,15 @@ set(PORTABLEKIT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." CACHE INTERNAL "PortableKit
+ 
+ # The system layer. Backend independent and always built; only the device the
+ # audio sink opens and the window the renderer creates depend on SDL.
+-set(PORTABLEKIT_HOST_SOURCES
++#
++# pk_runtime: what runs the guest and answers its system calls. The kernel (the
++# coroutine scheduler and its clocks), the HLE modules, the GE state tracker, the
++# texture decoder, the SAS mixer, the ATRAC and MPEG players behind the decoder
++# classes, save data, the disc image reader and the NID tables. No window, no
++# renderer, no interface, no installer, no input devices: those are the platform
++# layer's. It is built without SDL3, Vulkan or ImGui and, with FFmpeg behind the
++# decoder classes, is what a port to a platform without them compiles.
++set(PORTABLEKIT_RUNTIME_SOURCES
+     host/profile.cpp
+     host/app_paths.cpp
+     host/corpus_library.cpp
+@@ -32,22 +40,15 @@ set(PORTABLEKIT_HOST_SOURCES
+     host/movie/psmf_header.cpp
+     host/audio/audio_sink.cpp
+     host/audio/sas_core.cpp
+-    host/camera_probe.cpp
+-    host/camera/camera_input.cpp
+     host/gpu/ge_state.cpp
+     host/gpu/texture_decode.cpp
+-    host/input/bindings.cpp
+-    host/input/touch_controls.cpp
+-    host/input/tilt.cpp
+-    host/gpu/texture_pack.cpp
+-    host/gpu/texture_pack_import.cpp
+     host/perf/frame_stats.cpp
+     host/perf/bringup_stats.cpp
+     host/perf/debug_raster.cpp
+-    host/perf/perf_overlay.cpp
+     host/overlays.cpp
+     host/system.cpp
+     host/kernel/kernel.cpp
++    host/kernel/kernel_platform.cpp
+     host/kernel/fixed_pool.cpp
+     host/kernel/message_pipe.cpp
+     host/kernel/rtc_time.cpp
+@@ -86,12 +87,30 @@ set(PORTABLEKIT_HOST_SOURCES
+     host/save_data/savedata_store.cpp
+     host/save_data/save_transfer.cpp
+     host/install/executable_preparation.cpp
+-    host/install/front_end.cpp
+-    host/install/installer.cpp
+-    host/install/installer_dialogs.cpp
+     host/install/user_data.cpp
+     host/settings/settings.cpp
++    host/input/bindings.cpp
+     third_party/tiny_aes/aes.c
++    CACHE INTERNAL "pk_runtime sources, relative to PORTABLEKIT_ROOT")
++
++# What a desktop program has on top of the runtime: input devices and their
++# bindings, the camera, texture packs, the installer's screens and the
++# performance overlay.
++set(PORTABLEKIT_DESKTOP_SOURCES
++    host/camera_probe.cpp
++    host/camera/camera_input.cpp
++    host/input/touch_controls.cpp
++    host/input/tilt.cpp
++    host/gpu/texture_pack.cpp
++    host/gpu/texture_pack_import.cpp
++    host/perf/perf_overlay.cpp
++    host/install/front_end.cpp
++    host/install/installer.cpp
++    host/install/installer_dialogs.cpp
++    CACHE INTERNAL "PortableKit desktop-only system-layer sources, relative to PORTABLEKIT_ROOT")
++
++# The whole backend-independent system layer, as the desktop programs compile it.
++set(PORTABLEKIT_HOST_SOURCES ${PORTABLEKIT_RUNTIME_SOURCES} ${PORTABLEKIT_DESKTOP_SOURCES}
+     CACHE INTERNAL "PortableKit system-layer sources, relative to PORTABLEKIT_ROOT")
+ 
+ set(PORTABLEKIT_RENDERER_SOURCES
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 860d23b..65f8fe2 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -581,9 +581,12 @@ void register_display_ctrl(HleRegistrar &hle) {
+         // that does not wait for the vblank then runs at the pace a display
+         // would give it (16683 for 60 Hz), where it otherwise measures frames
+         // that cost no emulated time at all.
++        // With the realtime clock (<prefix>_CLOCK=realtime) the display's own period is the
++        // default: a game that presents faster than 59.94 Hz is held to it.
+         static const std::uint64_t limit_us = [] {
+             const char *text = portablekit::env("FRAME_LIMIT_US");
+-            return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
++            if (text != nullptr) return static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10));
++            return kernel().realtime() ? kVBlankPeriodUs : std::uint64_t{0};
+         }();
+         if (limit_us != 0u) {
+             static std::uint64_t last_flip_us = 0u;
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index e9c1be1..2effe57 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -2,6 +2,7 @@
+ #include "kernel.hpp"
+ 
+ #include "kernel/fast_loading.hpp"
++#include "kernel/kernel_platform.hpp"
+ #include "kernel/stall_watchdog.hpp"
+ #include "kernel/load_trace.hpp"
+ #include "perf/frame_stats.hpp"
+@@ -14,8 +15,11 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <iostream>
++#if !defined(PORTABLEKIT_NO_HOST_THREADS)
+ #include <thread>
++#endif
+ 
+ namespace portablekit {
+ namespace {
+@@ -25,13 +29,14 @@ constexpr std::uint32_t kLoaderPriority = 0x20u;
+ constexpr std::uint32_t kLoaderStackSize = 0x40000u;
+ constexpr std::uint32_t kThreadAttrNoFillStack = 0x00100000u;
+ constexpr std::uint32_t kThreadArgumentHome = 0x40u;
+-// Virtual time charged per runtime starvation boundary, i.e. per
+-// kStarvationInterval dispatches without an import call.
++// Virtual time charged each time the spin hook fires.
+ constexpr std::uint64_t kStarvationQuantumUs = 1000u;
+ // Idle vblanks with no runnable thread before the scheduler reports a deadlock.
+ constexpr std::uint64_t kIdleVBlankLimit = 60u * 60u * 5u;
+ constexpr std::int32_t kInterruptIdentity = -2;
+ constexpr std::int32_t kIdleIdentity = -3;
++// Interpreted instructions without a system call before the spin hook fires.
++constexpr std::uint64_t kDefaultSpinInstructions = 4'000'000u;
+ // Scratch for SceKernelSysClock values passed to VTimer handlers.
+ constexpr std::uint32_t kVTimerClockScratch = 0x08180000u;
+ 
+@@ -48,11 +53,8 @@ bool trace_enabled() {
+     return enabled;
+ }
+ 
+-void native_thread_exit(psprecomp::CorpusRuntime &, AllegrexContext &ctx) { kernel().thread_exit_stub(ctx); }
+-void native_interrupt_return(psprecomp::CorpusRuntime &, AllegrexContext &ctx) { kernel().interrupt_return_stub(ctx); }
+-void native_idle(psprecomp::CorpusRuntime &, AllegrexContext &ctx) { kernel().idle_stub(ctx); }
+-void native_guest_call_return(psprecomp::CorpusRuntime &, AllegrexContext &ctx) { kernel().guest_call_return_stub(ctx); }
+-void native_starvation(Runtime &, AllegrexContext &ctx) { kernel().on_starvation(ctx); }
++void spin_hook(std::uint32_t pc) { kernel().on_starvation(pc); }
++void abort_hook() { kernel().abort_to_scheduler(); }
+ 
+ const char *status_name(ThreadStatus status) {
+     switch (status) {
+@@ -81,6 +83,14 @@ const char *wait_name(WaitType type) {
+     return "?";
+ }
+ 
++void sleep_host(std::uint64_t microseconds) {
++#if !defined(PORTABLEKIT_NO_HOST_THREADS)
++    std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
++#else
++    kernel_platform().wait_event(microseconds);
++#endif
++}
++
+ } // namespace
+ 
+ Kernel &kernel() {
+@@ -100,13 +110,42 @@ void Kernel::install(Runtime &runtime, std::uint32_t gp, std::uint32_t image_end
+     const std::uint32_t user_end = psprecomp::GuestMemory::kPhysicalBase + runtime.memory().size();
+     free_ranges_.push_back(FreeRange{user_start, user_end - user_start});
+ 
+-    runtime.register_function(kThreadExitStub, &native_thread_exit, "portablekit_thread_exit");
+-    runtime.register_function(kInterruptReturnStub, &native_interrupt_return, "portablekit_interrupt_return");
+-    runtime.register_function(kIdleStub, &native_idle, "portablekit_idle");
+-    runtime.register_function(kGuestCallReturnStub, &native_guest_call_return, "portablekit_guest_call_return");
+-    std::uint64_t interval = 20'000u;
+-    if (const char *text = portablekit::env("STARVATION_INTERVAL")) interval = std::strtoull(text, nullptr, 0);
+-    psprecomp::set_runtime_starvation_hook(&native_starvation, interval);
++    // <prefix>_CLOCK=virtual|realtime
++    if (const char *text = portablekit::env("CLOCK"); text != nullptr && *text != '\0') {
++        if (std::strcmp(text, "realtime") == 0) clock_mode_ = ClockMode::Realtime;
++        else if (std::strcmp(text, "virtual") != 0)
++            std::cerr << "warning: " << portablekit::env_name("CLOCK") << "=" << text
++                      << " is not virtual or realtime; using virtual\n";
++    }
++    if (clock_mode_ == ClockMode::Realtime) {
++        const KernelPlatform &platform = kernel_platform();
++        if (platform.monotonic_us == nullptr || platform.wait_event == nullptr)
++            throw psprecomp::Error("the realtime clock needs a platform clock (set_kernel_platform)");
++        realtime_base_us_ = platform.monotonic_us();
++        now_us_ = 0u;
++        next_vblank_us_ = kVBlankPeriodUs;
++        std::cout << "Clock: realtime (host monotonic clock, 59.94 Hz vblank)\n";
++    }
++    // <prefix>_CO_STACK_KB: the host stack of every guest thread (default 256).
++    if (const char *text = portablekit::env("CO_STACK_KB"); text != nullptr && *text != '\0') {
++        const unsigned long kilobytes = std::strtoul(text, nullptr, 0);
++        if (kilobytes >= 16u) stack_bytes_ = static_cast<std::size_t>(kilobytes) * 1024u;
++    }
++    starve_equal_ = portablekit::env("STARVE_EQUAL") != nullptr;
++
++    // <prefix>_INTERP_ONLY=addr,addr-addr,...|all and <prefix>_LEAN_ONLY=1 (exec.hpp).
++    psprecomp::ExecOptions options;
++    if (const char *text = portablekit::env("INTERP_ONLY")) options.interp_only = text;
++    options.lean_only = portablekit::env("LEAN_ONLY") != nullptr;
++    psprecomp::exec_configure(options);
++    psprecomp::exec_set_abort_hook(&abort_hook);
++    // The spin hook: <prefix>_SPIN_INSNS interpreted instructions without a system call
++    // (0 turns it off). <prefix>_STARVATION_INTERVAL is the first kernel's name for it.
++    std::uint64_t spin = kDefaultSpinInstructions;
++    if (const char *text = portablekit::env("SPIN_INSNS")) spin = std::strtoull(text, nullptr, 0);
++    else if (const char *old = portablekit::env("STARVATION_INTERVAL")) spin = std::strtoull(old, nullptr, 0);
++    psprecomp::exec_set_spin_hook(&spin_hook, spin);
++    running_ = &root_;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -149,22 +188,20 @@ void Kernel::start_loader_thread(AllegrexContext &ctx, std::uint32_t entry, std:
+         thread->stack_bottom = block->address;
+         stack_top = block->address + block->size;
+     }
+-    thread->status = ThreadStatus::Running;
+     (void)stack_top;
+     const std::uint32_t sp = prepare_thread_stack(*thread);
+ 
++    // The boot arguments the installer left in a0/a1 reach the entry function.
+     const std::uint32_t a0 = ctx.gpr[4];
+     const std::uint32_t a1 = ctx.gpr[5];
+-    ctx = pristine_context_;
+-    ctx.set_gpr(4, a0);
+-    ctx.set_gpr(5, a1);
+-    ctx.set_gpr(26, thread->control_block);
+-    ctx.set_gpr(29, sp - kThreadArgumentHome);
+-    ctx.set_gpr(31, kThreadExitStub);
+-    ctx.pc = entry;
+-
+-    current_uid_ = thread->uid;
+-    psprecomp::set_runtime_thread_identity(thread->uid, thread->name);
++    thread->context = pristine_context_;
++    thread->context.set_gpr(4, a0);
++    thread->context.set_gpr(5, a1);
++    thread->context.set_gpr(26, thread->control_block);
++    thread->context.set_gpr(29, sp - kThreadArgumentHome);
++    thread->context.set_gpr(31, kThreadExitStub);
++    thread->context.pc = entry;
++    make_ready(*thread);
+     threads_.emplace(thread->uid, std::move(thread));
+ }
+ 
+@@ -224,6 +261,7 @@ std::int32_t Kernel::start_thread(AllegrexContext &ctx, SceUID uid, std::uint32_
+     thread->priority = thread->initial_priority;
+     thread->wakeup_count = 0u;
+     thread->exit_status = 0;
++    thread->co.release();  // a restarted thread begins on a fresh host stack
+     make_ready(*thread);
+     if (trace_enabled())
+         std::cerr << "[kernel] start thread uid=" << uid << " name=" << thread->name << "\n";
+@@ -231,24 +269,30 @@ std::int32_t Kernel::start_thread(AllegrexContext &ctx, SceUID uid, std::uint32_
+ }
+ 
+ void Kernel::exit_current_thread(AllegrexContext &ctx, std::int32_t status, bool delete_thread) {
++    (void)ctx;
+     Thread *thread = current_thread();
++    if (thread == nullptr) pk_fatal("a thread exit outside a thread (from an interrupt handler or an idle callback)", g_cpu.gpr[31]);
+     if (trace_enabled())
+-        std::cerr << "[kernel] exit thread uid=" << current_uid_
+-                  << " name=" << (thread != nullptr ? thread->name : "?") << " status=" << status << "\n";
+-    if (thread != nullptr) {
+-        thread->exit_status = status;
+-        thread->status = ThreadStatus::Dormant;
+-        const SceUID uid = thread->uid;
+-        for (auto &[other_uid, other] : threads_) {
+-            (void)other_uid;
+-            if (other->status == ThreadStatus::Waiting && other->wait.type == WaitType::ThreadEnd &&
+-                other->wait.object == uid)
+-                wake(*other, static_cast<std::uint32_t>(status));
+-        }
+-        if (delete_thread) (void)this->delete_thread(uid);
++        std::cerr << "[kernel] exit thread uid=" << current_uid_ << " name=" << thread->name << " status=" << status
++                  << "\n";
++    thread->exit_status = status;
++    thread->status = ThreadStatus::Dormant;
++    thread->wait = WaitState{};
++    const SceUID uid = thread->uid;
++    for (auto &[other_uid, other] : threads_) {
++        (void)other_uid;
++        if (other->status == ThreadStatus::Waiting && other->wait.type == WaitType::ThreadEnd &&
++            other->wait.object == uid)
++            wake(*other, static_cast<std::uint32_t>(status));
+     }
++    // This host stack is still the one running: the scheduler frees it (and the
++    // thread, when it deletes itself) as soon as it is back on its own.
++    finished_ = thread;
++    finished_delete_ = delete_thread;
+     current_uid_ = 0;
+-    schedule(ctx);
++    transfer(root_);
++    // Nothing switches back to an ended thread.
++    std::abort();
+ }
+ 
+ std::int32_t Kernel::terminate_thread(AllegrexContext &ctx, SceUID uid, bool delete_thread) {
+@@ -258,7 +302,12 @@ std::int32_t Kernel::terminate_thread(AllegrexContext &ctx, SceUID uid, bool del
+     if (uid == current_uid_) return static_cast<std::int32_t>(error::kIllegalThid);
+     if (thread->status == ThreadStatus::Waiting) remove_waiter(*thread);
+     thread->status = ThreadStatus::Dormant;
++    thread->wait = WaitState{};
+     thread->exit_status = static_cast<std::int32_t>(0x800201ACu);
++    // The thread is not running: its host stack, with whatever frames it holds, is
++    // simply dropped (nothing is unwound; the frames of a system call hold no
++    // resources the kernel needs back).
++    thread->co.release();
+     if (delete_thread) return this->delete_thread(uid);
+     return 0;
+ }
+@@ -269,6 +318,13 @@ std::int32_t Kernel::delete_thread(SceUID uid) {
+     if (thread->status != ThreadStatus::Dormant && thread->status != ThreadStatus::Dead)
+         return static_cast<std::int32_t>(error::kNotDormant);
+     if (thread->stack_block != 0) (void)free_block(thread->stack_block);
++    thread->stack_block = 0;
++    if (thread == finished_) {
++        // Deleting itself on the way out: the stack under the running code must not go
++        // yet. The scheduler erases it.
++        finished_delete_ = true;
++        return 0;
++    }
+     threads_.erase(uid);
+     return 0;
+ }
+@@ -294,6 +350,12 @@ void Kernel::make_ready(Thread &thread) {
+     thread.ready_sequence = next_ready_sequence_++;
+ }
+ 
++void Kernel::make_ready_front(Thread &thread) {
++    thread.status = ThreadStatus::Ready;
++    thread.wait = WaitState{};
++    thread.ready_sequence = --front_ready_sequence_;
++}
++
+ Thread *Kernel::best_ready_thread() noexcept {
+     Thread *best = nullptr;
+     for (auto &[uid, thread] : threads_) {
+@@ -306,45 +368,204 @@ Thread *Kernel::best_ready_thread() noexcept {
+     return best;
+ }
+ 
+-void Kernel::save_current(const AllegrexContext &ctx, ThreadStatus status) {
++bool Kernel::better_thread_ready(bool or_equal) noexcept {
++    Thread *current = current_thread();
++    if (current == nullptr) return false;
++    Thread *best = best_ready_thread();
++    if (best == nullptr) return false;
++    return best->priority < current->priority || (or_equal && best->priority == current->priority);
++}
++
++void Kernel::transfer(psprecomp::Coroutine &to) {
++    psprecomp::Coroutine &from = *running_;
++    running_ = &to;
++    psprecomp::Coroutine::switch_to(from, to);
++    // Whatever switched back to this coroutine made it the running one.
++}
++
++// The running thread gives the processor to the scheduler. Its registers go to its
++// Thread (the caller has set its status and its place in the queue); this returns
++// when the scheduler runs it again, with g_cpu loaded with them.
++void Kernel::leave_thread(Thread &thread, ThreadStatus status) {
++    (void)status;
++    thread.context = g_cpu;
++    thread.context.pc = g_cpu.gpr[31];  // where the system call returns to, for the dumps
++    current_uid_ = 0;
++    transfer(root_);
++}
++
++void Kernel::yield_running(bool front) {
+     Thread *thread = current_thread();
+     if (thread == nullptr) return;
+-    thread->context = ctx;
+-    if (status == ThreadStatus::Ready) make_ready(*thread);
+-    else thread->status = status;
++    if (front) make_ready_front(*thread);
++    else make_ready(*thread);
++    leave_thread(*thread, ThreadStatus::Ready);
++}
++
++void Kernel::thread_entry(void *thread) { kernel().thread_body(*static_cast<Thread *>(thread)); }
++
++void Kernel::thread_body(Thread &thread) {
++    try {
++        // g_cpu already holds the start context: sp, $k0, gp and the arguments.
++        pk_guest_call(thread.entry);
++        // The entry function returned: that is sceKernelExitThread(v0).
++        exit_current_thread(g_cpu, static_cast<std::int32_t>(g_cpu.gpr[2]), thread.name == "module_start");
++    } catch (const std::exception &error) {
++        runtime_->stop(std::string("exception in thread ") + thread.name + ": " + error.what());
++    } catch (...) {
++        runtime_->stop("unknown exception in thread " + thread.name);
++    }
++    abort_to_scheduler();
+ }
+ 
+-void Kernel::switch_to(AllegrexContext &ctx, Thread &thread) {
++void Kernel::run_thread(Thread &thread) {
++    static const bool trace_switch = portablekit::env("TRACE_SWITCH") != nullptr;
++    if (trace_switch)
++        std::fprintf(stderr, "[switch] t=%llu -> %s(%d prio %u) pc=0x%08X\n", static_cast<unsigned long long>(now_us_),
++                     thread.name.c_str(), thread.uid, thread.priority, thread.context.pc);
+     thread.status = ThreadStatus::Running;
+     current_uid_ = thread.uid;
+-    ctx = thread.context;
+     psprecomp::set_runtime_thread_identity(thread.uid, thread.name);
+     load_trace::run_as(thread.name);
+     idle_vblanks_ = 0u;
++    if (!thread.co.valid()) {
++        if (!thread.co.create(stack_bytes_, &Kernel::thread_entry, &thread)) {
++            runtime_->stop("cannot allocate a host stack for thread " + thread.name);
++            current_uid_ = 0;
++            return;
++        }
++    }
++    g_cpu = thread.context;
++    transfer(thread.co);
++    // Back on the scheduler's stack: the thread waited, yielded or ended.
++    if (psprecomp::Coroutine::stack_check_enabled() && thread.co.valid() && !thread.co.canary_intact() &&
++        !runtime_->stopped()) {
++        runtime_->stop("host stack overflow in thread " + thread.name + " (" + std::to_string(thread.co.stack_bytes()) +
++                       " bytes; raise " + portablekit::env_name("CO_STACK_KB") + ")");
++    }
+ }
+ 
+-void Kernel::finish(AllegrexContext &ctx, std::uint32_t result) {
+-    ctx.set_gpr(2, result);
+-    if (interrupt_active_ || current_thread() == nullptr) return;
+-    charge_instruction_time();
+-    charge_busy_time();
++void Kernel::reap_finished() {
++    if (finished_ == nullptr) return;
++    Thread *thread = finished_;
++    finished_ = nullptr;
++    const SceUID uid = thread->uid;
++    thread->co.release();
++    if (std::exchange(finished_delete_, false)) {
++        if (thread->stack_block != 0) {
++            (void)free_block(thread->stack_block);
++            thread->stack_block = 0;
++        }
++        threads_.erase(uid);
++    }
++}
+ 
+-    if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+-        interrupted_context_ = ctx;
+-        interrupted_context_.pc = ctx.gpr[31];
+-        interrupted_idle_ = false;
+-        (void)begin_pending_interrupt(ctx);
+-        return;
++void Kernel::abort_to_scheduler() {
++    if (running_ == &root_ || running_ == nullptr) {
++        std::fflush(stdout);
++        std::fflush(stderr);
++        std::abort();
+     }
+-    if (!dispatch_enabled_) return;
+-    Thread *best = best_ready_thread();
+-    Thread *current = current_thread();
+-    if (best != nullptr && best->priority < current->priority) {
+-        AllegrexContext saved = ctx;
+-        saved.pc = ctx.gpr[31];
+-        save_current(saved, ThreadStatus::Ready);
+-        switch_to(ctx, *best);
++    if (Thread *thread = current_thread()) {
++        thread->context = g_cpu;  // for the report at the end of the run
++        thread->context.pc = g_cpu.gpr[31];
++    }
++    transfer(root_);
++    std::abort();
++}
++
++void Kernel::run_main() {
++    running_ = &root_;
++    runtime_->begin_kernel_run();
++    scheduler_loop();
++    runtime_->end_kernel_run();
++    if (portablekit::env("SPIN_REPORT") != nullptr) report_spin(std::cerr);
++    if (portablekit::env("STACK_REPORT") != nullptr) report_stacks(std::cerr);
++    if (portablekit::env("EXEC_REPORT") != nullptr) {
++        std::string text;
++        psprecomp::exec_report(text);
++        std::cerr << text;
++    }
++}
++
++void Kernel::scheduler_loop() {
++    for (;;) {
++        if (runtime_->stopped()) return;
++        bringup::check_limits(*runtime_);
++        if (runtime_->stopped()) return;
++        if (poll_hook_) poll_hook_();
++        load_trace::run_as("idle");
++        psprecomp::set_runtime_thread_identity(kIdleIdentity, "idle");
++        for (;;) {
++            if (runtime_->stopped()) return;
++            if (clock_mode_ == ClockMode::Realtime) refresh_realtime();
++            process_timers();
++            if (interrupts_enabled_ && !pending_interrupts_.empty()) {
++                // Interrupts that come while nothing runs: on a coroutine of their own, so
++                // that a stop inside a handler can leave it.
++                if (!irq_.valid() && !irq_.create(stack_bytes_, &Kernel::interrupt_entry, this)) {
++                    runtime_->stop("cannot allocate a host stack for interrupt handlers");
++                    return;
++                }
++                transfer(irq_);
++                continue;
++            }
++            if (Thread *best = best_ready_thread()) {
++                run_thread(*best);
++                reap_finished();
++                break;
++            }
++
++            stall_watchdog::idle(*this);
++            const auto next = next_event_us();
++            if (!next || idle_vblanks_ > kIdleVBlankLimit) {
++                std::string report = "PSP scheduler deadlock: no runnable thread";
++                for (const auto &[uid, thread] : threads_) {
++                    report += "\n  uid=" + std::to_string(uid) + " name=" + thread->name + " status=" +
++                              status_name(thread->status);
++                    if (thread->status == ThreadStatus::Waiting)
++                        report += std::string(" wait=") + wait_name(thread->wait.type) +
++                                  " object=" + std::to_string(thread->wait.object) +
++                                  " resume=" + psprecomp::hex32(thread->context.pc);
++                }
++                runtime_->stop(report);
++                return;
++            }
++            if (clock_mode_ == ClockMode::Realtime) sleep_until_event(*next);
++            else advance_clock(*next);
++            bringup::check_limits(*runtime_);
++        }
++    }
++}
++
++void Kernel::interrupt_entry(void *kernel_pointer) { static_cast<Kernel *>(kernel_pointer)->interrupt_body(); }
++
++void Kernel::interrupt_body() {
++    for (;;) {
++        try {
++            run_interrupts_nested();
++        } catch (const std::exception &error) {
++            runtime_->stop(std::string("exception in an interrupt handler: ") + error.what());
++        } catch (...) {
++            runtime_->stop("unknown exception in an interrupt handler");
++        }
++        if (runtime_->stopped()) abort_to_scheduler();
++        transfer(root_);
++    }
++}
++
++void Kernel::finish(AllegrexContext &ctx, std::uint32_t result) {
++    ctx.set_gpr(2, result);
++    if (interrupt_active_ || current_uid_ == 0) return;
++    if (clock_mode_ == ClockMode::Realtime) {
++        refresh_realtime();
++        process_timers();
++    } else {
++        charge_instruction_time();
++        charge_busy_time();
+     }
++    if (interrupts_enabled_ && !pending_interrupts_.empty()) run_interrupts_nested();
++    if (dispatch_enabled_ && better_thread_ready(false)) yield_running(true);
+ }
+ 
+ void Kernel::finish64(AllegrexContext &ctx, std::uint64_t result) {
+@@ -361,21 +582,24 @@ void Kernel::block(AllegrexContext &ctx, const WaitState &wait, std::uint32_t re
+     ++waits_begun_;
+     thread->wait = wait;
+     if (wait.timeout_address != 0u)
+-        thread->wait.deadline_us = now_us_ + runtime_->memory().load32(wait.timeout_address);
+-    AllegrexContext saved = ctx;
+-    saved.set_gpr(2, result);
+-    saved.pc = ctx.gpr[31];
+-    save_current(saved, ThreadStatus::Waiting);
++        thread->wait.deadline_us = now_us() + runtime_->memory().load32(wait.timeout_address);
++    ctx.set_gpr(2, result);
++    thread->status = ThreadStatus::Waiting;
+     if (trace_enabled())
+         std::cerr << "[kernel] block uid=" << thread->uid << " name=" << thread->name
+                   << " wait=" << wait_name(wait.type) << " object=" << wait.object << "\n";
+-    current_uid_ = 0;
+-    schedule(ctx);
++    leave_thread(*thread, ThreadStatus::Waiting);
+ }
+ 
+ void Kernel::wake(Thread &thread, std::uint32_t result) {
++    static const bool trace_switch = portablekit::env("TRACE_SWITCH") != nullptr;
++    if (trace_switch)
++        std::fprintf(stderr, "[wake] t=%llu %s(prio %u) result=0x%X by=%s\n", static_cast<unsigned long long>(now_us_),
++                     thread.name.c_str(), thread.priority, result,
++                     current_thread() != nullptr ? current_thread()->name.c_str() : "idle/irq");
+     if (thread.wait.timeout_address != 0u && thread.wait.deadline_us) {
+-        const std::uint64_t remaining = *thread.wait.deadline_us > now_us_ ? *thread.wait.deadline_us - now_us_ : 0u;
++        const std::uint64_t now = now_us();
++        const std::uint64_t remaining = *thread.wait.deadline_us > now ? *thread.wait.deadline_us - now : 0u;
+         runtime_->memory().store32(thread.wait.timeout_address, static_cast<std::uint32_t>(remaining));
+     }
+     thread.context.set_gpr(2, result);
+@@ -385,7 +609,7 @@ void Kernel::wake(Thread &thread, std::uint32_t result) {
+ void Kernel::delay_current(AllegrexContext &ctx, std::uint64_t microseconds, std::uint32_t result) {
+     WaitState wait{};
+     wait.type = WaitType::Delay;
+-    wait.deadline_us = now_us_ + std::max<std::uint64_t>(microseconds, 1u);
++    wait.deadline_us = now_us() + std::max<std::uint64_t>(microseconds, 1u);
+     block(ctx, wait, result);
+ }
+ 
+@@ -401,47 +625,30 @@ void Kernel::wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeou
+     }
+     WaitState wait{};
+     wait.type = WaitType::Host;
+-    if (timeout_us) wait.deadline_us = now_us_ + *timeout_us;
++    if (timeout_us) wait.deadline_us = now_us() + *timeout_us;
+     wait.host_poll = std::move(poll);
+     // The poll result replaces v0 when the wait ends.
+     block(ctx, wait, 0u);
+ }
+ 
+-void Kernel::schedule(AllegrexContext &ctx) {
+-    bringup::check_limits(*runtime_);
+-    if (poll_hook_) poll_hook_();
+-    load_trace::run_as("idle");
+-    for (;;) {
+-        if (runtime_->stopped()) return;
+-        process_timers();
+-        if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+-            interrupted_idle_ = true;
+-            if (begin_pending_interrupt(ctx)) return;
+-        }
+-        if (Thread *best = best_ready_thread()) {
+-            switch_to(ctx, *best);
+-            return;
+-        }
++void Kernel::refresh_realtime() const noexcept {
++    const std::uint64_t reading = kernel_platform().monotonic_us() - realtime_base_us_;
++    if (reading > now_us_) now_us_ = reading;
++}
+ 
+-        stall_watchdog::idle(*this);
+-        const auto next = next_event_us();
+-        if (!next || idle_vblanks_ > kIdleVBlankLimit) {
+-            std::string report = "PSP scheduler deadlock: no runnable thread";
+-            for (const auto &[uid, thread] : threads_) {
+-                report += "\n  uid=" + std::to_string(uid) + " name=" + thread->name + " status=" +
+-                          status_name(thread->status);
+-                if (thread->status == ThreadStatus::Waiting)
+-                    report += std::string(" wait=") + wait_name(thread->wait.type) +
+-                              " object=" + std::to_string(thread->wait.object) +
+-                              " resume=" + psprecomp::hex32(thread->context.pc);
+-            }
+-            psprecomp::set_runtime_thread_identity(kIdleIdentity, "idle");
+-            ctx.pc = kIdleStub;
+-            runtime_->stop(report);
+-            return;
+-        }
+-        advance_clock(*next);
+-    }
++// Realtime idle: sleep on the platform's event until `target_us` of emulated time or
++// until another host thread signals it.
++void Kernel::sleep_until_event(std::uint64_t target_us) {
++    refresh_realtime();
++    if (target_us <= now_us_) return;
++    const std::uint64_t wait_us = target_us - now_us_;
++    using Clock = std::chrono::steady_clock;
++    const Clock::time_point start = Clock::now();
++    if (idle_hook_) idle_hook_(start + std::chrono::microseconds(wait_us));
++    refresh_realtime();
++    if (target_us > now_us_) kernel_platform().wait_event(target_us - now_us_);
++    perf::add_pacing_time(Clock::now() - start);
++    refresh_realtime();
+ }
+ 
+ void Kernel::dump_state(std::ostream &out) const {
+@@ -504,6 +711,10 @@ void Kernel::dump_state(std::ostream &out) const {
+ }
+ 
+ void Kernel::advance_clock(std::uint64_t target_us) {
++    if (clock_mode_ == ClockMode::Realtime) {
++        refresh_realtime();
++        return;
++    }
+     if (target_us <= now_us_) return;
+     const std::uint64_t step_us = target_us - now_us_;
+     now_us_ = target_us;
+@@ -514,7 +725,7 @@ void Kernel::advance_clock(std::uint64_t target_us) {
+     const bool host_wait = std::any_of(threads_.begin(), threads_.end(), [](const auto &entry) {
+         return entry.second->status == ThreadStatus::Waiting && entry.second->wait.type == WaitType::Host;
+     });
+-    if (host_wait) std::this_thread::sleep_for(std::chrono::microseconds(std::min(step_us, kHostWaitPollUs)));
++    if (host_wait) sleep_host(std::min(step_us, kHostWaitPollUs));
+ }
+ 
+ bool Kernel::pace_to_real_time() {
+@@ -563,7 +774,8 @@ bool Kernel::pace_to_real_time() {
+             idle_hook_(wake);
+             sleep_start = Clock::now();
+         }
+-        if (sleep_start < wake) std::this_thread::sleep_until(wake);
++        if (sleep_start < wake)
++            sleep_host(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(wake - sleep_start).count()));
+         perf::add_pacing_time(Clock::now() - sleep_start);
+         load_trace::note_pacing_sleep(std::chrono::duration<double, std::milli>(Clock::now() - now).count());
+     } else if (ahead_us < -kMaxLagUs) {
+@@ -593,6 +805,18 @@ std::optional<std::uint64_t> Kernel::next_event_us() const {
+ }
+ 
+ void Kernel::process_timers() {
++    if (in_timers_) return;
++    in_timers_ = true;
++    if (clock_mode_ == ClockMode::Realtime) {
++        refresh_realtime();
++        // A host that was away (a pause, a slow frame) does not get the vblanks it missed
++        // one after the other: the count catches up and the handlers run once.
++        if (now_us_ > next_vblank_us_ + 4u * kVBlankPeriodUs) {
++            const std::uint64_t missed = (now_us_ - next_vblank_us_) / kVBlankPeriodUs;
++            next_vblank_us_ += missed * kVBlankPeriodUs;
++            vblank_count_ += missed;
++        }
++    }
+     while (now_us_ >= next_vblank_us_) {
+         next_vblank_us_ += kVBlankPeriodUs;
+         if (current_uid_ == 0) ++idle_vblanks_;
+@@ -643,6 +867,7 @@ void Kernel::process_timers() {
+         timer.schedule_us = UINT64_MAX;
+         queue_interrupt(std::move(call));
+     }
++    in_timers_ = false;
+ }
+ 
+ void Kernel::finish_wait_timeout(Thread &thread) {
+@@ -706,12 +931,13 @@ std::string Kernel::describe_threads() const {
+ // frames. <prefix>_CPU_NS_PER_INSN=N charges N nanoseconds (fractions allowed)
+ // for each instruction the interpreter has run since the last charge, at the
+ // next system call that returns at once. The PSP's CPU runs at up to 333 MHz.
++// The realtime clock has no use for it: time passes by itself.
+ void Kernel::charge_instruction_time() {
+     static const double ns_per_instruction = [] {
+         const char *text = portablekit::env("CPU_NS_PER_INSN");
+         return text != nullptr ? std::strtod(text, nullptr) : 0.0;
+     }();
+-    if (ns_per_instruction <= 0.0) return;
++    if (ns_per_instruction <= 0.0 || clock_mode_ == ClockMode::Realtime) return;
+     const std::uint64_t total = psprecomp::interpreter_stats().instructions;
+     const std::uint64_t delta = total - charged_instructions_;
+     charged_instructions_ = total;
+@@ -725,7 +951,7 @@ void Kernel::charge_instruction_time() {
+ 
+ void Kernel::charge_busy_time() {
+     static const bool off = portablekit::env("NO_BUSY_CLOCK") != nullptr;
+-    if (off || interrupt_active_ || current_thread() == nullptr) return;
++    if (off || interrupt_active_ || current_thread() == nullptr || clock_mode_ == ClockMode::Realtime) return;
+     // A frame that computes and then waits for the vblank never gets here:
+     // only a thread that has gone this long without any wait is charged.
+     constexpr std::int64_t kBusyChargeMinUs = 100000;
+@@ -744,22 +970,77 @@ void Kernel::charge_busy_time() {
+     process_timers();
+ }
+ 
+-void Kernel::on_starvation(AllegrexContext &ctx) {
+-    if (interrupt_active_ || current_thread() == nullptr) return;
+-    advance_clock(now_us_ + kStarvationQuantumUs);
++// A thread has gone a long way without entering the system (or a loop that waits
++// for something said so with PK_YIELD). On a PSP a timer interrupt would have
++// interrupted it by now: serve what time has brought, and let a thread that
++// outranks it run.
++void Kernel::on_starvation(std::uint32_t pc) {
++    ++spin_calls_;
++    Thread *current = current_thread();
++    if (interrupt_active_ || current == nullptr) return;
++    SpinSite &site = spin_sites_[pc];
++    if (site.thread.empty()) site.thread = current->name;
++    if (clock_mode_ == ClockMode::Realtime) {
++        refresh_realtime();
++    } else {
++        charge_instruction_time();
++        advance_clock(now_us_ + kStarvationQuantumUs);
++    }
+     process_timers();
++    g_cpu.pc = pc;
+     if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+-        interrupted_context_ = ctx;
+-        interrupted_idle_ = false;
+-        (void)begin_pending_interrupt(ctx);
++        ++spin_interrupts_;
++        run_interrupts_nested();
++    }
++    if (!dispatch_enabled_) {
++        ++site.noops;
+         return;
+     }
+-    if (!dispatch_enabled_) return;
+     Thread *best = best_ready_thread();
+-    if (best != nullptr && best->priority <= current_thread()->priority) {
+-        save_current(ctx, ThreadStatus::Ready);
+-        switch_to(ctx, *best);
++    if (best == nullptr || (best->priority > current->priority) || (best->priority == current->priority && !starve_equal_)) {
++        ++site.noops;
++        return;
+     }
++    const bool equal = best->priority == current->priority;
++    ++site.switches;
++    if (equal) ++site.equal_switches;
++    site.switched_to = best->name + "(prio " + std::to_string(best->priority) + ")";
++    // An outranking thread takes the processor and gives it back at the front of its
++    // queue; an equal one only gets a turn behind the others.
++    yield_running(!equal);
++}
++
++void Kernel::report_spin(std::ostream &out) const {
++    std::uint64_t noops = 0u, switches = 0u, equal = 0u;
++    for (const auto &[pc, site] : spin_sites_) {
++        noops += site.noops;
++        switches += site.switches;
++        equal += site.equal_switches;
++    }
++    out << "[spin] calls=" << spin_calls_ << " noop=" << noops << " preemptions=" << switches << " (equal priority "
++        << equal << ", strictly better " << switches - equal << ") interrupts_delivered_inside=" << spin_interrupts_
++        << "\n";
++    for (const auto &[pc, site] : spin_sites_) {
++        if (site.noops != 0u)
++            out << "[spin] " << site.noops << " noop thread=" << site.thread << " pc=" << psprecomp::hex32(pc) << "\n";
++        if (site.switches != 0u)
++            out << "[spin] " << site.switches << " preempt " << site.thread << " pc=" << psprecomp::hex32(pc) << " -> "
++                      << site.switched_to << (site.equal_switches != 0u ? " (equal priority)" : "") << "\n";
++    }
++}
++
++void Kernel::report_stacks(std::ostream &out) const {
++    out << "[stacks] host stacks of " << stack_bytes_ / 1024u << " KiB; stack check "
++        << (psprecomp::Coroutine::stack_check_enabled() ? "on" : "off (PORTABLEKIT_STACK_CHECK=1 measures)") << "\n";
++    for (const auto &[uid, thread] : threads_) {
++        if (!thread->co.valid()) continue;
++        out << "[stacks] thread " << uid << " '" << thread->name << "' high-water " << thread->co.high_water_bytes()
++            << " of " << thread->co.stack_bytes() << " bytes, canary " << (thread->co.canary_intact() ? "intact" : "SMASHED")
++            << "\n";
++    }
++    if (irq_.valid())
++        out << "[stacks] interrupt handlers high-water " << irq_.high_water_bytes() << " of " << irq_.stack_bytes()
++            << " bytes, canary " << (irq_.canary_intact() ? "intact" : "SMASHED") << "\n";
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -954,8 +1235,9 @@ std::uint32_t Kernel::free_memory() const noexcept {
+     return total;
+ }
+ 
++
+ // ---------------------------------------------------------------------------
+-// Interrupts
++// Interrupts, callbacks and calls into the game
+ 
+ void Kernel::queue_interrupt(InterruptCall call) { pending_interrupts_.push_back(std::move(call)); }
+ 
+@@ -970,23 +1252,34 @@ void Kernel::notify_callback(SceUID callback, std::uint32_t argument) {
+                   << " arg=" << psprecomp::hex32(argument) << "\n";
+ }
+ 
++// Runs the callbacks the current thread has been notified of, now, as nested calls on
++// its own stack: a callback is thread code (it may wait, and does not count as an
++// interrupt handler). The registers are the caller's again afterwards.
+ bool Kernel::deliver_callbacks() {
+     Thread *thread = current_thread();
+     if (thread == nullptr || interrupt_active_) return false;
+-    bool queued = false;
++    struct Due {
++        SceUID uid;
++        std::uint32_t function;
++        GuestCallArguments arguments;
++    };
++    std::vector<Due> due;
+     for (auto &[uid, callback] : callbacks) {
+         if (!callback.pending || callback.owner != thread->uid || callback.function == 0u) continue;
+         callback.pending = false;
+-        InterruptCall call{};
+-        call.function = callback.function;
+         // PSP callbacks receive (notify count, notify argument, common pointer).
+-        call.arguments = {callback.notify_count, callback.notify_argument, callback.argument, 0u};
++        due.push_back(Due{uid, callback.function, {callback.notify_count, callback.notify_argument, callback.argument, 0u}});
+         callback.notify_count = 0u;
+-        queue_interrupt(std::move(call));
+-        queued = true;
+-        if (trace_enabled()) std::cerr << "[kernel] deliver callback " << uid << " " << callback.name << "\n";
+     }
+-    return queued;
++    for (const Due &call : due) {
++        if (trace_enabled()) std::cerr << "[kernel] deliver callback " << call.uid << "\n";
++        const AllegrexContext saved = g_cpu;
++        load_guest_call_arguments(g_cpu, call.arguments, 4u);
++        g_cpu.set_gpr(29, saved.gpr[29] - kThreadArgumentHome);
++        pk_guest_call(call.function);
++        g_cpu = saved;
++    }
++    return !due.empty();
+ }
+ 
+ void Kernel::on_vblank() {
+@@ -1017,81 +1310,51 @@ void Kernel::on_vblank() {
+     }
+ }
+ 
+-bool Kernel::begin_pending_interrupt(AllegrexContext &ctx) {
+-    if (pending_interrupts_.empty()) return false;
+-    InterruptCall call = std::move(pending_interrupts_.front());
+-    pending_interrupts_.pop_front();
++// Runs the queued interrupts one after the other, nested on whatever coroutine is
++// running: a guest call on the interrupt stack, with the interrupted registers
++// saved around it and the handler's own identity for the statistics.
++void Kernel::run_interrupts_nested() {
++    while (interrupts_enabled_ && !pending_interrupts_.empty() && !runtime_->stopped()) {
++        InterruptCall call = std::move(pending_interrupts_.front());
++        pending_interrupts_.pop_front();
++        run_interrupt(std::move(call));
++    }
++}
++
++void Kernel::run_interrupt(InterruptCall call) {
++    const AllegrexContext saved = g_cpu;
+     interrupt_active_ = true;
+-    interrupt_on_return_ = std::move(call.on_return);
+-    ctx = pristine_context_;
+-    load_guest_call_arguments(ctx, call.arguments, call.argument_count);
+-    ctx.set_gpr(29, kInterruptStackTop - kThreadArgumentHome);
+-    ctx.set_gpr(31, kInterruptReturnStub);
+-    ctx.pc = call.function;
++    g_cpu = pristine_context_;
++    load_guest_call_arguments(g_cpu, call.arguments, call.argument_count);
++    g_cpu.set_gpr(29, kInterruptStackTop - kThreadArgumentHome);
++    g_cpu.pc = call.function;
+     psprecomp::set_runtime_thread_identity(kInterruptIdentity, "interrupt");
+     load_trace::run_as("interrupt");
+-    return true;
+-}
+-
+-void Kernel::interrupt_return_stub(AllegrexContext &ctx) {
+-    const std::uint32_t result = ctx.gpr[2];
++    pk_guest_call(call.function);
++    const std::uint32_t result = g_cpu.gpr[2];
+     interrupt_active_ = false;
+-    if (interrupt_on_return_) {
+-        auto on_return = std::move(interrupt_on_return_);
+-        interrupt_on_return_ = nullptr;
+-        on_return(result);
+-    }
+-    if (interrupts_enabled_ && begin_pending_interrupt(ctx)) return;
+-
+-    if (interrupted_idle_ || current_thread() == nullptr) {
+-        interrupted_idle_ = false;
+-        current_uid_ = 0;
+-        schedule(ctx);
+-        return;
+-    }
+-    ctx = interrupted_context_;
+-    Thread *current = current_thread();
+-    psprecomp::set_runtime_thread_identity(current->uid, current->name);
+-    load_trace::run_as(current->name);
+-    if (!dispatch_enabled_) return;
+-    Thread *best = best_ready_thread();
+-    if (best != nullptr && best->priority < current->priority) {
+-        save_current(ctx, ThreadStatus::Ready);
+-        switch_to(ctx, *best);
++    g_cpu = saved;
++    if (const Thread *thread = current_thread()) {
++        psprecomp::set_runtime_thread_identity(thread->uid, thread->name);
++        load_trace::run_as(thread->name);
++    } else {
++        psprecomp::set_runtime_thread_identity(kIdleIdentity, "idle");
++        load_trace::run_as("idle");
+     }
+-}
+-
+-void Kernel::thread_exit_stub(AllegrexContext &ctx) {
+-    exit_current_thread(ctx, static_cast<std::int32_t>(ctx.gpr[2]), current_thread() != nullptr &&
+-                                                                         current_thread()->name == "module_start");
++    if (call.on_return) call.on_return(result);
+ }
+ 
+ void Kernel::call_guest(AllegrexContext &ctx, std::uint32_t function, const GuestCallArguments &arguments,
+                         GuestCallReturn on_return, std::uint32_t argument_count) {
+-    guest_calls_[current_uid_].push_back(GuestCall{ctx.gpr[31], std::move(on_return)});
++    // The callee runs in this thread with its stack, gp and $k0 (the import's caller's);
++    // only the argument registers are loaded. It returns here, and the import's return
++    // address is restored for whatever `on_return` does next.
++    const std::uint32_t return_address = ctx.gpr[31];
+     load_guest_call_arguments(ctx, arguments, argument_count);
+-    ctx.set_gpr(31, kGuestCallReturnStub);
+-    // A pc other than the import's own tells the import wrapper not to return.
+-    ctx.pc = function;
+-}
+-
+-void Kernel::guest_call_return_stub(AllegrexContext &ctx) {
+-    auto found = guest_calls_.find(current_uid_);
+-    if (found == guest_calls_.end() || found->second.empty()) {
+-        runtime_->stop("guest call returned in a thread that made none");
+-        return;
+-    }
+-    GuestCall call = std::move(found->second.back());
+-    found->second.pop_back();
+-    if (found->second.empty()) guest_calls_.erase(found);
+-    ctx.set_gpr(31, call.return_address);
+-    ctx.pc = call.return_address;
+-    call.on_return(ctx, ctx.gpr[2]);
+-}
+-
+-void Kernel::idle_stub(AllegrexContext &ctx) {
+-    current_uid_ = 0;
+-    schedule(ctx);
++    pk_guest_call(function);
++    ctx.set_gpr(31, return_address);
++    ctx.pc = return_address;
++    on_return(ctx, ctx.gpr[2]);
+ }
+ 
+ } // namespace portablekit
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index bd502e9..dfbdedf 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
+ #include "psprecomp/allegrex_context.hpp"
++#include "psprecomp/coroutine.hpp"
++#include "psprecomp/exec.hpp"
++#include "kernel/kernel_platform.hpp"
+ #include "psprecomp/runtime.hpp"
+ 
+ #include <array>
+@@ -15,16 +18,29 @@
+ #include <string>
+ #include <vector>
+ 
+-// Minimal PSP kernel: threads with a deterministic
+-// virtual clock, synchronization objects, partition memory, and guest interrupt
+-// delivery (VBlank sub-interrupts, VTimers, GE callbacks).
++// Minimal PSP kernel: threads, a virtual or a real clock, synchronization
++// objects, partition memory, and guest interrupt delivery (VBlank
++// sub-interrupts, VTimers, GE callbacks).
+ //
+-// Execution model. Every HLE import runs at the outer runtime dispatch level,
+-// with `ctx` aliasing Runtime::cpu(). An import that blocks or preempts saves
+-// the caller's context with pc = $ra and v0 = result, loads another thread's
+-// context into `ctx`, and changes the runtime thread identity. The generated
+-// import wrapper sees the identity change and leaves `ctx.pc` alone, so the
+-// dispatcher continues in the new thread.
++// Execution model: coroutines. Every guest thread runs on a host stack of its own
++// (psprecomp::Coroutine), so a system call that has to wait is an ordinary C++
++// call that returns when the thread runs again; nothing is unwound and no
++// context is rebuilt. `ctx` is always the one live register file (g_cpu =
++// Runtime::cpu()): a switch copies it into the thread that stops and loads the
++// one that starts, then swaps stacks.
++//
++//   * block / delay_current / wait_host / exit_current_thread give the processor
++//     to the scheduler, which lives on the program's own stack. block() and the
++//     others return when the thread has been woken and scheduled again;
++//     exit_current_thread never returns.
++//   * finish() is where a system call ends: it delivers pending interrupts as
++//     nested guest calls on the calling thread and lets a better thread run.
++//   * call_guest() runs a guest function to its end, on the calling thread, and
++//     then calls `on_return`. Interrupt handlers and thread callbacks are the
++//     same: a nested pk_guest_call with the register file saved around it.
++//   * Guest code is never entered from the scheduler's stack: idle-time
++//     interrupts run on a coroutine of their own, so that a runtime stop can
++//     always leave the guest by switching to the scheduler.
+ namespace portablekit {
+ 
+ using psprecomp::AllegrexContext;
+@@ -69,11 +85,10 @@ inline constexpr std::uint32_t kMutexRecursiveNotAllowed = 0x800201C8u;
+ } // namespace error
+ 
+ // Guest addresses reserved by the host. 0x08800000..0x08804000 lies in user
+-// RAM below the load image, inside the runtime's direct dispatch window.
++// RAM below the load image. A thread starts with $ra = kThreadExitStub, which no
++// code runs any more: the entry function's return lands in the execution layer's
++// sentinel (psprecomp::kGuestReturnSentinel, 0x0880000C) and the thread ends there.
+ inline constexpr std::uint32_t kThreadExitStub = 0x08800000u;
+-inline constexpr std::uint32_t kInterruptReturnStub = 0x08800004u;
+-inline constexpr std::uint32_t kIdleStub = 0x08800008u;
+-inline constexpr std::uint32_t kGuestCallReturnStub = 0x0880000Cu;
+ // Kernel partition scratch used by the host (boot arguments, interrupt stack).
+ inline constexpr std::uint32_t kBootArgumentAddress = 0x08100000u;
+ inline constexpr std::uint32_t kInterruptStackTop = 0x08200000u;
+@@ -86,6 +101,7 @@ inline constexpr std::uint32_t kVolatileMemorySize = 0x00400000u;
+ 
+ inline constexpr std::uint64_t kVBlankPeriodUs = 16'683u;
+ inline constexpr std::uint64_t kHostWaitPollUs = 1'000u;
++enum class ClockMode { Virtual, Realtime };
+ inline constexpr std::uint32_t kVBlankInterrupt = 30u;
+ 
+ enum class ThreadStatus { Dormant, Ready, Running, Waiting, Dead };
+@@ -136,7 +152,14 @@ struct Thread {
+     WaitState wait{};
+     std::int32_t exit_status{};
+     std::uint32_t wakeup_count{};
+-    std::uint64_t ready_sequence{};
++    // Position among the ready threads of one priority: the lowest runs first. A
++    // thread that becomes ready takes the next number up; one that was pre-empted
++    // takes the next number down, which puts it back at the front of its queue.
++    std::int64_t ready_sequence{};
++    // The host stack the thread runs on, made when it first runs and released when
++    // it ends or is terminated. `context` holds its registers whenever it is not the
++    // one running; the running thread's are in g_cpu.
++    psprecomp::Coroutine co;
+     // sceKernelSuspendThread: kept off the processor until resumed, whatever
+     // else it is (ready, or waiting: "waiting, suspended" on a PSP).
+     bool suspended{};
+@@ -237,16 +260,34 @@ class Kernel {
+ public:
+     void install(Runtime &runtime, std::uint32_t gp, std::uint32_t image_end);
+     [[nodiscard]] Runtime &runtime() noexcept { return *runtime_; }
++    // Runs the guest: the scheduler, on the calling stack, until the runtime stops
++    // or no thread is left. The loader thread (start_loader_thread) runs first.
++    void run_main();
+ 
+     // Clock ---------------------------------------------------------------
+-    [[nodiscard]] std::uint64_t now_us() const noexcept { return now_us_; }
++    // Virtual (the default): emulated time moves only with what the guest does and
++    // jumps over idle time, so a run is repeatable. Realtime
++    // (<prefix>_CLOCK=realtime): emulated time is the host's monotonic clock, idle
++    // time is a host sleep, timers and the vblank come from it, and the game is
++    // held to the display's rate where it presents faster than that.
++    [[nodiscard]] ClockMode clock_mode() const noexcept { return clock_mode_; }
++    [[nodiscard]] bool realtime() const noexcept { return clock_mode_ == ClockMode::Realtime; }
++    [[nodiscard]] std::uint64_t now_us() const noexcept {
++        if (clock_mode_ == ClockMode::Realtime) refresh_realtime();
++        return now_us_;
++    }
+     [[nodiscard]] std::uint64_t vblank_count() const noexcept { return vblank_count_; }
+     // Emulated time of the latest vblank, at or before now_us().
+     [[nodiscard]] std::uint64_t last_vblank_us() const noexcept { return next_vblank_us_ - kVBlankPeriodUs; }
+     // Forgets how far emulated time was ahead of or behind real time. Called
+     // after the game was paused, so it resumes at normal speed rather than
+     // racing to make up the pause.
+-    void resync_real_time() noexcept { pacing_started_ = false; }
++    void resync_real_time() noexcept {
++        pacing_started_ = false;
++        // The realtime clock forgets the time the pause took.
++        if (clock_mode_ == ClockMode::Realtime && kernel_platform().monotonic_us != nullptr)
++            realtime_base_us_ = kernel_platform().monotonic_us() - now_us_;
++    }
+     // Every thread, what it waits for and where, the objects waited on, the
+     // clock and the pacing, one line each (kernel/stall_watchdog.hpp).
+     void dump_state(std::ostream &out) const;
+@@ -256,6 +297,10 @@ public:
+     // Frame interpolation times its presents by it (gpu/frame_pacing.hpp).
+     [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> real_time_of(
+         std::uint64_t virtual_us) const noexcept {
++        // The realtime clock is the host's own: the default platform's steady_clock.
++        if (clock_mode_ == ClockMode::Realtime)
++            return std::chrono::steady_clock::time_point{} +
++                   std::chrono::microseconds(static_cast<std::int64_t>(realtime_base_us_ + virtual_us));
+         if (!pacing_started_ || pacing_fast_) return std::nullopt;
+         return pacing_real_base_ + std::chrono::microseconds(static_cast<std::int64_t>(virtual_us) -
+                                                              static_cast<std::int64_t>(pacing_virtual_base_));
+@@ -282,17 +327,22 @@ public:
+                                std::uint32_t stack_size, std::uint32_t attributes, std::uint32_t gp);
+     std::int32_t start_thread(AllegrexContext &ctx, SceUID uid, std::uint32_t argument_size,
+                               std::uint32_t argument_address);
+-    void exit_current_thread(AllegrexContext &ctx, std::int32_t status, bool delete_thread);
++    // The calling thread ends. Never returns: the scheduler frees its stack.
++    [[noreturn]] void exit_current_thread(AllegrexContext &ctx, std::int32_t status, bool delete_thread);
+     std::int32_t terminate_thread(AllegrexContext &ctx, SceUID uid, bool delete_thread);
+     std::int32_t delete_thread(SceUID uid);
+     std::int32_t change_priority(AllegrexContext &ctx, SceUID uid, std::uint32_t priority);
+ 
+     // HLE completion ------------------------------------------------------
+-    // Sets v0 and gives a higher-priority ready thread the CPU if one exists.
++    // Sets v0, runs the interrupts that are waiting (nested on this thread) and gives
++    // a higher-priority ready thread the processor if one exists, returning when
++    // this thread runs again.
+     void finish(AllegrexContext &ctx, std::uint32_t result);
+     void finish64(AllegrexContext &ctx, std::uint64_t result);
+-    // Blocks the current thread. `result` is what v0 holds if the wait ends
+-    // normally without an explicit wake result.
++    // Blocks the current thread; returns once it has been woken and scheduled
++    // again, with v0 set to the wake result (`result` if the wake gave none). The
++    // import must return straight away afterwards. Where a thread cannot wait (an
++    // interrupt handler) it returns at once with v0 = kCanNotWait.
+     void block(AllegrexContext &ctx, const WaitState &wait, std::uint32_t result = 0u);
+     // Makes a waiting thread ready with v0 = result.
+     void wake(Thread &thread, std::uint32_t result);
+@@ -305,10 +355,11 @@ public:
+     void wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeout_us, HostWaitPoll poll);
+     // Calls a guest function from an HLE import, in the calling thread, the
+     // way a library calls back into the game: the function runs like any
+-    // other guest code, so it may block, and when it returns `on_return` gets
+-    // its v0 with `ctx` back at the import's return address. `on_return` then
+-    // either finishes the import or makes another call. Use it instead of
+-    // finish(), as the last thing the import does.
++    // other guest code, so it may block, and when it has returned `on_return` gets
++    // its v0 with `ctx` at the import's return address. `on_return` then
++    // either finishes the import or makes another call. The call is synchronous
++    // (a nested pk_guest_call): use it instead of finish(), as the last thing the
++    // import does, and nothing after it.
+     // `argument_count` above four also passes t0 onwards (GuestCallArguments).
+     using GuestCallReturn = std::function<void(AllegrexContext &, std::uint32_t)>;
+     void call_guest(AllegrexContext &ctx, std::uint32_t function, const GuestCallArguments &arguments,
+@@ -349,8 +400,9 @@ public:
+     // Marks a callback as notified; it runs the next time its owner thread
+     // performs a callback-aware wait, as on hardware.
+     void notify_callback(SceUID callback, std::uint32_t argument);
+-    // Queues every notified callback owned by the current thread. Returns true
+-    // if any were queued.
++    // Runs every notified callback owned by the current thread now, in this thread
++    // (nested guest calls, the registers saved around each), and returns true if any
++    // ran. A callback may wait, as any thread code may.
+     bool deliver_callbacks();
+     [[nodiscard]] bool interrupts_enabled() const noexcept { return interrupts_enabled_; }
+     void set_interrupts_enabled(bool enabled) noexcept { interrupts_enabled_ = enabled; }
+@@ -364,8 +416,11 @@ public:
+     // One line per thread: state, what it waits for and where it resumes.
+     [[nodiscard]] std::string describe_threads() const;
+ 
+-    // Periodic hook from the runtime's starvation boundary.
+-    void on_starvation(AllegrexContext &ctx);
++    // A thread has run `pc`'s neighbourhood for a long time without calling the
++    // system (exec_set_spin_hook, PK_YIELD). Time is charged, timers and interrupts
++    // are served, and a ready thread that outranks it runs; <prefix>_STARVE_EQUAL=1
++    // lets an equal one run too, as the first kernel did.
++    void on_starvation(std::uint32_t pc);
+     // A thread that calls into the system again and again without ever
+     // waiting is using CPU time the clock should show: a PSP's loop that
+     // draws and reads the time, or polls a ring buffer, sees it move. Called
+@@ -378,11 +433,15 @@ public:
+     // <prefix>_CPU_NS_PER_INSN: emulated time passes with the instructions the interpreter runs.
+     void charge_instruction_time();
+ 
+-    // Guest entry stubs.
+-    void thread_exit_stub(AllegrexContext &ctx);
+-    void interrupt_return_stub(AllegrexContext &ctx);
+-    void idle_stub(AllegrexContext &ctx);
+-    void guest_call_return_stub(AllegrexContext &ctx);
++    // One line per thread of how often the spin hook fired and what it did, with
++    // the guest addresses (<prefix>_SPIN_REPORT=1 prints it when the run ends).
++    void report_spin(std::ostream &out) const;
++    // The host stack of every thread: size, high-water mark and canary
++    // (<prefix>_STACK_REPORT=1 with PORTABLEKIT_STACK_CHECK=1, at the end of a run).
++    void report_stacks(std::ostream &out) const;
++    // Switches away from the running coroutine to the scheduler for good: the
++    // runtime stopped inside a guest call (exec_set_abort_hook).
++    [[noreturn]] void abort_to_scheduler();
+ 
+ private:
+     struct FreeRange {
+@@ -392,13 +451,32 @@ private:
+ 
+     std::uint32_t prepare_thread_stack(Thread &thread);
+     void make_ready(Thread &thread);
+-    void save_current(const AllegrexContext &ctx, ThreadStatus status);
+-    void switch_to(AllegrexContext &ctx, Thread &thread);
+-    // Picks the next thread to run, delivering timers/interrupts and idling
+-    // the virtual clock forward when nothing is ready.
+-    void schedule(AllegrexContext &ctx);
++    void make_ready_front(Thread &thread);
++    // The scheduler: picks the next thread, serves timers and idle-time
++    // interrupts, and idles the clock forward when nothing is ready.
++    void scheduler_loop();
++    void run_thread(Thread &thread);
++    void reap_finished();
++    // Hands the processor to the scheduler. The running thread's registers go to its
++    // Thread, `status` is what it becomes; returns when it is chosen again.
++    void leave_thread(Thread &thread, ThreadStatus status);
++    // Switches the host stack: `to` runs, the running coroutine continues when
++    // something switches back to it.
++    void transfer(psprecomp::Coroutine &to);
++    static void thread_entry(void *thread);
++    static void interrupt_entry(void *kernel);
++    void thread_body(Thread &thread);
++    void interrupt_body();
+     [[nodiscard]] Thread *best_ready_thread() noexcept;
++    // True when a ready thread outranks the running one (or, with `or_equal`, matches it).
++    [[nodiscard]] bool better_thread_ready(bool or_equal) noexcept;
++    void yield_running(bool front);
++    // Delivers every pending interrupt now, nested on the running coroutine.
++    void run_interrupts_nested();
++    void run_interrupt(InterruptCall call);
+     void advance_clock(std::uint64_t target_us);
++    void refresh_realtime() const noexcept;
++    void sleep_until_event(std::uint64_t target_us);
+     // Holds the virtual clock to real time, so the game runs at PSP speed
+     // however fast frames are drawn and presented. False when pacing is off.
+     bool pace_to_real_time();
+@@ -414,9 +492,13 @@ private:
+     std::uint64_t idle_vblanks_{};
+     SceUID next_uid_{0x100};
+     SceUID current_uid_{};
+-    std::uint64_t next_ready_sequence_{1u};
++    std::int64_t next_ready_sequence_{1};
++    std::int64_t front_ready_sequence_{0};
+     std::map<SceUID, std::unique_ptr<Thread>> threads_;
+-    std::uint64_t now_us_{};
++    mutable std::uint64_t now_us_{};
++    ClockMode clock_mode_{ClockMode::Virtual};
++    std::uint64_t realtime_base_us_{};   // the platform clock's reading at time zero
++    std::uint64_t last_present_real_us_{};
+     std::uint64_t waits_begun_{};  // waits begun, so a busy thread can tell it has not waited
+     std::uint64_t charged_instructions_{};
+     std::uint64_t charged_remainder_ns_{};
+@@ -437,19 +519,36 @@ private:
+     std::map<SceUID, MemoryBlock> blocks_;
+     std::vector<FreeRange> free_ranges_;
+ 
+-    struct GuestCall {
+-        std::uint32_t return_address{};
+-        GuestCallReturn on_return;
+-    };
+-    // Calls in progress per thread, innermost last.
+-    std::map<SceUID, std::vector<GuestCall>> guest_calls_;
+-
+     std::vector<std::function<void()>> vblank_hooks_;
+     std::deque<InterruptCall> pending_interrupts_;
+     bool interrupt_active_{};
+-    bool interrupted_idle_{};
+-    AllegrexContext interrupted_context_{};
+-    std::function<void(std::uint32_t)> interrupt_on_return_;
++    bool in_timers_{};
++
++    // The coroutines. root_ stands for the stack the program started on, where the
++    // scheduler runs; irq_ is the stack idle-time interrupts run on; running_ is
++    // whichever of them (or of a thread's) is executing.
++    psprecomp::Coroutine root_;
++    psprecomp::Coroutine irq_;
++    psprecomp::Coroutine *running_{};
++    std::size_t stack_bytes_{psprecomp::Coroutine::kDefaultStackBytes};
++    // The thread that ended or was deleted while running; its stack is freed once
++    // the scheduler is back on its own.
++    Thread *finished_{};
++    bool finished_delete_{};
++    std::unique_ptr<Thread> zombie_;
++
++    // How the spin hook was used (report_spin).
++    struct SpinSite {
++        std::uint64_t noops{};
++        std::uint64_t switches{};
++        std::uint64_t equal_switches{};
++        std::string thread;
++        std::string switched_to;
++    };
++    std::map<std::uint32_t, SpinSite> spin_sites_;
++    std::uint64_t spin_calls_{};
++    std::uint64_t spin_interrupts_{};
++    bool starve_equal_{};
+ };
+ 
+ [[nodiscard]] Kernel &kernel();
+diff --git a/host/kernel/kernel_platform.cpp b/host/kernel/kernel_platform.cpp
+new file mode 100644
+index 0000000..cc0deba
+--- /dev/null
++++ b/host/kernel/kernel_platform.cpp
+@@ -0,0 +1,63 @@
++#include "kernel/kernel_platform.hpp"
++
++#if !defined(PORTABLEKIT_PLATFORM_CUSTOM)
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#endif
++
++namespace portablekit {
++namespace {
++
++KernelPlatform g_platform{};
++
++#if !defined(PORTABLEKIT_PLATFORM_CUSTOM)
++// The default: the only place in the runtime that needs a host mutex.
++struct DefaultEvent {
++    std::mutex mutex;
++    std::condition_variable wake;
++    bool signalled = false;
++};
++
++DefaultEvent &default_event() {
++    static DefaultEvent event;
++    return event;
++}
++
++std::uint64_t default_monotonic_us() {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                          std::chrono::steady_clock::now().time_since_epoch())
++                                          .count());
++}
++
++void default_wait_event(std::uint64_t timeout_us) {
++    DefaultEvent &event = default_event();
++    std::unique_lock<std::mutex> lock(event.mutex);
++    if (!event.signalled) event.wake.wait_for(lock, std::chrono::microseconds(timeout_us));
++    event.signalled = false;
++}
++
++void default_signal_event() {
++    DefaultEvent &event = default_event();
++    {
++        std::lock_guard<std::mutex> lock(event.mutex);
++        event.signalled = true;
++    }
++    event.wake.notify_all();
++}
++
++const bool g_default_installed = [] {
++    g_platform = KernelPlatform{&default_monotonic_us, &default_wait_event, &default_signal_event};
++    return true;
++}();
++#endif
++
++} // namespace
++
++void set_kernel_platform(const KernelPlatform &platform) noexcept { g_platform = platform; }
++const KernelPlatform &kernel_platform() noexcept { return g_platform; }
++void kernel_signal_event() noexcept {
++    if (g_platform.signal_event != nullptr) g_platform.signal_event();
++}
++
++} // namespace portablekit
+diff --git a/host/kernel/kernel_platform.hpp b/host/kernel/kernel_platform.hpp
+new file mode 100644
+index 0000000..4f647a3
+--- /dev/null
++++ b/host/kernel/kernel_platform.hpp
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <cstdint>
++
++// What the kernel needs from the machine it runs on, and nothing else: a
++// monotonic clock, a way to sleep that another host thread can cut short, and the
++// call that cuts it short. The realtime clock (<prefix>_CLOCK=realtime) is built
++// on these three; the virtual clock does not use them at all.
++//
++// The desktop builds get a default made of <chrono>, a mutex and a condition
++// variable (kernel_platform.cpp). A platform layer that has its own primitives
++// (the Vita's sceKernelGetSystemTimeWide, an event flag with a timeout) defines
++// PORTABLEKIT_PLATFORM_CUSTOM when it compiles pk_runtime, so that file is left
++// out, and calls set_kernel_platform() before the kernel runs.
++namespace portablekit {
++
++struct KernelPlatform {
++    // Microseconds on a clock that never goes backwards. The origin is the
++    // platform's own: the kernel subtracts what it reads first.
++    std::uint64_t (*monotonic_us)() = nullptr;
++    // Sleeps for at most `timeout_us`; returns early once signal_event() ran
++    // since the last return (an event signalled before the sleep started is not lost).
++    void (*wait_event)(std::uint64_t timeout_us) = nullptr;
++    // Wakes wait_event(). Callable from any host thread.
++    void (*signal_event)() = nullptr;
++};
++
++void set_kernel_platform(const KernelPlatform &platform) noexcept;
++[[nodiscard]] const KernelPlatform &kernel_platform() noexcept;
++// For host threads that deliver something to the game (network data, audio): the
++// idle kernel wakes at once instead of at its next timer.
++void kernel_signal_event() noexcept;
++
++} // namespace portablekit
+diff --git a/host/main.cpp b/host/main.cpp
+index 4b5d74b..1d1c18d 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -83,18 +83,6 @@ void ensure_main_stack(char **argv) {
+ }
+ #endif
+ 
+-std::uint64_t configured_max_dispatches() {
+-    constexpr std::uint64_t default_limit = 4'000'000'000ull;
+-    const char *text = std::getenv("PSPRECOMP_MAX_DISPATCHES");
+-    if (text == nullptr || *text == '\0') return default_limit;
+-    errno = 0;
+-    char *end = nullptr;
+-    const unsigned long long parsed = std::strtoull(text, &end, 0);
+-    if (errno == ERANGE || end == text || *end != '\0' || parsed == 0u)
+-        throw psprecomp::Error(std::string("Invalid PSPRECOMP_MAX_DISPATCHES value: ") + text);
+-    return static_cast<std::uint64_t>(parsed);
+-}
+-
+ std::string usage() {
+     const std::string app = portablekit::game().app_name;
+     return "usage: " + app + " [game_dir]\n"
+@@ -420,7 +408,9 @@ int main(int argc, char **argv) {
+             std::cout << "No recompiled code is linked; running under the interpreter.\n";
+         }
+ 
+-        runtime.run(elf.runtime_entry(load_base), configured_max_dispatches());
++        // The scheduler runs the guest, from the loader thread (install_system started it at
++        // the entry point) until the game ends, the runtime stops or a limit is reached.
++        portablekit::kernel().run_main();
+         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
+         portablekit::bringup::finish();
+         // Quit from the menu, a closed window or the game ending: the network
+diff --git a/include/psprecomp/runtime.hpp b/include/psprecomp/runtime.hpp
+index b80d82b..9d03848 100644
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -89,7 +89,13 @@ public:
+     [[nodiscard]] const std::filesystem::path &game_root() const noexcept;
+     [[nodiscard]] std::filesystem::path translate_path(const std::string &psp_path) const;
+ 
++    // The legacy dispatcher: runs recompiled code and the interpreter from outside, one
++    // outer dispatch at a time. The coroutine kernel (host/kernel) does not use it.
+     void run(std::uint32_t entry, std::uint64_t max_dispatches = 10'000'000u);
++    // Brackets a run driven by a scheduler instead of run(): the start clears a previous
++    // stop, the end reports what ran in the interpreter.
++    void begin_kernel_run();
++    void end_kernel_run();
+     void stop(std::string reason);
+     [[nodiscard]] bool stopped() const noexcept;
+     [[nodiscard]] const std::string &stop_reason() const noexcept;
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index ef4ce29..c29c227 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -566,14 +566,12 @@ void call_import_stub(CorpusRuntime &corpus, AllegrexContext &ctx) {
+         rt.stop("No import bound at " + hex32(ctx.pc));
+         return;
+     }
+-    const auto caller = capture_runtime_execution_context();
+-    const std::uint32_t stub_pc = ctx.pc;
+     const std::uint32_t return_address = ctx.gpr[31];
+     rt.invoke_import(found->second.library, found->second.nid, ctx);
+-    // The call may have switched threads or taken an interrupt, in which case
+-    // it has already decided where execution goes next.
+-    if (!rt.stopped() && runtime_execution_context_matches(caller) && ctx.pc == stub_pc)
+-        ctx.pc = return_address;
++    // The call may have waited, run interrupts or let other threads run before it
++    // returned; the register file is this thread's again either way, and it goes back
++    // to where it was called from.
++    if (!rt.stopped()) ctx.pc = return_address;
+ }
+ 
+ } // namespace
+@@ -1216,7 +1214,25 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
+     report_interpreter_stats();
+ }
+ 
+-void Runtime::stop(std::string reason) { stopped_ = true; stop_reason_ = std::move(reason); }
++void Runtime::begin_kernel_run() {
++    stopped_ = false;
++    stop_reason_.clear();
++    load_counted_pcs();
++}
++
++void Runtime::end_kernel_run() {
++    // Says which guest addresses ran without a recompiled function, so a profile can see
++    // what is worth adding to its corpus.
++    report_interpreter_stats();
++}
++
++void Runtime::stop(std::string reason) {
++    // The first reason stands: what stops a run is what went wrong first, not what a
++    // later limit says about the wreckage.
++    if (stopped_) return;
++    stopped_ = true;
++    stop_reason_ = std::move(reason);
++}
+ bool Runtime::stopped() const noexcept { return stopped_; }
+ const std::string &Runtime::stop_reason() const noexcept { return stop_reason_; }
+ 
+diff --git a/tests/kernel_tests.cpp b/tests/kernel_tests.cpp
+new file mode 100644
+index 0000000..3a7033c
+--- /dev/null
++++ b/tests/kernel_tests.cpp
+@@ -0,0 +1,416 @@
++// The coroutine kernel (host/kernel): every guest thread on a host stack of its own,
++// scheduling order, pre-emption, waiting in the middle of nested guest calls,
++// interrupts, thread deletion and a stop from deep inside. The guest code is
++// hand-assembled MIPS that runs in the interpreter and calls native stubs; no game,
++// no corpus.
++//
++// The kernel is one object per process, so each scenario is a run of its own:
++// `portablekit_kernel_tests N` runs scenario N, and with no argument the test runs
++// every scenario in a process of its own.
++
++#include "kernel/kernel.hpp"
++
++#include "psprecomp/exec.hpp"
++#include "psprecomp/interpreter.hpp"
++#include "psprecomp/runtime.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace {
++
++using namespace portablekit;
++using psprecomp::AllegrexContext;
++using psprecomp::CorpusRuntime;
++using psprecomp::Runtime;
++
++int g_failures = 0;
++
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++std::vector<std::uint32_t> g_log;
++
++void log_is(const std::vector<std::uint32_t> &expected, const char *what) {
++    const bool same = g_log == expected;
++    check(same, what);
++    if (!same) {
++        std::printf("      got: ");
++        for (const std::uint32_t value : g_log) std::printf(" %X", value);
++        std::printf("\n      want:");
++        for (const std::uint32_t value : expected) std::printf(" %X", value);
++        std::printf("\n");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// The native stubs the guest programs call. Like a system call, each ends by
++// returning to $ra.
++
++std::uint32_t arg(AllegrexContext &ctx, unsigned i) { return ctx.gpr[4 + i]; }
++void ret(AllegrexContext &ctx) { ctx.pc = ctx.gpr[31]; }
++
++void stub_log(CorpusRuntime &, AllegrexContext &ctx) {
++    g_log.push_back(arg(ctx, 0));
++    kernel().finish(ctx, 0u);
++    ret(ctx);
++}
++void stub_delay(CorpusRuntime &, AllegrexContext &ctx) {
++    kernel().delay_current(ctx, arg(ctx, 0));
++    ret(ctx);
++}
++void stub_start(CorpusRuntime &, AllegrexContext &ctx) {
++    const std::int32_t status = kernel().start_thread(ctx, static_cast<SceUID>(arg(ctx, 0)), 0u, 0u);
++    kernel().finish(ctx, static_cast<std::uint32_t>(status));
++    ret(ctx);
++}
++void stub_sleep(CorpusRuntime &, AllegrexContext &ctx) {
++    WaitState wait{};
++    wait.type = WaitType::Sleep;
++    kernel().block(ctx, wait, 0u);
++    ret(ctx);
++}
++void stub_exit(CorpusRuntime &, AllegrexContext &ctx) {
++    kernel().exit_current_thread(ctx, static_cast<std::int32_t>(arg(ctx, 0)), arg(ctx, 1) != 0u);
++}
++void stub_stop(CorpusRuntime &runtime, AllegrexContext &ctx) {
++    static_cast<Runtime &>(runtime).stop("test finished");
++    kernel().finish(ctx, 0u);
++    ret(ctx);
++}
++// call_guest(function a0, argument a1): logs the callee's v0 when it returns.
++void stub_call_guest(CorpusRuntime &, AllegrexContext &ctx) {
++    kernel().call_guest(ctx, arg(ctx, 0), {arg(ctx, 1), 0u, 0u, 0u}, [](AllegrexContext &returned, std::uint32_t result) {
++        g_log.push_back(result);
++        kernel().finish(returned, 0u);
++    });
++    ret(ctx);
++}
++// What an interrupt handler gets when it tries to wait: it cannot, and says so.
++void stub_try_wait(CorpusRuntime &, AllegrexContext &ctx) {
++    WaitState wait{};
++    wait.type = WaitType::Sleep;
++    kernel().block(ctx, wait, 0u);
++    g_log.push_back(ctx.gpr[2]);
++    kernel().finish(ctx, 0u);
++    ret(ctx);
++}
++void stub_queue_interrupt(CorpusRuntime &, AllegrexContext &ctx) {
++    InterruptCall call{};
++    call.function = arg(ctx, 0);
++    call.arguments = {arg(ctx, 1), 0u, 0u, 0u};
++    call.on_return = [](std::uint32_t result) { g_log.push_back(0x1000u + result); };
++    kernel().queue_interrupt(std::move(call));
++    kernel().finish(ctx, 0u);
++    ret(ctx);
++}
++void stub_terminate(CorpusRuntime &, AllegrexContext &ctx) {
++    const std::int32_t status = kernel().terminate_thread(ctx, static_cast<SceUID>(arg(ctx, 0)), arg(ctx, 1) != 0u);
++    kernel().finish(ctx, static_cast<std::uint32_t>(status));
++    ret(ctx);
++}
++void stub_priority(CorpusRuntime &, AllegrexContext &ctx) {
++    const std::int32_t status = kernel().change_priority(ctx, 0, arg(ctx, 0));
++    kernel().finish(ctx, static_cast<std::uint32_t>(status));
++    ret(ctx);
++}
++
++constexpr std::uint32_t kLog = 0x08800100u;
++constexpr std::uint32_t kDelay = 0x08800104u;
++constexpr std::uint32_t kStart = 0x08800108u;
++constexpr std::uint32_t kSleep = 0x0880010Cu;
++constexpr std::uint32_t kExit = 0x08800114u;
++constexpr std::uint32_t kStop = 0x08800118u;
++constexpr std::uint32_t kCallGuest = 0x0880011Cu;
++constexpr std::uint32_t kTryWait = 0x08800120u;
++constexpr std::uint32_t kQueueInterrupt = 0x08800124u;
++constexpr std::uint32_t kTerminate = 0x08800128u;
++constexpr std::uint32_t kPriority = 0x0880012Cu;
++
++// ---------------------------------------------------------------------------
++// A tiny assembler.
++
++constexpr std::uint32_t kCodeBase = 0x08A00000u;
++constexpr std::uint32_t kSlotBytes = 0x4000u;
++constexpr std::uint32_t kImageEnd = 0x08C00000u;  // thread stacks are allocated above this
++
++std::uint32_t slot_address(unsigned slot) { return kCodeBase + slot * kSlotBytes; }
++
++struct Code {
++    std::vector<std::uint32_t> words;
++
++    static std::uint32_t i_type(std::uint32_t opcode, std::uint32_t rs, std::uint32_t rt, std::uint32_t imm) {
++        return (opcode << 26u) | (rs << 21u) | (rt << 16u) | (imm & 0xFFFFu);
++    }
++    void op(std::uint32_t word) { words.push_back(word); }
++    void li(std::uint32_t reg, std::uint32_t value) {
++        op(i_type(0x0Fu, 0u, reg, value >> 16u));      // lui reg, hi
++        op(i_type(0x0Du, reg, reg, value & 0xFFFFu));  // ori reg, reg, lo
++    }
++    void call(std::uint32_t target) {
++        op((3u << 26u) | ((target >> 2u) & 0x03FFFFFFu));  // jal target
++        op(0u);                                            // nop (delay slot)
++    }
++    Code &log(std::uint32_t value) { li(4u, value); call(kLog); return *this; }
++    Code &delay(std::uint32_t us) { li(4u, us); call(kDelay); return *this; }
++    Code &start(std::int32_t uid) { li(4u, static_cast<std::uint32_t>(uid)); call(kStart); return *this; }
++    Code &sleep() { call(kSleep); return *this; }
++    Code &exit(std::uint32_t status, bool remove) { li(4u, status); li(5u, remove ? 1u : 0u); call(kExit); return *this; }
++    Code &stop() { call(kStop); return *this; }
++    Code &call_guest(std::uint32_t function, std::uint32_t argument) { li(4u, function); li(5u, argument); call(kCallGuest); return *this; }
++    Code &try_wait() { call(kTryWait); return *this; }
++    Code &queue_interrupt(std::uint32_t function, std::uint32_t argument) { li(4u, function); li(5u, argument); call(kQueueInterrupt); return *this; }
++    Code &terminate(std::int32_t uid, bool remove) { li(4u, static_cast<std::uint32_t>(uid)); li(5u, remove ? 1u : 0u); call(kTerminate); return *this; }
++    Code &priority(std::uint32_t value) { li(4u, value); call(kPriority); return *this; }
++    Code &set_v0(std::uint32_t value) { li(2u, value); return *this; }
++};
++
++// A guest function: a frame, the steps, a return. A step may set v0 last to answer.
++void install(Runtime &runtime, unsigned slot, const Code &body) {
++    Code function;
++    function.op(Code::i_type(0x09u, 29u, 29u, 0xFFE0u));  // addiu sp, sp, -32
++    function.op(Code::i_type(0x2Bu, 29u, 31u, 28u));      // sw ra, 28(sp)
++    function.words.insert(function.words.end(), body.words.begin(), body.words.end());
++    function.op(Code::i_type(0x23u, 29u, 31u, 28u));      // lw ra, 28(sp)
++    function.op(Code::i_type(0x09u, 29u, 29u, 32u));      // addiu sp, sp, 32
++    function.op(0x03E00008u);                             // jr ra
++    function.op(0u);                                      //   nop
++    const std::uint32_t base = slot_address(slot);
++    for (std::size_t i = 0; i < function.words.size(); ++i)
++        runtime.memory().store32(base + static_cast<std::uint32_t>(i) * 4u, function.words[i]);
++}
++
++struct Fixture {
++    Runtime runtime;
++    AllegrexContext caller{};  // what the kernel is called with outside a thread
++
++    Fixture() {
++        runtime.register_function(kLog, &stub_log, "log");
++        runtime.register_function(kDelay, &stub_delay, "delay");
++        runtime.register_function(kStart, &stub_start, "start");
++        runtime.register_function(kSleep, &stub_sleep, "sleep");
++        runtime.register_function(kExit, &stub_exit, "exit");
++        runtime.register_function(kStop, &stub_stop, "stop");
++        runtime.register_function(kCallGuest, &stub_call_guest, "call_guest");
++        runtime.register_function(kTryWait, &stub_try_wait, "try_wait");
++        runtime.register_function(kQueueInterrupt, &stub_queue_interrupt, "queue_interrupt");
++        runtime.register_function(kTerminate, &stub_terminate, "terminate");
++        runtime.register_function(kPriority, &stub_priority, "priority");
++        kernel().install(runtime, 0u, kImageEnd);
++    }
++
++    // A thread whose entry is code slot `slot`.
++    SceUID create(const char *name, unsigned slot, std::uint32_t priority) {
++        const std::int32_t uid = kernel().create_thread(name, slot_address(slot), priority, 0x4000u, 0u, 0u);
++        check(uid > 0, name);
++        return uid;
++    }
++    void start(SceUID uid) { check(kernel().start_thread(caller, uid, 0u, 0u) == 0, "thread started"); }
++    void run() {
++        g_log.clear();
++        kernel().run_main();
++    }
++};
++
++// ---------------------------------------------------------------------------
++// The scenarios.
++
++// Equal priorities run in the order they became ready; delays end in deadline order.
++void equal_priorities() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID first = f.create("first", 1, 40u);
++    const SceUID second = f.create("second", 2, 40u);
++    install(f.runtime, 0, Code().start(first).start(second).log(0u).exit(0u, false));
++    install(f.runtime, 1, Code().log(1u).delay(1000u).log(4u).stop());
++    install(f.runtime, 2, Code().log(2u).delay(500u).log(3u).exit(0u, false));
++    f.start(starter);
++    f.run();
++    log_is({0u, 1u, 2u, 3u, 4u}, "equal priorities run in start order; delays end in deadline order");
++    check(f.runtime.stop_reason() == "test finished", "the guest's stop leaves the scheduler");
++}
++
++// A better thread pre-empts at once; the pre-empted one goes to the front of its queue.
++void preemption_front_of_queue() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID low1 = f.create("low1", 1, 60u);
++    const SceUID low2 = f.create("low2", 2, 60u);
++    const SceUID high = f.create("high", 3, 30u);
++    install(f.runtime, 0, Code().start(low1).start(low2).exit(0u, false));
++    install(f.runtime, 1, Code().log(10u).start(high).log(11u).exit(0u, false));
++    install(f.runtime, 2, Code().log(12u).stop());
++    install(f.runtime, 3, Code().log(20u).exit(0u, false));
++    f.start(starter);
++    f.run();
++    log_is({10u, 20u, 11u, 12u}, "a better thread pre-empts at once; the pre-empted one resumes before its equals");
++}
++
++// A thread that lowers its own priority below a ready one gives the processor up.
++void priority_lowered() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID worker = f.create("worker", 1, 40u);
++    const SceUID peer = f.create("peer", 2, 50u);
++    install(f.runtime, 0, Code().start(worker).start(peer).exit(0u, false));
++    install(f.runtime, 1, Code().log(1u).priority(60u).log(3u).exit(0u, false));
++    install(f.runtime, 2, Code().log(2u).delay(100u).log(4u).stop());
++    f.start(starter);
++    f.run();
++    log_is({1u, 2u, 3u, 4u}, "lowering its own priority gives the processor to a thread that now outranks it");
++}
++
++// A guest function called from the system waits; another thread runs meanwhile.
++void wait_inside_guest_call() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID t1 = f.create("t1", 1, 40u);
++    const SceUID t2 = f.create("t2", 2, 40u);
++    install(f.runtime, 0, Code().start(t1).start(t2).exit(0u, false));
++    install(f.runtime, 1, Code().log(30u).call_guest(slot_address(4), 5u).log(33u).stop());
++    install(f.runtime, 2, Code().log(40u).exit(0u, false));
++    // The callee logs, waits 400 us, logs, and answers 77.
++    install(f.runtime, 4, Code().log(31u).delay(400u).log(32u).set_v0(77u));
++    f.start(starter);
++    f.run();
++    log_is({30u, 31u, 40u, 32u, 77u, 33u}, "a guest function called from the system may wait; another thread runs meanwhile");
++}
++
++// Interrupt handlers queued by a running thread run nested on it, before its system call returns.
++void interrupt_nested() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID worker = f.create("worker", 1, 40u);
++    install(f.runtime, 0, Code().start(worker).exit(0u, false));
++    install(f.runtime, 1,
++            Code().queue_interrupt(slot_address(5), 1u).log(2u).delay(300u).queue_interrupt(slot_address(5), 3u).log(4u).stop());
++    // The handler logs, tries to wait (it cannot) and answers 9.
++    install(f.runtime, 5, Code().log(100u).try_wait().set_v0(9u));
++    f.start(starter);
++    f.run();
++    log_is({100u, 0x800201A7u, 0x1009u, 2u, 100u, 0x800201A7u, 0x1009u, 4u},
++           "interrupt handlers run nested on the thread, cannot wait, and the thread's registers survive");
++}
++
++// Interrupts that come while no thread runs go on a stack of their own.
++void interrupt_while_idle() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID worker = f.create("worker", 1, 40u);
++    install(f.runtime, 0, Code().start(worker).exit(0u, false));
++    // The worker sleeps through the first vblank (16.7 ms); the hook queues the handler then.
++    install(f.runtime, 1, Code().log(1u).delay(40000u).log(7u).stop());
++    install(f.runtime, 5, Code().log(100u).try_wait().set_v0(9u));
++    bool queued = false;
++    kernel().add_vblank_hook([&] {
++        if (queued) return;
++        queued = true;
++        InterruptCall call{};
++        call.function = slot_address(5);
++        call.on_return = [](std::uint32_t result) { g_log.push_back(0x1000u + result); };
++        kernel().queue_interrupt(std::move(call));
++    });
++    f.start(starter);
++    f.run();
++    log_is({1u, 100u, 0x800201A7u, 0x1009u, 7u}, "an interrupt with every thread asleep runs, cannot wait, and the sleeper wakes on time");
++}
++
++// Terminating a waiting thread drops its host stack; a thread that exits deleting itself is gone.
++void terminate_and_delete() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    const SceUID sleeper = f.create("sleeper", 1, 40u);
++    const SceUID killer = f.create("killer", 2, 50u);
++    const SceUID closer = f.create("closer", 3, 70u);
++    install(f.runtime, 0, Code().start(sleeper).start(killer).start(closer).exit(0u, false));
++    install(f.runtime, 1, Code().log(1u).sleep().log(0xBADu));
++    install(f.runtime, 2, Code().log(2u).terminate(sleeper, true).log(3u).exit(0u, true));
++    install(f.runtime, 3, Code().log(4u).stop());
++    f.start(starter);
++    f.run();
++    log_is({1u, 2u, 3u, 4u}, "a terminated sleeper never runs again");
++    check(kernel().find_thread(sleeper) == nullptr, "terminate-and-delete removes the thread");
++    check(kernel().find_thread(killer) == nullptr, "a thread that exits deleting itself is gone once the scheduler is back");
++    check(kernel().find_thread(starter) != nullptr, "a thread that exits without deleting stays, dormant");
++}
++
++// Threads made, run to their end and deleted by themselves, in bulk: host stacks come and go.
++void many_short_lives() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    std::vector<SceUID> workers;
++    for (unsigned i = 0; i < 300u; ++i) workers.push_back(f.create("short", 1, 40u + (i & 7u)));
++    const SceUID last = f.create("last", 2, 70u);
++    Code spawn;
++    for (const SceUID worker : workers) spawn.start(worker);
++    spawn.exit(0u, false);
++    install(f.runtime, 0, spawn);
++    install(f.runtime, 1, Code().exit(0u, true));
++    install(f.runtime, 2, Code().log(7u).stop());
++    f.start(starter);
++    f.start(last);
++    f.run();
++    log_is({7u}, "300 threads that delete themselves leave the scheduler running; the last thread runs after them");
++    int alive = 0;
++    for (const SceUID worker : workers) alive += kernel().find_thread(worker) != nullptr ? 1 : 0;
++    check(alive == 0, "all 300 were deleted");
++}
++
++// A stop from three guest calls deep ends the run; nothing after it runs.
++void stop_from_deep_inside() {
++    Fixture f;
++    const SceUID starter = f.create("starter", 0, 20u);
++    install(f.runtime, 0, Code().log(1u).call_guest(slot_address(1), 0u).log(6u).exit(0u, false));
++    install(f.runtime, 1, Code().log(2u).call_guest(slot_address(2), 0u).log(5u));
++    install(f.runtime, 2, Code().log(3u).stop().log(4u));
++    f.start(starter);
++    f.run();
++    log_is({1u, 2u, 3u}, "a stop inside nested guest calls leaves at once");
++    check(f.runtime.stopped() && f.runtime.stop_reason() == "test finished", "the run ended with the guest's reason");
++}
++
++struct Scenario {
++    const char *name;
++    void (*run)();
++};
++
++const Scenario kScenarios[] = {
++    {"equal priorities", &equal_priorities},
++    {"pre-emption", &preemption_front_of_queue},
++    {"priority lowered", &priority_lowered},
++    {"wait inside a guest call", &wait_inside_guest_call},
++    {"interrupt nested", &interrupt_nested},
++    {"interrupt while idle", &interrupt_while_idle},
++    {"terminate and delete", &terminate_and_delete},
++    {"many short lives", &many_short_lives},
++    {"stop from deep inside", &stop_from_deep_inside},
++};
++constexpr std::size_t kScenarioCount = sizeof(kScenarios) / sizeof(kScenarios[0]);
++
++} // namespace
++
++int main(int argc, char **argv) {
++    if (argc > 1) {
++        const std::size_t index = static_cast<std::size_t>(std::strtoul(argv[1], nullptr, 10));
++        if (index >= kScenarioCount) {
++            std::printf("no scenario %zu (there are %zu)\n", index, kScenarioCount);
++            return 2;
++        }
++        std::printf("scenario %zu: %s\n", index, kScenarios[index].name);
++        kScenarios[index].run();
++        std::fflush(stdout);
++        return g_failures == 0 ? 0 : 1;
++    }
++    int failed = 0;
++    for (std::size_t i = 0; i < kScenarioCount; ++i) {
++        const std::string command = std::string("\"") + argv[0] + "\" " + std::to_string(i);
++        if (std::system(command.c_str()) != 0) ++failed;
++    }
++    std::printf("%s\n", failed == 0 ? "all kernel scenarios passed" : "kernel scenarios FAILED");
++    return failed == 0 ? 0 : 1;
++}

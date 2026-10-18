@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 10:56:30 +0000
+Subject: [PATCH] split renderer: an idle-work hook, so the GL thread can use
+ the time it would wait for a draw
+
+Renderer gets a virtual warm_up_step(quiet_us) (default: nothing to do). GeWorker::run_loop tracks how long the ring has been
+empty and calls a hook installed with set_idle_work() when it is, SplitRenderer installs one that calls the inner renderer's
+warm_up_step() on the GL thread, and the non-split media path calls it in a loop before the first frame. Nothing uses it in
+this commit; the next one does.
+
+Verified: framework tests pass (45 of 45). Not verified: any effect, since no renderer implements the hook yet.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+index 988a236..3925728 100644
+--- a/host/gpu/ge_worker.cpp
++++ b/host/gpu/ge_worker.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -174,10 +175,17 @@ void GeWorker::request_stop() noexcept {
+ }
+ 
+ void GeWorker::run_loop() {
++    using IdleClock = std::chrono::steady_clock;
++    IdleClock::time_point quiet_since = IdleClock::now();
+     for (;;) {
+         const std::uint64_t head = head_.load(std::memory_order_relaxed);
+         if (head == tail_.load(std::memory_order_acquire)) {
+             if (stop_.load(std::memory_order_acquire) && head == tail_.load(std::memory_order_acquire)) return;
++            if (idle_work_ != nullptr && !stop_.load(std::memory_order_acquire)) {
++                const auto quiet = static_cast<std::uint64_t>(
++                    std::chrono::duration_cast<std::chrono::microseconds>(IdleClock::now() - quiet_since).count());
++                if (idle_work_(idle_context_, quiet)) continue;
++            }
+             consumer_sleeping_.store(true, std::memory_order_seq_cst);
+             if (head == tail_.load(std::memory_order_seq_cst) && !stop_.load(std::memory_order_acquire) &&
+                 g_platform.event_wait != nullptr && work_event_ != nullptr) {
+@@ -192,6 +200,7 @@ void GeWorker::run_loop() {
+         Slot &slot = slots_[head % capacity_];
+         if (slot.job) slot.job();
+         slot.job = nullptr;
++        if (idle_work_ != nullptr) quiet_since = IdleClock::now();
+         head_.store(head + 1u, std::memory_order_seq_cst);
+         if (forwarder_ != nullptr) {
+             // Someone else finishes this job's work: they publish its completion (mark_completed). The producer may be
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+index 815d851..2583c56 100644
+--- a/host/gpu/ge_worker.hpp
++++ b/host/gpu/ge_worker.hpp
+@@ -109,6 +109,15 @@ public:
+     // Publishes completed() = `value` (never backwards) and wakes the guest as run_loop() does. Any thread.
+     void mark_completed(std::uint64_t value);
+ 
++    // Work for the consumer to do when the ring is empty, before it sleeps: `work(context, quiet_us)` where quiet_us is how
++    // long the ring has been empty (since the last job ended, or since the loop started). Returns true when it did something,
++    // and the loop looks at the ring again at once. Set it before the loop runs and clear it after.
++    using IdleWork = bool (*)(void *context, std::uint64_t quiet_us);
++    void set_idle_work(IdleWork work, void *context) noexcept {
++        idle_work_ = work;
++        idle_context_ = context;
++    }
++
+ private:
+     struct Slot {
+         Job job;
+@@ -129,6 +138,8 @@ private:
+     // two calls a draw off the walker and the GL thread. Set before the sleeper's last look at the ring, read after the
+     // producer's store (both sequentially consistent), so a wake-up is never lost; the sleeps also time out.
+     int idle_phase_ = -1;
++    IdleWork idle_work_ = nullptr;
++    void *idle_context_ = nullptr;
+     std::atomic<bool> consumer_sleeping_{false};
+     std::atomic<std::uint32_t> space_waiters_{0u};
+     void signal_space() noexcept;
+diff --git a/host/gpu/renderer.hpp b/host/gpu/renderer.hpp
+index d417e12..f83a84d 100644
+--- a/host/gpu/renderer.hpp
++++ b/host/gpu/renderer.hpp
+@@ -68,6 +68,10 @@ public:
+     virtual bool initialize(const RendererConfig &config, std::string &error) = 0;
+     virtual void shutdown() = 0;
+     [[nodiscard]] virtual bool available() const noexcept = 0;
++    // Start-up work a backend can do in small pieces while its thread has nothing else to do (the split renderer calls it from
++    // the GL thread's idle loop; `quiet_us` is how long that thread has had no job). The GL backend links the shader programs
++    // earlier runs needed, one a call, and only in a lull once frames are coming. True when it did a piece (call again at once).
++    virtual bool warm_up_step(std::uint64_t quiet_us) { (void)quiet_us; return false; }
+ 
+     // ---- drawing -------------------------------------------------------
+ 
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 340143c..5cb71d0 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -229,7 +229,11 @@ bool SplitRenderer::run(GeWorker &walker, void (*guest)(void *), void *arg, int
+         t_gl = false;
+         return false;
+     }
++    // The GL thread's idle time goes to the renderer's start-up work (the shader programs earlier runs needed): while the guest
++    // boots, and later in a lull of the frames.
++    queue_.set_idle_work([](void *self, std::uint64_t quiet_us) { return static_cast<SplitRenderer *>(self)->inner_->warm_up_step(quiet_us); }, this);
+     queue_.run_loop();
++    queue_.set_idle_work(nullptr, nullptr);
+     platform.thread_join(guest_thread);
+     platform.thread_join(walker_thread);
+     {
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 64b1bad..443b710 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -1670,6 +1670,7 @@ static bool create_gl_renderer() {
+         media().renderer = std::make_unique<gpu::SplitRenderer>(std::unique_ptr<gpu::Renderer>(std::move(renderer)));
+     } else {
+         media().renderer = std::move(renderer);
++        while (media().renderer->warm_up_step(~0ull)) {}   // (the split renderer does this in its GL thread's idle time)
+     }
+     overlay_host::attach(*media().renderer);
+     // While the settings menu holds the guest still the audio device is silenced, and afterwards the frame statistics

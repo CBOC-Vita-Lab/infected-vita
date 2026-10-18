@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:07:05 +0000
+Subject: [PATCH] settings: Performance > Resolution (960x544 or 720x408)
+
+The display targets drawn at 1.5 times the PSP's size and enlarged, 56 % of the pixels (the Wii ports' 1.5x preset).
+Read when the renderer starts, so a change takes a restart; a developer's GL_DISPLAY_SCALE_PERCENT wins. Checked with a
+desktop replay at 720x408.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 3c8da85..3727515 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -1627,6 +1627,9 @@ static bool create_gl_renderer() {
+         for (char &c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+         if (const char *value = portablekit::env(("GL_" + upper).c_str())) gpu::apply_gl_setting(settings, name, value);
+     }
++    // perf.resolution 720x408: the display targets at 1.5 times the PSP's size (a developer's GL_DISPLAY_SCALE_PERCENT wins).
++    if (settings.display_scale_percent == 0u && settings.display_scale == 2u && port::reduced_resolution())
++        settings.display_scale_percent = 150u;
+     renderer->set_settings(settings);
+     std::string error;
+     if (!renderer->initialize(gpu::RendererConfig{}, error)) {
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 812e656..04997ca 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -52,6 +52,11 @@ const KeyInfo kTable[kKeyCount] = {
+     {Key::PerfShowFps, "perf.show_fps", Page::Performance, "Show FPS",
+      "Frames per second, frame time and draw count.", 2, 0,
+      {"off", "on"}, {"Off", "On"}, {N, L}, 0, false},
++    // Resolution: the 3D picture and the HUD drawn at 720x408 and enlarged, 56 % of the pixels of 960x544 (the Wii ports'
++    // 1.5x preset). The render targets are made once, so a change takes a restart.
++    {Key::PerfResolution, "perf.resolution", Page::Performance, "Resolution",
++     "Drawing resolution. 720x408 draws faster.", 2, 0,
++     {"960x544", "720x408"}, {"960x544", "720x408"}, {L, N}, 0, true},
+     {Key::PerfThreadedRenderer, "perf.threaded_renderer", Page::Performance, "Renderer thread",
+      "Draws on its own CPU core. Needs a restart.", 2, 0,
+      {"on", "off"}, {"On", "Off"}, {N, N}, 0, true},
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index 3bf4bc5..6135b2d 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -43,6 +43,7 @@ enum class Key : std::uint8_t {
+     GfxHdMovies,
+     PerfFrameCap,
+     PerfShowFps,
++    PerfResolution,
+     PerfThreadedRenderer,
+     PerfCpuClock,
+     PerfEnemyDensity,
+@@ -225,6 +226,9 @@ private:
+ // Microseconds between two game flips the cap allows: 16683 (60), 33366 (30), 0 (off).
+ [[nodiscard]] std::uint64_t frame_cap_period_us() noexcept;
+ [[nodiscard]] inline bool show_fps() { return settings().index(Key::PerfShowFps) != 0u; }
++// The display drawn at 1.5 times the PSP's 480x272 (720x408, enlarged to the screen) instead of twice. Read when the
++// renderer starts: a change shows as "restart needed".
++[[nodiscard]] inline bool reduced_resolution() { return settings().started_index(Key::PerfResolution) != 0u; }
+ [[nodiscard]] inline bool threaded_renderer() { return settings().index(Key::PerfThreadedRenderer) == 0u; }
+ [[nodiscard]] std::uint32_t cpu_clock_mhz() noexcept;       // 444 or 500
+ [[nodiscard]] std::uint32_t enemy_density_percent() noexcept;  // 100, 125, 150, 200

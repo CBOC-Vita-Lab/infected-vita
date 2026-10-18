@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 18:04:21 +0000
+Subject: [PATCH] settings: Renderer thread gets a third choice, Split (two
+ renderer threads)
+
+perf.threaded_renderer=split runs the split GE thread (list walker and GL thread on two cores) without a developer
+switch; GE_SPLIT still decides when it is set. Checked on desktop: settings.txt with split starts the walker and the GL
+thread; framework tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 8e1616c..7b7cdfc 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "perf/phase_timers.hpp"
+ #include "profile.hpp"
++#include "settings/port_settings.hpp"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -36,7 +37,8 @@ void warn_foreign_thread(const char *what) {
+ 
+ bool ge_split_setting_enabled() {
+     const char *value = portablekit::env("GE_SPLIT");
+-    if (value == nullptr || *value == '\0') return false;
++    // Without the developer switch, the player's choice: perf.threaded_renderer=split.
++    if (value == nullptr || *value == '\0') return port::split_renderer();
+     std::string text(value);
+     for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+     return text == "1" || text == "on" || text == "true" || text == "yes";
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+index 85f73e5..480ff2c 100644
+--- a/host/gpu/split_renderer.hpp
++++ b/host/gpu/split_renderer.hpp
+@@ -31,7 +31,7 @@
+ // it (overlay, settings) on the main thread before any thread is started.
+ namespace portablekit::gpu {
+ 
+-// <PREFIX>_GE_SPLIT: on, off (default off).
++// <PREFIX>_GE_SPLIT: on, off; without it, perf.threaded_renderer=split of the port settings (default off).
+ [[nodiscard]] bool ge_split_setting_enabled();
+ 
+ class SplitRenderer final : public Renderer {
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 04997ca..7624438 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -57,9 +57,11 @@ const KeyInfo kTable[kKeyCount] = {
+     {Key::PerfResolution, "perf.resolution", Page::Performance, "Resolution",
+      "Drawing resolution. 720x408 draws faster.", 2, 0,
+      {"960x544", "720x408"}, {"960x544", "720x408"}, {L, N}, 0, true},
++    // Renderer thread: on (one thread draws beside the game), off (everything on the game's core), split (two threads:
++    // display lists and vertex decoding on one core, the GL calls on another; gpu::ge_split_setting_enabled()).
+     {Key::PerfThreadedRenderer, "perf.threaded_renderer", Page::Performance, "Renderer thread",
+-     "Draws on its own CPU core. Needs a restart.", 2, 0,
+-     {"on", "off"}, {"On", "Off"}, {N, N}, 0, true},
++     "Own CPU core; Split uses two. Needs restart.", 3, 0,
++     {"on", "off", "split"}, {"On", "Off", "Split"}, {N, N, N}, 0, true},
+     {Key::PerfCpuClock, "perf.cpu_clock", Page::Performance, "CPU clock",
+      "Vita CPU speed in MHz. Higher runs hotter.", 2, 0,
+      {"444", "500"}, {"444 MHz", "500 MHz", }, {N, L}, 0, false},
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index 6135b2d..11ba8f8 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -229,7 +229,9 @@ private:
+ // The display drawn at 1.5 times the PSP's 480x272 (720x408, enlarged to the screen) instead of twice. Read when the
+ // renderer starts: a change shows as "restart needed".
+ [[nodiscard]] inline bool reduced_resolution() { return settings().started_index(Key::PerfResolution) != 0u; }
+-[[nodiscard]] inline bool threaded_renderer() { return settings().index(Key::PerfThreadedRenderer) == 0u; }
++// On or split: the renderer runs beside the game. Split: two renderer threads (lists and vertices, then GL).
++[[nodiscard]] inline bool threaded_renderer() { return settings().index(Key::PerfThreadedRenderer) != 1u; }
++[[nodiscard]] inline bool split_renderer() { return settings().index(Key::PerfThreadedRenderer) == 2u; }
+ [[nodiscard]] std::uint32_t cpu_clock_mhz() noexcept;       // 444 or 500
+ [[nodiscard]] std::uint32_t enemy_density_percent() noexcept;  // 100, 125, 150, 200
+ [[nodiscard]] std::uint32_t view_distance_percent() noexcept;  // 100, 150, 200

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 08:54:48 +0000
+Subject: [PATCH] Menu: the "guest resumed" line prints the clock read inside
+ the pause
+
+The value was read after the pause scope was left, when the realtime clock had restarted (44 us to 5 ms later on the Vita), so the line
+looked like a jump. The check itself (the "moved while the menu was open" warning) was already inside the scope.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 60c259d..2f8b660 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -535,7 +535,7 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+     // No guest thread, interrupt, timer or vblank runs inside the scope and emulated time stands still; the
+     // listener registered with the renderer silences the audio and restarts the frame statistics afterwards.
+     bool window_open = true;
+-    std::uint64_t before_us = 0u;
++    std::uint64_t before_us = 0u, after_us = 0u;
+     {
+         const Kernel::PauseScope pause(kernel());
+         // Read inside the scope: the pause takes its last reading of the (real time) clock on the way in, and what
+@@ -544,9 +544,10 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+         if (!threaded) renderer.pause_interpolation();
+         window_open = overlay_host::run_modal(renderer, host);
+         // The clock stood still: this is the check that a mission timer cannot have jumped.
+-        if (kernel().now_us() != before_us)
++        after_us = kernel().now_us();
++        if (after_us != before_us)
+             std::cerr << "[menu] the emulated clock moved while the menu was open: " << before_us << " -> "
+-                      << kernel().now_us() << " us" << std::endl;
++                      << after_us << " us" << std::endl;
+     }
+ #if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
+     if (threaded) {
+@@ -554,7 +555,7 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+         gpu::ge_worker().post([&renderer] { renderer.pause_interpolation(); });
+     }
+ #endif
+-    std::cerr << "[menu] guest resumed at flip " << bringup::flip_count() << ", emulated time " << kernel().now_us()
++    std::cerr << "[menu] guest resumed at flip " << bringup::flip_count() << ", emulated time " << after_us
+               << " us (it was " << before_us << " us when the menu opened)" << (threaded ? " [GE thread]" : "") << std::endl;
+     return window_open;
+ }

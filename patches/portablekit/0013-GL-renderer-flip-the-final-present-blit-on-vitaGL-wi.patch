@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 02:45:07 +0000
+Subject: [PATCH] GL renderer: flip the final present blit on vitaGL
+ (window_flip_y), optional quad_clear for emulators where glClear is a no-op
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index 7161db1..75256db 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -43,6 +43,10 @@ struct Caps {
+     // The size of the window (the Vita's screen) the finished frame is drawn into.
+     std::uint32_t window_width{960};
+     std::uint32_t window_height{544};
++    // The window's rows are drawn the other way up than a target's: a target's row 0 is the top of the PSP picture and sits at
++    // texture t = 0, so a window that follows GL's bottom-left origin (vitaGL's display does) shows it upside down unless the
++    // final blit flips it. Off for the desktop builds, whose "window" is read back row 0 first.
++    bool window_flip_y{false};
+     // Strings for logs.
+     std::string vendor, renderer, version;
+ };
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 69abb44..a14dbfd 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -290,6 +290,7 @@ struct GlRenderer::Impl {
+     std::map<std::array<std::uint32_t, 3>, bool> target_verdicts;  // per display list: target, texture, size -> unchanged
+     std::vector<std::uint32_t> decode_buffer;
+     GLuint upload_texture{};  // for upload_frame
++    GLuint clear_texture{};   // 1x1 transparent black for quad_clear
+     std::uint32_t upload_width{}, upload_height{};
+     std::uint32_t presented{};  // address of the target last shown
+     bool has_presented{};
+@@ -519,9 +520,13 @@ struct GlRenderer::Impl {
+         glDisable(GL_SCISSOR_TEST);
+         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+         glDepthMask(GL_TRUE);
+-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+-        glClearDepthf(0.0f);
+-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++        if (settings.quad_clear) {
++            quad_clear(target);
++        } else {
++            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++            glClearDepthf(0.0f);
++            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++        }
+         glEnable(GL_SCISSOR_TEST);
+         cache.color_mask = -1;
+         cache.depth_write = -1;
+@@ -1814,7 +1819,8 @@ struct GlRenderer::Impl {
+         return true;
+     }
+ 
+-    void blit(GLuint texture, std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height) {
++    void blit(GLuint texture, std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height, bool flip_y = false,
++              bool write_depth_zero = false) {
+         if (blit_program.id == 0u) return;
+         glDisableVertexAttribArray(1u);
+         glDisableVertexAttribArray(3u);
+@@ -1824,11 +1830,23 @@ struct GlRenderer::Impl {
+         }
+         bind_texture(texture);
+         set_sampler(texture, GL_LINEAR, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+-        glDisable(GL_DEPTH_TEST);
++        if (write_depth_zero) {
++            // Depth test on with ALWAYS and a collapsed range: every fragment writes depth 0 (the clear value of a new target).
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(GL_ALWAYS);
++            glDepthMask(GL_TRUE);
++            glDepthRangef(0.0f, 0.0f);
++            cache.depth_test = -1;
++            cache.depth_function = 0;
++            cache.depth_write = -1;
++            cache.depth_range[0] = cache.depth_range[1] = -1.0f;
++        } else {
++            glDisable(GL_DEPTH_TEST);
++            cache.depth_test = 0;
++        }
+         glDisable(GL_BLEND);
+         glDisable(GL_CULL_FACE);
+         glDisable(GL_SCISSOR_TEST);
+-        cache.depth_test = 0;
+         cache.blend = 0;
+         cache.cull = 0;
+         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+@@ -1837,16 +1855,38 @@ struct GlRenderer::Impl {
+         cache.viewport[0] = -1;
+         static const float quad[] = {-1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f,
+                                      -1.0f, 1.0f,  0.0f, 1.0f, 1.0f, 1.0f,  1.0f, 1.0f};
+-        glVertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, 16, quad);
+-        glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
++        static const float quad_flipped[] = {-1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
++                                             -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f};
++        const float *vertices = flip_y ? quad_flipped : quad;
++        glVertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, 16, vertices);
++        glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, 16, vertices + 2);
+         glUniform1i(blit_texture, 0);
+         if (!settings.null_draw) glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        if (write_depth_zero) {
++            glDepthRangef(0.0f, 1.0f);
++            glDisable(GL_DEPTH_TEST);
++            cache.depth_test = 0;
++        }
+         glEnableVertexAttribArray(1u);
+         glEnableVertexAttribArray(3u);
+         glEnable(GL_SCISSOR_TEST);
+         ++st().gl_draws;
+     }
+ 
++    // A clear done as a draw: transparent black into the colour and 0 into the depth of the bound target, for a driver whose glClear
++    // is not implemented. The blit's own state setup is the whole job.
++    void quad_clear(const Target &target) {
++        if (blit_program.id == 0u) return;
++        if (clear_texture == 0u) {
++            glGenTextures(1, &clear_texture);
++            bind_texture(clear_texture);
++            static const std::uint8_t zero[4] = {0, 0, 0, 0};
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
++            samplers.erase(clear_texture);
++        }
++        blit(clear_texture, 0, 0, static_cast<std::int32_t>(target.width), static_cast<std::int32_t>(target.height), false, true);
++    }
++
+     void upload(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width, std::uint32_t height,
+                 std::uint32_t stride) {
+         if (!ready || pixels == nullptr || width == 0u || height == 0u || stride < width) return;
+@@ -1890,7 +1930,7 @@ struct GlRenderer::Impl {
+             glBindFramebuffer(GL_FRAMEBUFFER, 0u);
+             cache.fbo = 0u;
+             blit(target->color, 0, 0, static_cast<std::int32_t>(glp::caps().window_width),
+-                 static_cast<std::int32_t>(glp::caps().window_height));
++                 static_cast<std::int32_t>(glp::caps().window_height), glp::caps().window_flip_y);
+             glp::swap_buffers();
+             // The platform may have drawn its own overlay on top (other program, fixed-function state, other bindings): forget what this
+             // renderer thinks is set. Scissor is the one state it never caches (always on).
+@@ -1960,6 +2000,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "depth_bits") settings.depth_bits = u32;
+     else if (name == "target_textures") settings.target_textures = flag;
+     else if (name == "use_glclear") settings.use_glclear = flag;
++    else if (name == "quad_clear") settings.quad_clear = flag;
+     else if (name == "rect_clamp") settings.rect_clamp = flag;
+     else if (name == "cull") settings.cull = flag;
+     else if (name == "lighting") settings.lighting = flag;
+@@ -1979,7 +2020,7 @@ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+         "writeback", "texture_budget_mb", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
+-        "use_glclear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
++        "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+ }
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 27f4af0..315bc78 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -44,6 +44,9 @@ struct GlSettings {
+     bool target_textures{true};
+     // A clear that is a rectangle in through mode is done with glClear.
+     bool use_glclear{true};
++    // A new render target is cleared by drawing a full-screen quad instead of glClear (an emulator whose glClear does nothing,
++    // Vita3K's Vulkan renderer: "Mask not implemented"). Never needed on a real GL driver or on a Vita.
++    bool quad_clear{false};
+     // Store the displayed frame into guest memory (the CPU may read it): 0 never, 1 every presented
+     // frame, N every Nth. The store is a glReadPixels of the whole display, which stalls the GPU and costs
+     // a conversion pass, so it is off by default; a draw that copies a framebuffer (a GE block

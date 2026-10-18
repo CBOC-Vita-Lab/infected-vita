@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 04:25:49 +0000
+Subject: [PATCH] GE thread: off under INFECTED_BENCH / GE_DUMP, fix the merged
+ present scopes, ge_replay links ge_worker
+
+- ge_worker_setting_enabled() is false while the bench or the GE recorder is on (both need the lists to run where the guest asked).
+- hle_media.cpp: the merge left two locals named present_scope in present_frame(); the bench one is renamed.
+- CMakeLists.txt: ge_replay gets host/gpu/ge_worker.cpp.
+
+Verified: ge_replay with and without --threaded produces identical pictures (md5 of every presented PNG) on four recorded dump sets
+(131, 122, 165 and 54 pictures); the Vita build with the GE thread runs in Vita3K from the logos to the campaign menu.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 541ef32..4ac2b30 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -561,6 +561,7 @@ if(PORTABLEKIT_GE_REPLAY)
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_state.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/texture_decode.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_dump.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/ge_worker.cpp"
+         "${PORTABLEKIT_ROOT}/host/profile.cpp"
+         "${PORTABLEKIT_ROOT}/host/perf/frame_stats.cpp"
+         "${PORTABLEKIT_ROOT}/host/perf/bench.cpp"
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+index acbf008..71ae4cb 100644
+--- a/host/gpu/ge_worker.cpp
++++ b/host/gpu/ge_worker.cpp
+@@ -104,6 +104,9 @@ void set_ge_worker_platform(const GeWorkerPlatform &platform) noexcept { g_platf
+ const GeWorkerPlatform &ge_worker_platform() noexcept { return g_platform; }
+ 
+ bool ge_worker_setting_enabled() {
++    // The recorder reads guest memory at the moment a list is run and the bench accounts wall time by category on one
++    // thread: both need the lists to run where the guest asked for them.
++    if (portablekit::env("GE_DUMP") != nullptr || portablekit::env("BENCH") != nullptr) return false;
+     if (const char *value = portablekit::env("THREADED_RENDERER")) return parse_flag(value, true);
+     const char *dir = portablekit::env("DATA_DIR");
+     if (dir == nullptr || *dir == '\0') return true;
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+index ce4a51a..bf7f8c6 100644
+--- a/host/gpu/ge_worker.hpp
++++ b/host/gpu/ge_worker.hpp
+@@ -47,7 +47,8 @@ void set_ge_worker_platform(const GeWorkerPlatform &platform) noexcept;
+ [[nodiscard]] const GeWorkerPlatform &ge_worker_platform() noexcept;
+ 
+ // The setting: <PREFIX>_THREADED_RENDERER (0/1/on/off) if set, else `perf.threaded_renderer` in settings.txt in the data
+-// root (<PREFIX>_DATA_DIR; the file's `key=value` lines, unknown keys ignored), else on.
++// root (<PREFIX>_DATA_DIR; the file's `key=value` lines, unknown keys ignored), else on. Always off while the GE recorder
++// (<PREFIX>_GE_DUMP) or the bench (<PREFIX>_BENCH) is on.
+ [[nodiscard]] bool ge_worker_setting_enabled();
+ 
+ class GeWorker {
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index fa8b422..72b253c 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -463,7 +463,7 @@ void present_frame(Runtime &rt) {
+                                       ? (media().display.framebuffer | 0x04000000u)
+                                       : media().display.framebuffer;
+     const perf::Clock::time_point present_start = perf::Clock::now();
+-    const bench::Scope present_scope(bench::Present);
++    const bench::Scope bench_present_scope(bench::Present);
+     // The GE only draws into VRAM, so a framebuffer in main memory was
+     // written by the CPU (the movie player's sceJpegCsc) and has to be shown
+     // from memory.

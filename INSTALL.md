@@ -1,21 +1,23 @@
 # Install
 
-Private preparation draft: current source/tool exports and a fresh-install
-test are still needed before this becomes a release guide.
+Private preparation guide: source is included; a complete clean rebuild
+and fresh-install test are still pending. There is no public VPK download.
 For the shortest path, open [Start Here](START-HERE.txt).
 
 ## You Need
 
 - A homebrew-enabled PS Vita and VitaShell.
 - Your own **Infected USA, `ULUS-10054`, version 1.02** ISO.
-- `Infected-current-private-candidate.vpk`, application ID **`INFC00001`**.
+- Your [owner-built VPK](BUILDING.md), application ID **`INFC00001`**.
+  The already staged private candidate is only for the original owner's use.
 - A legitimately obtained shader compiler module at
   `ur0:data/libshacccg.suprx`. It is not included. Use a documented lawful
   user-side setup; do not download an unofficial firmware/module bundle.
 
 ## Installation
 
-1. Extract the install ZIP on your computer and [check the download](CHECK-DOWNLOAD.md).
+1. Build `dist/infected.vpk`, or use your existing private install bundle.
+   If using that bundle, extract the ZIP and [check it](CHECK-DOWNLOAD.md).
    Leave the VPK intact. Copy it through VitaShell USB or FTP to `ux0:VPK/`
    (create that folder if needed), then end the transfer. In VitaShell,
    highlight the VPK, use the confirm button (usually Cross), and confirm
@@ -24,7 +26,7 @@ For the shortest path, open [Start Here](START-HERE.txt).
 3. Open the Infected bubble.
 
 Use the filename above for the simplest documented path. The current code
-is reported to discover other `.iso` names, but that variant has not been
+can discover other `.iso` names, but that variant has not been
 verified, so this guide does not rely on it.
 
 ```text
@@ -70,6 +72,11 @@ Exit the app, then back up **`ux0:data/infected/`**, particularly `ms0/`
 and a saved game loads. Do not delete saves or apply a test config as an
 update step.
 
+This runtime has a one-time migration from an older 444 MHz setting to a
+500 MHz request. Check the CPU clock option after updating and preserve
+`cpu_clock_500.done` with your backup. See [Settings](docs/SETTINGS.md).
+No kernel-plugin or clock-profile installation is part of these instructions.
+
 Removing the bubble is separate from deleting the data folder. Back up
 before either operation; deleting the data folder removes the ISO, packs,
 settings and saves stored there.
@@ -84,5 +91,6 @@ settings and saves stored there.
 | HD option unavailable | First run without HD, then check the compatible pack's name and location. |
 
 Report the build and relevant error text, not your ISO, saves or an unreviewed
-full log. Controls, the module setup procedure, RetroFlow copying and the
-complete update path still need final source/install verification.
+full log. [Controls](CONTROLS.md) are checked against the recovered source.
+The module setup, RetroFlow copying and complete upgrade path still need
+final device verification.

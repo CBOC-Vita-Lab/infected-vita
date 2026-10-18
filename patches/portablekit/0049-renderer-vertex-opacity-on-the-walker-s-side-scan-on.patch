@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 21:04:40 +0000
+Subject: [PATCH] renderer: vertex opacity on the walker's side; scan only a
+ texture's words of a target
+
+- DrawCall::prepared_vertex_alpha: GlRenderer::prepare_draw() records whether
+  every vertex colour is opaque, so the alpha-test elision on the GL thread
+  does not scan the vertices again (GeState resets it for every draw, as the
+  call is reused).
+- find_target_texture() compares only the snapshot words that lie inside the
+  texture, instead of walking every word of the target and skipping.
+
+Verified: replays byte-identical with and without --prepare (223 frames over
+8 dump sets) and against the previous build (25 mission frames); Vita3K
+mission 1 with the split renderer draws menus, briefing and gameplay
+correctly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index 1a9c1af..e8b1e2d 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -1134,6 +1134,7 @@ void GeState::fill_draw_state(DrawCall &call) const {
+     call.view = view_;
+     call.projection = projection_;
+     call.matrix_version = matrix_version_;
++    call.prepared_vertex_alpha = 0u;  // the call is reused: what a renderer prepared belongs to the previous draw
+     call.texture_matrix = texture_matrix_;
+ }
+ 
+diff --git a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+index 4fcab4d..89b4cd9 100644
+--- a/host/gpu/ge_state.hpp
++++ b/host/gpu/ge_state.hpp
+@@ -228,6 +228,9 @@ struct DrawCall {
+     std::uint64_t environment_version{};
+     std::uint64_t material_version{};
+     std::uint64_t matrix_version{};
++    // Filled by Renderer::prepare_draw where a renderer uses it (0 when not): 1 when every vertex colour has alpha
++    // 255, 2 when one does not.
++    std::uint8_t prepared_vertex_alpha{};
+     std::array<float, 16> world{};
+     std::array<float, 16> view{};
+     std::array<float, 16> projection{};
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 9f7c7bc..92f509b 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -163,8 +163,8 @@ struct DrawState {
+     std::uint32_t color_mask;  // bit 0 red .. bit 3 alpha
+     std::uint32_t blend_enable, blend_source, blend_destination, blend_equation, blend_constant;
+     float blend_color[4];
+-    float shader_blend[4];  // u_blend
+     std::uint32_t min_filter, mag_filter, wrap_s, wrap_t;
++    float shader_blend[4];  // u_blend
+     float uv[4];
+     float texenv[4];
+     float alpha[4];
+@@ -900,9 +900,13 @@ struct GlRenderer::Impl {
+         if (verdict == target_verdicts.end()) {
+             bool unchanged = true;
+             const std::uint8_t *raw = memory.raw_pointer(best->address, target_bytes(*best));
+-            for (std::size_t i = 0; i < best->guest_words.size() && unchanged; ++i) {
++            // Only the snapshot words inside the texture: from the first at or after its start to the last before its end.
++            const std::uint64_t offset = texture_address - best->address;  // texture_address >= best->address
++            const std::size_t first = static_cast<std::size_t>((offset + 255u) / 256u);
++            const std::size_t end = std::min<std::size_t>(best->guest_words.size(),
++                                                          static_cast<std::size_t>((texture_end - best->address + 255u) / 256u));
++            for (std::size_t i = first; i < end && unchanged; ++i) {
+                 const std::uint32_t word_address = best->address + static_cast<std::uint32_t>(i) * 256u;
+-                if (word_address < texture_address || word_address >= texture_end) continue;
+                 std::uint32_t word{};
+                 if (raw != nullptr) std::memcpy(&word, raw + i * 256u, sizeof(word));
+                 else if (!memory.contains(word_address, 4u)) unchanged = false;
+@@ -1482,23 +1486,23 @@ struct GlRenderer::Impl {
+     void upload_uniforms(Program &program, const DrawState &state) {
+         const std::uint32_t flags = program.flags;
+         const bool through = (flags & glsl::kThrough) != 0u;
+-        uniform<glsl::kUUv>(program, state.uv);
+-        uniform<glsl::kUBlend>(program, state.shader_blend);
+         // The matrices (transform, world, view z) are compared only when the draw's transform is not the one this
+         // program last had (matrix_serial: one per transform the renderer made).
+         const std::uint64_t matrix_serial =
+             static_cast<std::uint64_t>(state.matrix_serial_high) << 32u | state.matrix_serial_low;
+         const bool matrices_current = matrix_serial != 0u && program.matrix_serial == matrix_serial;
++        // The lighting environment and the fog colour are compared only when they were refreshed after this program
++        // last had them (twelve 4- and 16-float uniforms, most of the comparisons of a lit draw).
++        const bool environment_current = program.environment_serial == environment_serial;
++        program.environment_serial = environment_serial;
++        uniform<glsl::kUUv>(program, state.uv);
++        uniform<glsl::kUBlend>(program, state.shader_blend);
+         if (through) {
+             uniform<glsl::kUScreen>(program, state.screen);
+         } else {
+             if (!matrices_current) uniform<glsl::kUTransform>(program, state.transform);
+             uniform<glsl::kUFlip>(program, state.flip);
+         }
+-        // The lighting environment and the fog colour are compared only when they were refreshed after this program
+-        // last had them (twelve 4- and 16-float uniforms, most of the comparisons of a lit draw).
+-        const bool environment_current = program.environment_serial == environment_serial;
+-        program.environment_serial = environment_serial;
+         if ((flags & glsl::kLight) != 0u) {
+             if (!matrices_current) uniform<glsl::kUWorld>(program, state.world);
+             uniform<glsl::kUFlags>(program, state.flags);
+@@ -1949,6 +1953,7 @@ struct GlRenderer::Impl {
+     }
+ 
+     static bool vertices_opaque(const DrawCall &call) {
++        if (call.prepared_vertex_alpha != 0u) return call.prepared_vertex_alpha == 1u;  // prepare_draw() looked already
+         std::uint32_t all = 0xFFFFFFFFu;  // every colour ANDed: no early exit, two instructions a vertex
+         for (const Vertex &vertex : call.vertices) all &= vertex.color;
+         return (all >> 24u) == 0xFFu;
+@@ -2198,10 +2203,11 @@ struct GlRenderer::Impl {
+             group = GlStats::kBreakDepth;
+         else if (differs(offsetof(DrawState, cull), offsetof(DrawState, blend_enable)))
+             group = GlStats::kBreakCull;
+-        else if (differs(offsetof(DrawState, blend_enable), offsetof(DrawState, min_filter)))
++        else if (differs(offsetof(DrawState, blend_enable), offsetof(DrawState, min_filter)) ||
++                 differs(offsetof(DrawState, shader_blend), offsetof(DrawState, uv)))
+             group = GlStats::kBreakBlend;
+         else if (differs(offsetof(DrawState, texture), offsetof(DrawState, program_flags)) ||
+-                 differs(offsetof(DrawState, min_filter), offsetof(DrawState, uv)))
++                 differs(offsetof(DrawState, min_filter), offsetof(DrawState, shader_blend)))
+             group = GlStats::kBreakTexture;
+         else if (differs(offsetof(DrawState, uv), offsetof(DrawState, flip)))
+             group = GlStats::kBreakTexEnv;
+@@ -2895,6 +2901,10 @@ void GlRenderer::begin_display_list() {
+ void GlRenderer::submit(const DrawCall &call, const GuestMemory &memory) { impl_->submit(call, memory); }
+ 
+ void GlRenderer::prepare_draw(DrawCall &call) const {
++    // Whether every vertex is opaque (for the alpha-test elision of submit()).
++    std::uint32_t all = 0xFFFFFFFFu;
++    for (const Vertex &vertex : call.vertices) all &= vertex.color;
++    call.prepared_vertex_alpha = (all >> 24u) == 0xFFu ? 1u : 2u;
+     // Only transformed draws: through-mode strips keep their shape for the sprite and picture clamps of submit().
+     if (call.through || (call.primitive != PrimitiveType::TriangleStrip && call.primitive != PrimitiveType::TriangleFan))
+         return;

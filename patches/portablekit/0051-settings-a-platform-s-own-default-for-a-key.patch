@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 22:57:50 +0000
+Subject: [PATCH] settings: a platform's own default for a key
+
+Settings::set_platform_default(key, value), called before init(): the value
+a platform runs with while settings.txt does not choose, and what is_default()
+and reset_to_defaults() mean there. The table's default stays the framework's,
+so no other port changes. The Vita build uses it for the renderer thread
+(Split) and the frame limit (30). Tests: an allowed value only, a file without
+the key keeps it, a file's choice wins, reset goes back to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 7624438..052da7d 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -212,7 +212,7 @@ Settings::Settings() {
+     for (std::size_t i = 0; i < kKeyCount; ++i) {
+         const std::uint8_t def = kTable[i].default_index;
+         effective_[i].store(def, std::memory_order_relaxed);
+-        stored_[i] = override_[i] = started_[i] = def;
++        stored_[i] = override_[i] = started_[i] = default_[i] = def;
+     }
+     // What this program cannot offer. A platform or a feature module changes these with set_unavailable().
+     unavailable_[static_cast<std::size_t>(Key::GfxHdTextures)] = "No texture pack installed.";
+@@ -231,7 +231,7 @@ Settings::Settings() {
+ const char *Settings::value(Key key) const noexcept { return info(key).values[index(key)]; }
+ const char *Settings::label(Key key) const noexcept { return info(key).labels[index(key)]; }
+ Cost Settings::cost(Key key) const noexcept { return info(key).costs[index(key)]; }
+-bool Settings::is_default(Key key) const noexcept { return index(key) == info(key).default_index; }
++bool Settings::is_default(Key key) const noexcept { return index(key) == default_[static_cast<std::size_t>(key)]; }
+ 
+ void Settings::bump() noexcept { generation_.fetch_add(1u, std::memory_order_release); }
+ 
+@@ -240,7 +240,7 @@ void Settings::bump() noexcept { generation_.fetch_add(1u, std::memory_order_rel
+ void Settings::refresh(Key key) noexcept {
+     const auto i = static_cast<std::size_t>(key);
+     std::uint8_t wanted = overridden_[i] ? override_[i] : stored_[i];
+-    if (unavailable_[i] != nullptr && !overridden_[i]) wanted = kTable[i].default_index;
++    if (unavailable_[i] != nullptr && !overridden_[i]) wanted = default_[i];
+     if (effective_[i].load(std::memory_order_relaxed) == wanted) return;
+     effective_[i].store(wanted, std::memory_order_relaxed);
+     bump();
+@@ -278,12 +278,24 @@ std::uint8_t Settings::step(Key key, int direction) {
+ 
+ void Settings::reset_to_defaults() {
+     for (std::size_t i = 0; i < kKeyCount; ++i) {
+-        if (stored_[i] != kTable[i].default_index) dirty_ = true;
+-        stored_[i] = kTable[i].default_index;
++        if (stored_[i] != default_[i]) dirty_ = true;
++        stored_[i] = default_[i];
+         refresh(static_cast<Key>(i));
+     }
+ }
+ 
++bool Settings::set_platform_default(Key key, std::string_view text) {
++    if (key == Key::Count) return false;
++    const int found = value_index(key, text);
++    if (found < 0) return false;
++    const auto i = static_cast<std::size_t>(key);
++    const bool was_default = stored_[i] == default_[i];
++    default_[i] = static_cast<std::uint8_t>(found);
++    if (was_default && !in_file_[i]) stored_[i] = default_[i];   // nothing chose otherwise yet
++    refresh(key);
++    return true;
++}
++
+ void Settings::apply_env_overrides(const char *(*env)(const char *name)) {
+     if (env == nullptr) return;
+     for (std::size_t i = 0; i < kKeyCount; ++i) {
+@@ -333,7 +345,7 @@ bool Settings::restart_pending(Key key) const noexcept {
+     if (key == Key::Count) return false;
+     // The pending choice is the stored one (what the next start will read); an override would apply again anyway.
+     const auto i = static_cast<std::size_t>(key);
+-    const std::uint8_t pending = overridden_[i] ? override_[i] : (unavailable_[i] != nullptr ? kTable[i].default_index : stored_[i]);
++    const std::uint8_t pending = overridden_[i] ? override_[i] : (unavailable_[i] != nullptr ? default_[i] : stored_[i]);
+     return restart_for_change(key, started_[i], pending);
+ }
+ 
+@@ -383,7 +395,7 @@ bool Settings::load_text(std::string_view text) {
+         lines_.clear();
+         in_file_.fill(false);
+         std::array<std::uint8_t, kKeyCount> values = stored_;
+-        for (std::size_t i = 0; i < kKeyCount; ++i) values[i] = kTable[i].default_index;
++        for (std::size_t i = 0; i < kKeyCount; ++i) values[i] = default_[i];
+         std::size_t at = 0;
+         while (at <= text.size()) {
+             std::size_t end = text.find('\n', at);
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index 11ba8f8..bff709d 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -141,6 +141,11 @@ public:
+     // Steps through the allowed values, skipping none, wrapping round; returns the new effective index.
+     std::uint8_t step(Key key, int direction);
+     void reset_to_defaults();
++    // A platform's own default for a key (the Vita build: perf.threaded_renderer=split), set before init(): what the
++    // program runs with while settings.txt does not choose, and what reset_to_defaults() goes back to. The table's
++    // default (KeyInfo::default_index) stays the framework's. False for a value that is not allowed.
++    bool set_platform_default(Key key, std::string_view value);
++    [[nodiscard]] std::uint8_t default_index(Key key) const noexcept { return default_[static_cast<std::size_t>(key)]; }
+ 
+     // ---- overrides and availability ----------------------------------------------------------------------------
+     // Developer overrides from the environment: <PREFIX>_GFX_TEXTURE_FILTER=original. Bad values are reported once on
+@@ -191,6 +196,7 @@ private:
+     std::array<std::uint8_t, kKeyCount> stored_{};
+     std::array<std::uint8_t, kKeyCount> override_{};
+     std::array<std::uint8_t, kKeyCount> started_{};
++    std::array<std::uint8_t, kKeyCount> default_{};   // the table's, or the platform's (set_platform_default)
+     std::array<const char *, kKeyCount> unavailable_{};
+     std::array<bool, kKeyCount> overridden_{};
+     std::array<bool, kKeyCount> in_file_{};
+diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
+index 0744241..e29ae3b 100644
+--- a/tests/port_settings_tests.cpp
++++ b/tests/port_settings_tests.cpp
+@@ -241,6 +241,25 @@ int main() {
+             check(std::strlen(info(static_cast<Key>(i)).description) <= 46u, info(static_cast<Key>(i)).name);
+     }
+ 
++    // A platform's own default (the Vita build: perf.threaded_renderer=split): the run's value while the file does not
++    // choose, what is_default() and reset_to_defaults() mean, and a file's choice still wins.
++    {
++        Settings p;
++        check(p.set_platform_default(Key::PerfThreadedRenderer, "split") && !p.set_platform_default(Key::PerfThreadedRenderer, "sideways"),
++              "a platform default must be an allowed value");
++        p.set_unavailable(Key::PerfThreadedRenderer, nullptr);
++        check(std::strcmp(p.value(Key::PerfThreadedRenderer), "split") == 0 && p.is_default(Key::PerfThreadedRenderer) &&
++                  p.default_index(Key::PerfThreadedRenderer) == 2u && info(Key::PerfThreadedRenderer).default_index == 0u,
++              "the platform default is the value and the default; the table keeps the framework's");
++        check(p.load_text("perf.frame_cap=30\n") && std::strcmp(p.value(Key::PerfThreadedRenderer), "split") == 0,
++              "a file without the key keeps the platform default");
++        check(p.load_text("perf.threaded_renderer=on\n") && std::strcmp(p.value(Key::PerfThreadedRenderer), "on") == 0 &&
++                  !p.is_default(Key::PerfThreadedRenderer),
++              "a file's choice wins over the platform default");
++        p.reset_to_defaults();
++        check(std::strcmp(p.value(Key::PerfThreadedRenderer), "split") == 0, "reset goes back to the platform default");
++    }
++
+     // The HD pack policy: what "Automatic" picks and the budgets of the modes (host/gpu/hd_texture_pack.hpp, header-only part).
+     {
+         using namespace portablekit::gpu;

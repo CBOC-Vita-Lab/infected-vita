@@ -1,0 +1,709 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 04:30:09 +0000
+Subject: [PATCH] split renderer: frame skipping, so the game and its audio
+ keep their pace when drawing falls behind
+
+The GL thread measures how far behind the walker it is (a moving average of the delay between a job's end and the GL thread
+reaching it). Past 14 ms the guest is let run ahead instead of waiting for the drawing; past 28 ms a frame is left undrawn (at most
+two in a row, for at most 120 ms), so the game's own clock and the audio it mixes stay on time. Back under 5 ms it waits for every
+frame again. A skipped frame sends no list, draw, read-back or present to the renderer; the picture holds for a frame.
+
+New setting perf.frame_skip (Auto / Off, Performance page, no restart). <PREFIX>_FRAME_SKIP=off|auto|always and the
+FRAME_SKIP_*_US tuning variables are for tests. Early sync turns it off (no markers to measure by).
+
+Known cost while running ahead: a texture the guest rewrites may show a frame early, and block-transfer read-backs of a skipped
+frame are dropped.
+
+Verified: portablekit_split_renderer_tests (a fake renderer with a chosen GL cost; four scenarios) and the settings tests pass; on
+the desktop with an artificially slow GL thread (45 ms) the game holds 30 fps instead of 14 with about 40% of frames left undrawn
+and no visible corruption; the recorded-mission replay gives identical results with frame skipping on and off (in both it no
+longer reaches the expected outcome recorded on 10 Oct, which predates this change and is not explained yet).
+Not verified: on the PS Vita.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 073366c..898674b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -362,6 +362,24 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_port_settings_tests COMMAND portablekit_port_settings_tests)
+ endif()
+ 
++# The split renderer's frame skipping (host/gpu/split_renderer.hpp): a game waiting for every frame, one let run ahead of a slow
++# GL thread, what a skipped frame sends to the renderer. A renderer that draws nothing; the host's threads.
++if(PSPRECOMP_BUILD_TESTS)
++    find_package(Threads REQUIRED)
++    add_executable(portablekit_split_renderer_tests
++        "${PORTABLEKIT_ROOT}/tests/split_renderer_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/ge_worker.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/split_renderer.cpp"
++        "${PORTABLEKIT_ROOT}/host/profile.cpp"
++        "${PORTABLEKIT_ROOT}/host/settings/port_settings.cpp"
++        "${PORTABLEKIT_ROOT}/tests/test_profile.cpp")
++    target_compile_features(portablekit_split_renderer_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_split_renderer_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/include")
++    target_link_libraries(portablekit_split_renderer_tests PRIVATE psprecomp_core Threads::Threads)
++    set_target_properties(portablekit_split_renderer_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_split_renderer_tests COMMAND portablekit_split_renderer_tests)
++endif()
++
+ # The mip chains of the world textures (host/gpu/mip_chain.hpp): sizes, alpha-weighted colour, kept coverage.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_mip_chain_tests
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 26eeb58..340143c 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -6,10 +6,12 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <string>
++#include <thread>
+ #include <utility>
+ 
+ namespace portablekit::gpu {
+@@ -69,9 +71,55 @@ bool ge_split_early_sync_enabled() {
+     return text == "1" || text == "on" || text == "true" || text == "yes";
+ }
+ 
++namespace {
++// Microseconds on the platform's monotonic clock (the same one the kernel uses).
++std::uint64_t clock_us() {
++    const GeWorkerPlatform &platform = ge_worker_platform();
++    if (platform.monotonic_us != nullptr) return platform.monotonic_us();
++    return static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++// How far behind the walker the GL thread is, smoothed over the markers it reaches (about six a frame), decides what happens:
++//  - above kCatchupEnterUs the guest is let run ahead (GE jobs complete at the walker): with the GL thread the slower side a
++//    frame then costs the guest what its own code needs, not what the drawing needs;
++//  - below kCatchupLeaveUs it waits for the drawing again (the exact behaviour, no texture is ever read after the guest rewrote it);
++//  - while running ahead and more than kSkipLagUs behind, the frame about to begin is not drawn (at most kMaxSkipStreak in a row).
++// The numbers are for a 30 fps game: a healthy frame on the Vita leaves the guest waiting about 10 ms for the last draw.
++// <PREFIX>_FRAME_SKIP_ENTER_US, _LEAVE_US, _LAG_US and _STREAK change them for measuring.
++struct SkipTuning {
++    std::int32_t enter_us;
++    std::int32_t leave_us;
++    std::int32_t skip_us;
++    std::uint32_t streak;
++};
++const SkipTuning &skip_tuning() {
++    static const SkipTuning tuning{static_cast<std::int32_t>(env_count("FRAME_SKIP_ENTER_US", 14000u, 1000u, 500000u)),
++                                   static_cast<std::int32_t>(env_count("FRAME_SKIP_LEAVE_US", 5000u, 0u, 500000u)),
++                                   static_cast<std::int32_t>(env_count("FRAME_SKIP_LAG_US", 28000u, 1000u, 1000000u)),
++                                   env_count("FRAME_SKIP_STREAK", 2u, 0u, 8u)};
++    return tuning;
++}
++// A skipped frame whose present never comes (a list run with no flip after it) is drawn again after this long.
++constexpr std::uint64_t kSkipHoldLimitUs = 120000u;
++} // namespace
++
++FrameSkipMode frame_skip_mode() {
++    const char *value = portablekit::env("FRAME_SKIP");
++    if (value != nullptr && *value != '\0') {
++        std::string text(value);
++        for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        if (text == "0" || text == "off" || text == "false" || text == "no") return FrameSkipMode::Off;
++        if (text == "always") return FrameSkipMode::Always;
++        return FrameSkipMode::Auto;
++    }
++    return port::frame_skip() ? FrameSkipMode::Auto : FrameSkipMode::Off;
++}
++
+ SplitRenderer::SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots)
+     : inner_(std::move(inner)), queue_(16384u), slots_(env_count("GE_SPLIT_SLOTS", std::max<std::uint32_t>(draw_slots, 64u), 64u, 8192u)),
+-      presents_ahead_(env_count("GE_SPLIT_PRESENTS_AHEAD", kPresentsAhead, 1u, 4u)), early_sync_(ge_split_early_sync_enabled()) {
++      presents_ahead_(env_count("GE_SPLIT_PRESENTS_AHEAD", kPresentsAhead, 1u, 4u)), early_sync_(ge_split_early_sync_enabled()),
++      slow_gl_us_(env_count("GE_SPLIT_SLOW_PRESENT_US", 0u, 0u, 500000u)) {
+     g_instance = this;
+ }
+ 
+@@ -121,9 +169,7 @@ struct ThreadArgs {
+ 
+ void forward_completion(void *context, std::uint64_t completed) {
+     auto *args = static_cast<ThreadArgs *>(context);
+-    GeWorker *walker = args->walker;
+-    // Published when the GL thread reaches this point of its queue: everything the job queued has been drawn by then.
+-    args->self->queue().post([walker, completed] { walker->mark_completed(completed); });
++    args->self->forward_job_done(*args->walker, completed);
+ }
+ 
+ void walker_main(void *pointer) {
+@@ -186,6 +232,12 @@ bool SplitRenderer::run(GeWorker &walker, void (*guest)(void *), void *arg, int
+     queue_.run_loop();
+     platform.thread_join(guest_thread);
+     platform.thread_join(walker_thread);
++    {
++        const FrameSkipStats stats = frame_skip_stats();
++        std::cerr << "[split] frame skipping: " << stats.skipped_frames << " frame(s) left undrawn, " << stats.catchup_frames
++                  << " frame(s) run ahead of the GL thread, last lag " << stats.lag_us / 1000.0 << " ms; "
++                  << presents_posted_ << " present(s) queued" << std::endl;
++    }
+     walker.set_active(false);
+     walker.set_completion_forwarder(nullptr, nullptr);
+     queue_.set_active(false);
+@@ -194,6 +246,72 @@ bool SplitRenderer::run(GeWorker &walker, void (*guest)(void *), void *arg, int
+     return true;
+ }
+ 
++// ---- frame skipping -----------------------------------------------------------------------------------------------
++
++void SplitRenderer::forward_job_done(GeWorker &walker, std::uint64_t completed) {
++    const std::uint64_t stamp = clock_us();
++    if (catchup_) {
++        // The guest is let run ahead: the job counts as completed now, and the GL thread only measures how far behind it is.
++        // The interrupts the job raised keep their place in the GL thread's queue (raise_ge_interrupt), so they stay in order.
++        walker.mark_completed(completed);
++        queue_.post([this, stamp] { note_lag(stamp); });
++        return;
++    }
++    // Published when the GL thread reaches this point of its queue: everything the job queued has been drawn by then.
++    queue_.post([this, &walker, completed, stamp] {
++        note_lag(stamp);
++        walker.mark_completed(completed);
++    });
++}
++
++void SplitRenderer::note_lag(std::uint64_t posted_us) {
++    const std::uint64_t now = clock_us();
++    const std::uint64_t behind = now > posted_us ? std::min<std::uint64_t>(now - posted_us, 1000000u) : 0u;
++    const std::int32_t old = lag_us_.load(std::memory_order_relaxed);
++    lag_us_.store((old * 3 + static_cast<std::int32_t>(behind)) / 4, std::memory_order_relaxed);
++}
++
++void SplitRenderer::start_frame() {
++    frame_open_ = true;
++    frame_started_us_ = clock_us();
++    skip_frame_ = false;
++    // Early sync (a developer switch) already lets the guest run ahead, with no markers to measure by: nothing to decide.
++    const FrameSkipMode mode = early_sync_ ? FrameSkipMode::Off : frame_skip_mode();
++    const SkipTuning &tuning = skip_tuning();
++    const std::int32_t lag = lag_us_.load(std::memory_order_relaxed);
++    switch (mode) {
++    case FrameSkipMode::Off: catchup_ = false; break;
++    case FrameSkipMode::Always: catchup_ = true; break;
++    case FrameSkipMode::Auto:
++        if (!catchup_ && lag > tuning.enter_us) catchup_ = true;
++        else if (catchup_ && lag < tuning.leave_us) catchup_ = false;
++        break;
++    }
++    catchup_visible_.store(catchup_, std::memory_order_relaxed);
++    if (catchup_) frames_catchup_.fetch_add(1u, std::memory_order_relaxed);
++    skip_frame_ = catchup_ && lag > tuning.skip_us && skip_streak_ < tuning.streak;
++}
++
++void SplitRenderer::end_frame(bool skipped) {
++    frame_open_ = false;
++    skip_frame_ = false;
++    if (skipped) {
++        ++skip_streak_;
++        frames_skipped_.fetch_add(1u, std::memory_order_relaxed);
++    } else {
++        skip_streak_ = 0u;
++    }
++}
++
++FrameSkipStats SplitRenderer::frame_skip_stats() const noexcept {
++    FrameSkipStats stats;
++    stats.skipped_frames = frames_skipped_.load(std::memory_order_relaxed);
++    stats.catchup_frames = frames_catchup_.load(std::memory_order_relaxed);
++    stats.lag_us = lag_us_.load(std::memory_order_relaxed);
++    stats.catchup = catchup_visible_.load(std::memory_order_relaxed);
++    return stats;
++}
++
+ // ---- Renderer ----------------------------------------------------------------------------------------------------
+ 
+ bool SplitRenderer::initialize(const RendererConfig &config, std::string &error) {
+@@ -207,6 +325,14 @@ void SplitRenderer::shutdown() {
+ }
+ 
+ void SplitRenderer::begin_display_list() {
++    if (forwarding() && t_walker && !t_gl) {
++        if (!frame_open_) start_frame();
++        if (skip_frame_) {
++            // Nothing of this frame reaches the GL thread. A present that never comes must not freeze the picture.
++            if (clock_us() - frame_started_us_ > kSkipHoldLimitUs) skip_frame_ = false;
++            else return;
++        }
++    }
+     post([this] { inner_->begin_display_list(); });
+ }
+ 
+@@ -219,6 +345,7 @@ void SplitRenderer::submit(const DrawCall &draw, const GuestMemory &memory) {
+         warn_foreign_thread("submit");
+         return;
+     }
++    if (skip_frame_) return;
+     DrawSlot &slot = claim_slot(memory);
+     slot.call = draw;   // the vertex vector keeps its capacity: after a few frames this copies, it does not allocate
+     post_draw();
+@@ -233,6 +360,7 @@ void SplitRenderer::submit_taking(DrawCall &draw, const GuestMemory &memory) {
+         warn_foreign_thread("submit");
+         return;
+     }
++    if (skip_frame_) return;   // frame skipping: the draw is dropped before any work is spent on it
+     // The vertices and indices change hands instead of being copied (most of a draw's bytes; on the Vita the copy was
+     // a measurable part of the walker's frame): the slot takes the draw's, the draw gets the slot's old ones (emptied,
+     // with their capacity) for the walker's next draw. The rest of the call is copied.
+@@ -284,11 +412,14 @@ void SplitRenderer::run_draw(std::uint64_t sequence) {
+ }
+ 
+ void SplitRenderer::write_back_frame(GuestMemory &memory) {
++    if (forwarding() && t_walker && skip_frame_) return;
+     GuestMemory *target = &memory;
+     post([this, target] { inner_->write_back_frame(*target); });
+ }
+ 
+ void SplitRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &memory) {
++    // A frame that is not drawn has nothing to read back, and waiting for the GL thread is what skipping avoids.
++    if (forwarding() && t_walker && skip_frame_) return;
+     // Waits: the walker moves guest memory right after this (a block transfer), and every draw queued before it must
+     // have read its textures first.
+     call([&] { inner_->read_back_framebuffer(source, memory); });
+@@ -301,6 +432,7 @@ void SplitRenderer::upload_frame(std::uint32_t display_address, const std::uint8
+         return;
+     }
+     if (pixels == nullptr || width == 0u || height == 0u || stride < width) return;
++    if (t_walker && skip_frame_) return;
+     // The caller's pixels are only valid during the call: copied.
+     const std::size_t bytes = static_cast<std::size_t>(stride) * height * 4u;
+     post([this, display_address, width, height, stride, copy = std::vector<std::uint8_t>(pixels, pixels + bytes)] {
+@@ -314,6 +446,11 @@ bool SplitRenderer::present(std::uint32_t display_address, std::optional<std::ch
+         warn_foreign_thread("present");
+         return false;
+     }
++    if (skip_frame_) {
++        // Frame skipping: no draw of this frame was queued, and showing it would show an empty picture. The display keeps the last one.
++        end_frame(true);
++        return true;
++    }
+     const std::uint64_t mine = ++presents_posted_;
+     if (mine - presents_done_.load(std::memory_order_acquire) > presents_ahead_ + 1u) {
+         const phase::Scope wait(phase::SplitWait);
+@@ -325,8 +462,11 @@ bool SplitRenderer::present(std::uint32_t display_address, std::optional<std::ch
+             const phase::Scope present_scope(phase::Present);
+             (void)inner_->present(display_address, moment);
+         }
++        // A test aid: a GL thread that is slower than the game, to see what the guest does about it.
++        if (slow_gl_us_ != 0u) std::this_thread::sleep_for(std::chrono::microseconds(slow_gl_us_));
+         presents_done_.fetch_add(1u, std::memory_order_release);
+     });
++    end_frame(false);
+     return true;
+ }
+ 
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+index ae4dfea..dd7d3ad 100644
+--- a/host/gpu/split_renderer.hpp
++++ b/host/gpu/split_renderer.hpp
+@@ -42,6 +42,21 @@ namespace portablekit::gpu {
+ // for the drawing (read_back_framebuffer).
+ [[nodiscard]] bool ge_split_early_sync_enabled();
+ 
++// <PREFIX>_FRAME_SKIP: off, auto, always; without it the port setting perf.frame_skip (auto or off). Auto: while the GL thread
++// is more than a few milliseconds behind the walker, GE jobs count as completed once the walker is through them (the guest
++// does not wait for the drawing, so it keeps its pace and so does its sound), and when the GL thread is more than about a frame
++// behind, the next frame's draws and present are left out (the picture holds for a frame). Always: the same without the wait
++// for the GL thread to fall behind (a test aid). Off: every frame is drawn and the guest waits for each, as before.
++enum class FrameSkipMode : std::uint8_t { Off, Auto, Always };
++[[nodiscard]] FrameSkipMode frame_skip_mode();
++
++struct FrameSkipStats {
++    std::uint64_t skipped_frames{};   // frames whose draws and present were left out
++    std::uint64_t catchup_frames{};   // frames run with early completion (drawn or not)
++    std::int32_t lag_us{};            // how far behind the walker the GL thread runs (smoothed)
++    bool catchup{};                   // the guest is not waiting for the GL thread now
++};
++
+ class SplitRenderer final : public Renderer {
+ public:
+     explicit SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots = 1024u);
+@@ -54,6 +69,11 @@ public:
+     [[nodiscard]] bool forwarding() const noexcept { return forwarding_.load(std::memory_order_acquire); }
+     // ge_split_early_sync_enabled() when the renderer was made: completion and interrupts at the walker.
+     [[nodiscard]] bool early_sync() const noexcept { return early_sync_; }
++    // Frame skipping (see FrameSkipMode); the counters can be read from any thread.
++    [[nodiscard]] FrameSkipStats frame_skip_stats() const noexcept;
++    // The walker's loop calls this after every GE job it has walked (set_completion_forwarder): the job counts as completed when
++    // the GL thread reaches this point of its queue, or at once while the guest is let run ahead of it (frame skipping).
++    void forward_job_done(GeWorker &walker, std::uint64_t completed);
+ 
+     // Runs `guest(arg)` on a new thread (guest_core), `walker` (the GE worker's loop) on another (walker_core) and the
+     // GL queue on the calling thread, which owns the GL context. Returns when the guest has returned and both queues are
+@@ -109,6 +129,11 @@ private:
+     // Runs `fn` on the GL thread and waits for it (on the calling thread before start()).
+     template <typename Fn> void call(Fn &&fn);
+     void run_draw(std::uint64_t sequence);
++    // Frame skipping. All of it runs on the walker except note_lag(), which the GL thread runs.
++    void start_frame();                     // the first list after a present: picks the mode and whether this frame is drawn
++    void end_frame(bool skipped);
++    void note_lag(std::uint64_t posted_us); // GL thread: a marker the walker posted at `posted_us` has been reached
++
+     DrawSlot &claim_slot(const GuestMemory &memory);  // the slot of the next draw, once the GL thread is done with it
+     void post_draw();                                 // queues the draw in that slot
+ 
+@@ -123,6 +148,17 @@ private:
+     std::atomic<bool> forwarding_{false};
+     std::uint32_t presents_ahead_{1u};
+     bool early_sync_{false};
++    // Frame skipping.
++    std::atomic<std::int32_t> lag_us_{0};          // GL thread writes (smoothed), walker reads
++    bool catchup_{false};                          // walker only: GE jobs complete at the walker
++    bool frame_open_{false};                       // walker only: a frame has begun and its present has not come
++    bool skip_frame_{false};                       // walker only: this frame's draws and present are left out
++    std::uint32_t skip_streak_{0u};                // walker only: undrawn frames in a row
++    std::uint64_t frame_started_us_{0u};           // walker only
++    std::atomic<std::uint64_t> frames_skipped_{0u};
++    std::atomic<std::uint64_t> frames_catchup_{0u};
++    std::atomic<bool> catchup_visible_{false};
++    std::uint32_t slow_gl_us_{0u};                 // <PREFIX>_GE_SPLIT_SLOW_PRESENT_US: a test aid, the GL thread sleeps this long in each present
+ };
+ 
+ // The SplitRenderer in front of `renderer`, or null when there is none.
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 052da7d..5a4e021 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -49,6 +49,11 @@ const KeyInfo kTable[kKeyCount] = {
+     {Key::PerfFrameCap, "perf.frame_cap", Page::Performance, "Frame limit",
+      "Most frames shown per second. 30 saves power.", 3, 0,
+      {"60", "30", "off"}, {"60 fps", "30 fps", "Off"}, {N, N, N}, 0, false},
++    // Frame skip: with the split renderer a frame the GL thread cannot take in time is not drawn (the picture holds for a frame)
++    // and the game goes on at its own pace; without it the game waits for every frame and runs slower when drawing is slow.
++    {Key::PerfFrameSkip, "perf.frame_skip", Page::Performance, "Frame skip",
++     "When drawing lags, skip frames, not the game.", 2, 0,
++     {"auto", "off"}, {"Auto", "Off"}, {N, N}, 0, false},
+     {Key::PerfShowFps, "perf.show_fps", Page::Performance, "Show FPS",
+      "Frames per second, frame time and draw count.", 2, 0,
+      {"off", "on"}, {"Off", "On"}, {N, L}, 0, false},
+@@ -75,6 +80,14 @@ const KeyInfo kTable[kKeyCount] = {
+     {Key::PerfViewDistance, "perf.view_distance", Page::Performance, "View distance",
+      "Fog and clip distance. GPU cost not measured.", 3, 0,
+      {"100", "150", "200"}, {"100%", "150%", "200%"}, {N, M, M}, 0, false},
++    // Controls. The game only reads PSP buttons: the platform's pad code moves the Vita's buttons onto them (the left stick is
++    // the PSP's analog nub in both layouts). Nothing here costs frame time.
++    {Key::ControlsLayout, "controls.layout", Page::Controls, "Button layout",
++     "Modern: R1 fires, L1 locks on. Classic: PSP.", 2, 0,
++     {"modern", "classic"}, {"Modern", "Classic"}, {N, N}, 0, false},
++    {Key::ControlsAutoFire, "controls.auto_fire", Page::Controls, "Hold to fire",
++     "Hold R1 to keep firing. Modern layout only.", 2, 0,
++     {"on", "off"}, {"On", "Off"}, {N, N}, 0, false},
+ };
+ 
+ // What the build or the device cannot do yet; set_unavailable() changes this at run time.
+@@ -170,7 +183,14 @@ const char *cost_name(Cost cost) noexcept {
+     return "";
+ }
+ 
+-const char *page_name(Page page) noexcept { return page == Page::Graphics ? "Graphics" : "Performance"; }
++const char *page_name(Page page) noexcept {
++    switch (page) {
++    case Page::Graphics: return "Graphics";
++    case Page::Performance: return "Performance";
++    case Page::Controls: return "Controls";
++    }
++    return "";
++}
+ 
+ std::vector<Key> keys_on(Page page) {
+     std::vector<Key> keys;
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index bff709d..4c51922 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -26,8 +26,8 @@
+ 
+ namespace portablekit::port {
+ 
+-enum class Page : std::uint8_t { Graphics, Performance };
+-inline constexpr std::size_t kPageCount = 2;
++enum class Page : std::uint8_t { Graphics, Performance, Controls };
++inline constexpr std::size_t kPageCount = 3;
+ 
+ // What an option costs, as an estimate for the Vita (no GPU timing exists here, see docs/GRAPHICS_OPTIONS.md).
+ enum class Cost : std::uint8_t { None, Low, Medium, High };
+@@ -42,12 +42,15 @@ enum class Key : std::uint8_t {
+     GfxMovieFilter,
+     GfxHdMovies,
+     PerfFrameCap,
++    PerfFrameSkip,
+     PerfShowFps,
+     PerfResolution,
+     PerfThreadedRenderer,
+     PerfCpuClock,
+     PerfEnemyDensity,
+     PerfViewDistance,
++    ControlsLayout,
++    ControlsAutoFire,
+     Count
+ };
+ inline constexpr std::size_t kKeyCount = static_cast<std::size_t>(Key::Count);
+@@ -60,6 +63,7 @@ enum class TextureFilter : std::uint8_t { Smooth, Original };
+ enum class Antialiasing : std::uint8_t { Off, Fxaa, Msaa2, Msaa4 };
+ enum class MovieFilter : std::uint8_t { Sharp, Bilinear };
+ enum class FrameCap : std::uint8_t { Fps60, Fps30, Off };
++enum class ControlLayout : std::uint8_t { Modern, Classic };
+ 
+ struct KeyInfo {
+     Key key;
+@@ -231,6 +235,10 @@ private:
+ [[nodiscard]] inline FrameCap frame_cap() { return static_cast<FrameCap>(settings().index(Key::PerfFrameCap)); }
+ // Microseconds between two game flips the cap allows: 16683 (60), 33366 (30), 0 (off).
+ [[nodiscard]] std::uint64_t frame_cap_period_us() noexcept;
++// perf.frame_skip: Auto lets the renderer leave a frame undrawn when the GL thread has fallen behind, so the game (and its sound)
++// keeps its pace instead of waiting for the drawing; Off waits for every frame. The developer override <PREFIX>_FRAME_SKIP
++// (off, auto, always) is read by gpu/split_renderer.cpp. Only the split renderer has anything to skip.
++[[nodiscard]] inline bool frame_skip() { return settings().index(Key::PerfFrameSkip) == 0u; }
+ [[nodiscard]] inline bool show_fps() { return settings().index(Key::PerfShowFps) != 0u; }
+ // The display drawn at 1.5 times the PSP's 480x272 (720x408, enlarged to the screen) instead of twice. Read when the
+ // renderer starts: a change shows as "restart needed".
+@@ -238,6 +246,11 @@ private:
+ // On or split: the renderer runs beside the game. Split: two renderer threads (lists and vertices, then GL).
+ [[nodiscard]] inline bool threaded_renderer() { return settings().index(Key::PerfThreadedRenderer) != 1u; }
+ [[nodiscard]] inline bool split_renderer() { return settings().index(Key::PerfThreadedRenderer) == 2u; }
++// controls.layout: Modern puts firing on the right shoulder button and lock-on on the left one (the shooter convention); Classic
++// is the PSP's own layout, button for button. The platform's pad code applies it (the game only ever sees PSP buttons).
++[[nodiscard]] inline ControlLayout control_layout() { return static_cast<ControlLayout>(settings().index(Key::ControlsLayout)); }
++// controls.auto_fire (Modern layout): holding the fire button keeps shooting the pistol, as the PSP original needed a tap per shot.
++[[nodiscard]] inline bool auto_fire() { return settings().index(Key::ControlsAutoFire) == 0u; }
+ [[nodiscard]] std::uint32_t cpu_clock_mhz() noexcept;       // 444 or 500
+ [[nodiscard]] std::uint32_t enemy_density_percent() noexcept;  // 100, 125, 150, 200
+ [[nodiscard]] std::uint32_t view_distance_percent() noexcept;  // 100, 150, 200
+diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
+index e29ae3b..98c4f3b 100644
+--- a/tests/port_settings_tests.cpp
++++ b/tests/port_settings_tests.cpp
+@@ -60,7 +60,8 @@ int main() {
+         check(value_index(Key::GfxAntialiasing, "FXAA") == 1 && value_index(Key::GfxAntialiasing, "msaa8") == -1,
+               "values are found case-insensitively and unknown ones are -1");
+         check(env_name(Key::GfxTextureFilter) == "GFX_TEXTURE_FILTER", "environment names");
+-        check(keys_on(Page::Graphics).size() + keys_on(Page::Performance).size() == kKeyCount, "every key is on a page");
++        check(keys_on(Page::Graphics).size() + keys_on(Page::Performance).size() + keys_on(Page::Controls).size() == kKeyCount,
++              "every key is on a page");
+         check(info(Key::GfxTextureFilter).default_index == 0 && info(Key::GfxMipmaps).default_index == 0,
+               "defaults are the first values");
+     }
+@@ -87,6 +88,15 @@ int main() {
+           "step wraps in both directions");
+     check(s.set("perf.show_fps", "on") && s.index(Key::PerfShowFps) == 1u && !s.set("perf.nothing", "on"), "set by key name");
+     check(s.dirty(), "changes make the settings dirty");
++    // Frame skip: on (Auto) by default, a row of the Performance page that costs nothing and needs no restart.
++    check(key_from_name("perf.frame_skip") == Key::PerfFrameSkip && info(Key::PerfFrameSkip).page == Page::Performance &&
++              info(Key::PerfFrameSkip).default_index == 0u && std::strcmp(info(Key::PerfFrameSkip).values[0], "auto") == 0,
++          "frame skip: perf.frame_skip, Performance page, Auto by default");
++    check(s.set("perf.frame_skip", "off") && s.index(Key::PerfFrameSkip) == 1u && !restart_for_change(Key::PerfFrameSkip, 0u, 1u) &&
++              info(Key::PerfFrameSkip).costs[0] == Cost::None && info(Key::PerfFrameSkip).costs[1] == Cost::None,
++          "frame skip: Off is a value, takes effect at once, costs nothing");
++    s.set("perf.frame_skip", "auto");
++    check(keys_on(Page::Performance).size() <= 8u, "the overlay shows at most eight rows on a page");
+ 
+     // Serialisation round trip and unknown lines.
+     s.reset_to_defaults();
+diff --git a/tests/split_renderer_tests.cpp b/tests/split_renderer_tests.cpp
+new file mode 100644
+index 0000000..e9816b2
+--- /dev/null
++++ b/tests/split_renderer_tests.cpp
+@@ -0,0 +1,193 @@
++// The split renderer's frame skipping (host/gpu/split_renderer.hpp), with a renderer that draws nothing and a GL thread whose
++// speed the test chooses: a game that waits for every frame, one that is let run ahead of a slow GL thread, and what is and is not
++// handed to the renderer. The threads are the host's own (std::thread through the GE worker's default platform).
++//
++// Exit status 0 when every check passes. Timing checks are loose (a busy machine must not fail them): they compare two runs of the
++// same scenario, not a run with a number.
++
++#include "gpu/ge_worker.hpp"
++#include "gpu/renderer.hpp"
++#include "gpu/split_renderer.hpp"
++#include "profile.hpp"
++
++#include <psprecomp/guest_memory.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++using namespace portablekit;
++using Clock = std::chrono::steady_clock;
++
++int g_failures = 0;
++void check(bool condition, const std::string &what) {
++    if (condition) return;
++    ++g_failures;
++    std::cout << "FAIL: " << what << "\n";
++}
++
++// What the renderer saw, written by the GL thread (the thread that calls run()).
++struct Seen {
++    std::uint64_t begins = 0;
++    std::uint64_t submits = 0;
++    std::uint64_t presents = 0;
++    std::uint64_t uploads = 0;
++    std::vector<std::uint64_t> drawn_frames;   // the frame number of each draw (DrawCall::matrix_version), once per frame
++};
++
++class FakeRenderer final : public gpu::Renderer {
++public:
++    FakeRenderer(Seen &seen, unsigned present_us) : seen_(seen), present_us_(present_us) {}
++    bool initialize(const gpu::RendererConfig &, std::string &) override { return true; }
++    void shutdown() override {}
++    bool available() const noexcept override { return true; }
++    void begin_display_list() override { ++seen_.begins; }
++    void submit(const gpu::DrawCall &call, const psprecomp::GuestMemory &) override {
++        ++seen_.submits;
++        if (seen_.drawn_frames.empty() || seen_.drawn_frames.back() != call.matrix_version) seen_.drawn_frames.push_back(call.matrix_version);
++    }
++    void write_back_frame(psprecomp::GuestMemory &) override {}
++    void read_back_framebuffer(std::uint32_t, psprecomp::GuestMemory &) override {}
++    void upload_frame(std::uint32_t, const std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t) override { ++seen_.uploads; }
++    bool present(std::uint32_t, std::optional<std::chrono::steady_clock::time_point>) override {
++        // The GL thread's cost of a frame: the drawing and the swap.
++        if (present_us_ != 0u) std::this_thread::sleep_for(std::chrono::microseconds(present_us_));
++        ++seen_.presents;
++        ++presented_;
++        return true;
++    }
++    bool capture_frame(const std::string &) override { return true; }
++    std::uint64_t frames_presented() const noexcept override { return presented_; }
++    std::uint64_t draws_submitted() const noexcept override { return seen_.submits; }
++
++private:
++    Seen &seen_;
++    unsigned present_us_;
++    std::uint64_t presented_ = 0;
++};
++
++struct Scenario {
++    const char *frame_skip;     // <PREFIX>_FRAME_SKIP
++    unsigned gl_frame_us;       // the GL thread's cost of one frame
++    unsigned logic_us = 20000;  // the guest's own work per frame
++    unsigned frames = 40;
++    unsigned draws = 20;
++};
++
++struct Outcome {
++    Seen seen;
++    double guest_ms = 0.0;
++    gpu::FrameSkipStats stats;
++    std::uint64_t flips = 0;
++};
++
++struct GuestArgs {
++    gpu::GeWorker *walker = nullptr;
++    gpu::SplitRenderer *split = nullptr;
++    psprecomp::GuestMemory *memory = nullptr;
++    const Scenario *scenario = nullptr;
++    Outcome *outcome = nullptr;
++};
++
++void guest_main(void *pointer) {
++    auto *args = static_cast<GuestArgs *>(pointer);
++    gpu::GeWorker &walker = *args->walker;
++    gpu::SplitRenderer &split = *args->split;
++    const Scenario &s = *args->scenario;
++    const auto start = Clock::now();
++    for (unsigned frame = 1; frame <= s.frames; ++frame) {
++        // One list: the draws of the frame, as a game's display list run would hand them over.
++        walker.post([&split, args, frame, &s] {
++            split.begin_display_list();
++            for (unsigned i = 0; i < s.draws; ++i) {
++                gpu::DrawCall call;
++                call.matrix_version = frame;
++                split.submit(call, *args->memory);
++            }
++        });
++        const std::uint64_t list = walker.posted();
++        // The flip.
++        walker.post([&split] { (void)split.present(0x04000000u); });
++        ++args->outcome->flips;
++        // sceGeDrawSync of the list, then the game's own work for the frame.
++        walker.wait_completed(list);
++        std::this_thread::sleep_for(std::chrono::microseconds(s.logic_us));
++    }
++    args->outcome->guest_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
++}
++
++Outcome run_scenario(const Scenario &scenario) {
++    ::setenv(portablekit::env_name("FRAME_SKIP").c_str(), scenario.frame_skip, 1);
++    Outcome outcome;
++    psprecomp::GuestMemory memory(32u * 1024u * 1024u);
++    gpu::GeWorker walker(256u);
++    auto fake = std::make_unique<FakeRenderer>(outcome.seen, scenario.gl_frame_us);
++    gpu::SplitRenderer split(std::move(fake), 64u);
++    GuestArgs args{&walker, &split, &memory, &scenario, &outcome};
++    const bool ran = split.run(walker, &guest_main, &args, -1, 256 * 1024, -1, 256 * 1024, -1);
++    check(ran, "the split renderer starts its threads");
++    outcome.stats = split.frame_skip_stats();
++    std::cout << "  frame_skip=" << scenario.frame_skip << " gl=" << scenario.gl_frame_us / 1000.0 << " ms/frame: guest " << outcome.guest_ms
++              << " ms for " << scenario.frames << " frames, presented " << outcome.seen.presents << ", skipped " << outcome.stats.skipped_frames
++              << ", catch-up frames " << outcome.stats.catchup_frames << ", lag " << outcome.stats.lag_us / 1000.0 << " ms\n";
++    return outcome;
++}
++
++} // namespace
++
++int main() {
++    // 1. A GL thread that keeps up: nothing is skipped, every frame is drawn, the guest is never let run ahead.
++    {
++        const Outcome o = run_scenario({"auto", 2000u});
++        check(o.stats.skipped_frames == 0u, "a fast GL thread: no frame is skipped");
++        check(o.seen.presents == 40u && o.seen.submits == 40u * 20u, "a fast GL thread: every frame is drawn and presented");
++        check(o.seen.begins == 40u, "a fast GL thread: every list reaches the renderer");
++        check(!o.stats.catchup, "a fast GL thread: the guest still waits for the drawing");
++    }
++
++    // 2. A GL thread that cannot keep up, frame skipping off: every frame is drawn and the guest is held to the GL thread's pace.
++    Outcome slow_off;
++    {
++        slow_off = run_scenario({"off", 45000u});
++        check(slow_off.stats.skipped_frames == 0u, "frame skipping off: no frame is skipped");
++        check(slow_off.seen.presents == 40u, "frame skipping off: every frame is presented");
++        check(slow_off.guest_ms > 40 * 45.0 * 0.85, "frame skipping off: the guest waits for the GL thread (it runs at its pace)");
++    }
++
++    // 3. The same GL thread with frame skipping auto: the guest keeps closer to its own pace, frames are left out, and what is left out
++    // never reaches the renderer; the picture is never more than a few frames stale.
++    {
++        const Outcome o = run_scenario({"auto", 45000u});
++        check(o.stats.skipped_frames > 0u, "a slow GL thread: frames are skipped");
++        check(o.stats.catchup_frames > 0u, "a slow GL thread: the guest is let run ahead");
++        check(o.seen.presents + o.stats.skipped_frames == 40u, "a slow GL thread: every frame is either presented or skipped");
++        check(o.seen.submits == o.seen.presents * 20u, "a slow GL thread: a skipped frame sends no draw to the renderer");
++        check(o.guest_ms < slow_off.guest_ms * 0.8, "a slow GL thread: the guest finishes sooner than with frame skipping off");
++        std::uint64_t largest_gap = 0;
++        for (std::size_t i = 1; i < o.seen.drawn_frames.size(); ++i)
++            largest_gap = std::max(largest_gap, o.seen.drawn_frames[i] - o.seen.drawn_frames[i - 1]);
++        check(largest_gap <= 3u, "a slow GL thread: no more than two frames in a row are skipped (largest step " +
++                                     std::to_string(largest_gap) + ")");
++        check(!o.seen.drawn_frames.empty() && o.seen.drawn_frames.front() == 1u, "a slow GL thread: the first frame is drawn");
++    }
++
++    // 4. 'always': the guest runs ahead from the start; a fast GL thread then still draws every frame.
++    {
++        const Outcome o = run_scenario({"always", 2000u});
++        check(o.stats.catchup_frames >= 39u, "always: the guest runs ahead of the GL thread");
++        check(o.stats.skipped_frames == 0u, "always with a fast GL thread: nothing is skipped");
++        check(o.seen.presents == 40u, "always with a fast GL thread: every frame is presented");
++    }
++
++    std::cout << (g_failures == 0 ? "all passed\n" : "FAILURES\n");
++    return g_failures == 0 ? 0 : 1;
++}

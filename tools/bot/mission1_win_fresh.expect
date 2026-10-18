@@ -1,0 +1,13 @@
+# expected outcome of mission1_win_fresh.pad on a blank memory stick (sourced by replay_check.sh; run with MS0=ms0.empty)
+FRAMES=13100
+COMPLETE_FLIP=12653
+SCORE=21500
+KILLS=39
+SHOTS=32
+SECONDS_=116
+HAZARD=1250
+MEDAL=1
+RESULTS_FLIP=12833
+SAVE_SCORE=21500
+SAVE_HAZARD=1250
+DEATHS=0

@@ -1,0 +1,256 @@
+diff --git a/src/interpreter.cpp b/src/interpreter.cpp
+index ae99b5b..f1a3b2d 100644
+--- a/src/interpreter.cpp
++++ b/src/interpreter.cpp
+@@ -10,12 +10,21 @@
+ #include <algorithm>
+ #include <bit>
+ #include <cmath>
++#include <csignal>
+ #include <cstdlib>
++#include <cstring>
++#include <fstream>
+ #include <iostream>
+ #include <limits>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
+ namespace psprecomp {
+ 
+ namespace {
+@@ -67,6 +76,211 @@ void load_watch_list(const char *text) {
+     g_watch.erase(std::unique(g_watch.begin(), g_watch.end()), g_watch.end());
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Differential-test snapshot capture (used by the lean recompiler's test harness; no effect unless LEAN_SNAP_DIR and
++// LEAN_SNAP_FUNCS are set).  At the n-th entry of each listed function the process forks.  The child re-executes that one
++// call on its own copy of the guest RAM, which it has made inaccessible: every page the call touches is copied out the
++// first time it is touched.  It writes <dir>/<entry>_<n>.snap (registers + touched pages) and exits; the parent carries on.
++//   LEAN_SNAP_FUNCS  text file, one function per line: "0xADDRESS occurrence[,occurrence...]"
++//   LEAN_SNAP_IMAGE  optional: the guest image (loaded at 0x08804000); pages identical to it are not stored
++//   LEAN_SNAP_LIMIT  instruction limit of one captured call (default 20000000)
++// Imports reached by the call are answered with v0 = v1 = 0.  VRAM and the scratchpad are not captured.
++// ---------------------------------------------------------------------------------------------------------------------
++namespace lean_snap {
++constexpr std::uint32_t kBase = 0x08800000u;
++constexpr std::uint32_t kWords = (32u * 1024u * 1024u) / 4u;
++constexpr std::uint32_t kSentinel = 0x08FFFFF0u;
++constexpr unsigned kMaxPages = 3000;
++constexpr std::size_t kPage = 4096;
++bool g_on = false;
++bool g_child = false;
++std::vector<std::uint8_t> g_target;
++std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> g_sched;
++std::unordered_map<std::uint32_t, std::uint32_t> g_count;
++std::string g_dir;
++std::vector<std::uint8_t> g_image;
++std::uint64_t g_limit = 20000000u;
++
++std::uint8_t *g_ram = nullptr;       // guest RAM host pointer (not page aligned)
++std::uint8_t *g_ap = nullptr;        // first page boundary inside it
++std::size_t g_phase = 0, g_npages = 0;
++std::uint8_t *g_pool = nullptr;
++std::uint32_t g_offs[kMaxPages];
++unsigned g_np = 0;
++
++struct Header {
++    char magic[8];
++    std::uint32_t entry, occurrence, ra, flags;
++    std::uint32_t gpr[32], hi, lo, fcr31, fpr[32], vfpu[128], ctrl[16];
++    std::uint32_t npages, page_bytes;
++    std::uint64_t instructions;
++};
++
++void init() {
++    const char *dir = std::getenv("LEAN_SNAP_DIR");
++    const char *funcs = std::getenv("LEAN_SNAP_FUNCS");
++    if (dir == nullptr || funcs == nullptr) return;
++    std::ifstream f(funcs);
++    std::string line;
++    while (std::getline(f, line)) {
++        char *end = nullptr;
++        const unsigned long long a = std::strtoull(line.c_str(), &end, 0);
++        if (end == line.c_str()) continue;
++        std::vector<std::uint32_t> occ;
++        const char *t = end;
++        while (*t != '\0') {
++            char *e2 = nullptr;
++            const unsigned long long v = std::strtoull(t, &e2, 10);
++            if (e2 == t) { ++t; continue; }
++            occ.push_back(static_cast<std::uint32_t>(v));
++            t = e2;
++        }
++        if (!occ.empty()) g_sched[static_cast<std::uint32_t>(a)] = occ;
++    }
++    if (g_sched.empty()) return;
++    g_dir = dir;
++    g_target.assign(kWords, 0u);
++    for (const auto &kv : g_sched) {
++        const std::uint32_t index = (kv.first - kBase) >> 2u;
++        if (index < kWords) g_target[index] = 1u;
++    }
++    if (const char *img = std::getenv("LEAN_SNAP_IMAGE")) {
++        std::ifstream in(img, std::ios::binary);
++        g_image.assign(std::istreambuf_iterator<char>(in), {});
++    }
++    if (const char *lim = std::getenv("LEAN_SNAP_LIMIT")) g_limit = std::strtoull(lim, nullptr, 0);
++    g_on = true;
++}
++
++void on_fault(int, siginfo_t *si, void *) {
++    const auto a = reinterpret_cast<std::uintptr_t>(si->si_addr);
++    const auto lo = reinterpret_cast<std::uintptr_t>(g_ap);
++    if (a < lo || a >= lo + g_npages * kPage || g_np >= kMaxPages) _exit(90);
++    const std::size_t k = (a - lo) / kPage;
++    std::uint8_t *page = g_ap + k * kPage;
++    mprotect(page, kPage, PROT_READ | PROT_WRITE);
++    std::memcpy(g_pool + static_cast<std::size_t>(g_np) * kPage, page, kPage);
++    g_offs[g_np++] = static_cast<std::uint32_t>(g_phase + k * kPage);
++}
++
++void noop_function(CorpusRuntime &, AllegrexContext &) {}
++
++void write_all(int fd, const void *p, std::size_t n) {
++    const char *c = static_cast<const char *>(p);
++    while (n != 0u) {
++        const ssize_t w = ::write(fd, c, n);
++        if (w <= 0) _exit(92);
++        c += w; n -= static_cast<std::size_t>(w);
++    }
++}
++
++[[noreturn]] void child(Runtime &rt, const AllegrexContext &ctx0, std::uint32_t entry, std::uint32_t occurrence) {
++    g_child = true;
++    alarm(180);
++    char path[512];
++    std::snprintf(path, sizeof path, "%s/%08X_%u.snap", g_dir.c_str(), entry, occurrence);
++    const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd < 0) _exit(93);
++    GuestMemory &mem = rt.memory();
++    g_ram = mem.raw_pointer(0x08000000u, 32u * 1024u * 1024u);
++    if (g_ram == nullptr) _exit(94);
++    g_ap = reinterpret_cast<std::uint8_t *>((reinterpret_cast<std::uintptr_t>(g_ram) + kPage - 1u) & ~(kPage - 1u));
++    g_phase = static_cast<std::size_t>(g_ap - g_ram);
++    g_npages = (32u * 1024u * 1024u - g_phase) / kPage;
++    g_pool = static_cast<std::uint8_t *>(mmap(nullptr, kMaxPages * kPage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    if (g_pool == MAP_FAILED) _exit(95);
++    static std::uint8_t altstack[65536];
++    stack_t ss{}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack;
++    sigaltstack(&ss, nullptr);
++    struct sigaction sa{};
++    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGSEGV, &sa, nullptr);
++    sigaction(SIGBUS, &sa, nullptr);
++
++    Header h{};
++    std::memcpy(h.magic, "LSNP1\0\0\0", 8);
++    h.entry = entry; h.occurrence = occurrence; h.ra = ctx0.gpr[31];
++    for (int i = 0; i < 32; ++i) { h.gpr[i] = ctx0.gpr[i]; h.fpr[i] = std::bit_cast<std::uint32_t>(ctx0.fpr[i]); }
++    h.hi = ctx0.hi; h.lo = ctx0.lo; h.fcr31 = ctx0.fcr31;
++    for (int i = 0; i < 128; ++i) h.vfpu[i] = std::bit_cast<std::uint32_t>(ctx0.vfpu[i]);
++    for (int i = 0; i < 16; ++i) h.ctrl[i] = ctx0.vfpu_ctrl[i];
++
++    AllegrexContext c = ctx0;
++    c.pc = entry;
++    c.gpr[31] = kSentinel;
++    rt.register_function(kSentinel, &noop_function, "snap-sentinel");
++    mprotect(g_ap, g_npages * kPage, PROT_NONE);
++    const std::uint64_t i0 = interpreter_stats().instructions;
++    std::uint32_t flags = 0;
++    unsigned dispatches = 0;
++    try {
++    for (;;) {
++        const InterpreterExit ex = interpret_allegrex(rt, c, 200000u);
++        if (interpreter_stats().instructions - i0 > g_limit || ++dispatches > 20000u) { flags |= 4u; break; }
++        if (ex == InterpreterExit::Budget) continue;
++        if (ex == InterpreterExit::Dispatch) {
++            if (c.pc == kSentinel) { flags |= 2u; break; }
++            flags |= 1u;                       // an import: answer v0 = v1 = 0 and return to the caller
++            c.gpr[2] = 0u; c.gpr[3] = 0u;
++            c.pc = c.gpr[31];
++            if (c.pc == kSentinel) { flags |= 2u; break; }
++            continue;
++        }
++        flags |= 8u;
++        break;
++    }
++    } catch (...) {
++        // the call faulted (typically because an import answered 0 where the game got a pointer): not a usable snapshot
++        ::unlink(path);
++        _exit(96);
++    }
++    mprotect(g_ap, g_npages * kPage, PROT_READ | PROT_WRITE);
++    h.flags = flags;
++    h.instructions = interpreter_stats().instructions - i0;
++    if (std::getenv("LEAN_SNAP_DEBUG") != nullptr) {
++        char msg[200];
++        const int n = std::snprintf(msg, sizeof msg, "[snap] %08X #%u flags=%u instructions=%llu pages=%u\n", entry, occurrence, flags,
++                                    static_cast<unsigned long long>(h.instructions), g_np);
++        if (n > 0) { const ssize_t r = ::write(2, msg, static_cast<std::size_t>(n)); (void)r; }
++    }
++    // drop the pages that still equal the guest image (code / constant data)
++    unsigned keep = 0;
++    for (unsigned i = 0; i < g_np; ++i) {
++        const std::uint32_t off = g_offs[i];
++        const std::uint32_t ga = 0x08000000u + off;
++        bool same = false;
++        if (!g_image.empty() && ga >= 0x08804000u && ga + kPage <= 0x08804000u + g_image.size())
++            same = std::memcmp(g_pool + static_cast<std::size_t>(i) * kPage, g_image.data() + (ga - 0x08804000u), kPage) == 0;
++        if (same) continue;
++        if (keep != i) {
++            std::memcpy(g_pool + static_cast<std::size_t>(keep) * kPage, g_pool + static_cast<std::size_t>(i) * kPage, kPage);
++            g_offs[keep] = off;
++        }
++        ++keep;
++    }
++    if ((flags & 4u) != 0u) { ::close(fd); ::unlink(path); _exit(0); }          // did not finish within the limit: unusable
++    h.npages = keep; h.page_bytes = static_cast<std::uint32_t>(kPage);
++    write_all(fd, &h, sizeof h);
++    for (unsigned i = 0; i < keep; ++i) {
++        write_all(fd, &g_offs[i], 4);
++        write_all(fd, g_pool + static_cast<std::size_t>(i) * kPage, kPage);
++    }
++    ::close(fd);
++    _exit(0);
++}
++
++inline void maybe_capture(Runtime &rt, const AllegrexContext &ctx, std::uint32_t pc) {
++    const std::uint32_t n = ++g_count[pc];
++    const auto it = g_sched.find(pc);
++    if (it == g_sched.end() || std::find(it->second.begin(), it->second.end(), n) == it->second.end()) return;
++    const pid_t pid = ::fork();
++    if (pid == 0) child(rt, ctx, pc, n);
++    if (pid > 0) { int st = 0; ::waitpid(pid, &st, 0); }
++}
++} // namespace lean_snap
++
+ void load_settings() {
+     if (g_settings_loaded) return;
+     g_settings_loaded = true;
+@@ -81,6 +295,7 @@ void load_settings() {
+             g_budget = static_cast<std::uint64_t>(value);
+     }
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_WATCH")) load_watch_list(text);
++    lean_snap::init();
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_WATCH_LIMIT")) {
+         char *end = nullptr;
+         const unsigned long long value = std::strtoull(text, &end, 0);
+@@ -963,6 +1178,9 @@ InterpreterExit interpret_allegrex(Runtime &rt, AllegrexContext &ctx,
+         }
+ 
+         ctx.pc = pc;
++        if (lean_snap::g_on && !lean_snap::g_child && (pc - lean_snap::kBase) < (lean_snap::kWords << 2u) &&
++            lean_snap::g_target[(pc - lean_snap::kBase) >> 2u])
++            lean_snap::maybe_capture(rt, ctx, pc);
+         if (!g_watch.empty() && std::binary_search(g_watch.begin(), g_watch.end(), pc))
+             report_watch(rt, ctx, pc);
+         const DecodedInstruction decoded = decode_allegrex(memory.aot_load32(pc));

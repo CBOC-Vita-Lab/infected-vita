@@ -1,0 +1,76 @@
+# Infected for the PS Vita: optional settings.
+#
+# To use this file: rename it to config.txt (in ux0:data/infected/) and take the # off the lines you want.
+# Lines that start with # are ignored. Everything below is OFF by default. You need none of it to play.
+# The file is read once, when the game starts. docs/history/release-candidate/HARDWARE-TEST.md shows how the test runs use it.
+
+# ---- Speed tests (docs/history/release-candidate/HARDWARE-TEST.md) --------------------------------------------------------------------------------
+# The bot plays mission 1 by itself, with the game as it is. The log gets a speed line every 10 seconds.
+#bench=play
+# Seconds the bot may play before the test ends by itself (it also ends when the mission is over). Default 420.
+#bench_seconds=420
+# Replays the recorded pictures in the dumps folder (graphics only). Stops after bench_flips pictures.
+#bench=ge_replay
+#bench_flips=300
+#bench_report=50
+# Runs the whole game and prints a table of where the time went, after bench_flips pictures.
+#bench=cpu
+#bench_flips=1800
+
+# ---- The bot, outside the tests --------------------------------------------------------------------------------------
+# Lets the bot press the buttons all the time (it plays missions 1 and 2; see docs/KNOWN-ISSUES.md). Your buttons then do nothing,
+# except the way out (START + SELECT + L + R).
+#bot=1
+
+# ---- One option for one run: the same names as the settings menu (docs/SETTINGS.md) ----------------------------------------
+# A line here decides for the whole run. The menu shows it and cannot change it. It is never saved to settings.txt.
+# Write nothing after the value on the same line (a comment there would become part of the value).
+# gfx.hd_textures: auto, off, 2x or 4x
+#gfx.hd_textures=off
+# gfx.texture_filter: smooth or original
+#gfx.texture_filter=original
+# gfx.mipmaps: on or off
+#gfx.mipmaps=off
+# gfx.antialiasing: off, fxaa, msaa2 or msaa4
+#gfx.antialiasing=fxaa
+# gfx.pixel_lighting: off or on
+#gfx.pixel_lighting=on
+# gfx.effects_scale: 1 or 2
+#gfx.effects_scale=2
+# perf.frame_cap: 60, 30 or off
+#perf.frame_cap=off
+# perf.show_fps: off or on
+#perf.show_fps=on
+# perf.threaded_renderer: on or off
+#perf.threaded_renderer=off
+# perf.frame_skip: auto or off. Auto: when the graphics side falls behind, some frames are not drawn so the game and its sound keep their pace.
+#perf.frame_skip=off
+# perf.cpu_clock: 444 or 500 (500 is the default on the Vita; the system must allow it, otherwise the game stays at 444)
+#perf.cpu_clock=444
+# perf.enemy_density: 100, 125, 150 or 200 (percent)
+#perf.enemy_density=200
+# perf.view_distance: 100, 150 or 200 (percent)
+#perf.view_distance=200
+
+# ---- Other ------------------------------------------------------------------------------------------------------------
+# The Vita's fourth CPU core belongs to the system. With a plugin that lets games use it (CapUnlocker) the game puts its helper
+# threads (sound output, movie decoding, the graphics library's clean-up) there. Without the plugin nothing changes. 0 = never.
+#core3=0
+# The sound output follows the speed the game produces sound at, so a slightly fast or slow game never makes a gap. 0 = fixed rate.
+#audio_follow=0
+# The HUD's small pixel-art pictures (button glyphs, icons) are drawn from a copy made twice as large by the MMPX filter, so they
+# are not blurred at 960x544. It costs a little once per picture, spread over frames (gl_ui_upscale_budget_us, default 1500, is what
+# one frame may spend; 0 = no limit). 0 = draw the original pictures.
+#gl_ui_upscale=0
+#gl_ui_upscale_budget_us=1500
+# Shader programs the game used in earlier runs are linked while the game is waiting (boot, lulls), so a mission's first seconds do not
+# stall on them. The list is shader_variants.txt in this folder. 0 = link each program when it is first drawn.
+#gl_prewarm=0
+# 3D draws leave out the vertex fields their shader does not read (24 or 36 bytes a vertex instead of 40: about 15 % fewer vertex bytes
+# in a mission). The picture is the same. On by default; 0 = write the whole vertex.
+#gl_compact_vertices=0
+# How many scenes a frame the GPU's render targets are created for (the game draws into some targets twice a frame). Default 4; 0 = the
+# library's own default of 1. If a version stutters or runs out of memory, 0 is the first thing to try.
+#gl_rt_scenes=4
+# Writes the log to the card after every line (slower). Use it if the game crashes and the last lines are missing.
+#log_sync=1

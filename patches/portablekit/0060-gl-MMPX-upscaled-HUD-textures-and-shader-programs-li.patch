@@ -1,0 +1,807 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 10:56:30 +0000
+Subject: [PATCH] gl: MMPX-upscaled HUD textures, and shader programs linked
+ ahead of their first draw from a recorded list
+
+HUD upscaling (ui_upscale, on): a small texture that only through-mode draws sample and that looks like pixel art (a palette
+texture, or at most 256 colours) is uploaded at twice its size, made by MMPX (host/gpu/mmpx.{hpp,cpp}, after McGuire and Gagiu,
+JCGT 2021, via Yakumo's MIT code; credit in docs/SOURCE_PROVENANCE.md). The guest's texture, size register and coordinates are
+unchanged. The pass is a CPU pass once per texture and is metered: ui_upscale_budget_us (1500) is what a frame may spend after the
+first pass, ui_upscale_max_us (3000) leaves a texture alone when the earlier passes predict a longer one; a texture over budget is
+drawn as the original and done at a later frame. Mip building skips these textures.
+
+Shader pre-link (prewarm, on): every program the renderer links is appended to <data>/shader_variants.txt (header
+"# portablekit-gl-variants 1"); a shipped <data>/shader_cache/variants.txt is read too. warm_up_step() links the listed programs one
+per call while the GL thread has nothing to draw (all at once during boot, later only after a 20 ms lull). variant_dir moves the
+folder; prewarm=0 reads and writes no list. A list is only a hint: a flag set that cannot be built is skipped.
+
+ge_replay --stats prints the ui2x counters. docs/GL_RENDERER.md describes both, and the decode paragraph of the previous commit.
+
+Verified on x86-64 (software GL): HUD frames of mission 1 with and without ui_upscale differ only in the HUD (icons and frames
+crisper, the minimap ring thinner); two bot runs of the same data folder: the first recorded 25 programs, the second linked all 25
+during boot and linked none at a draw. The MMPX unit test passes; framework tests 45 of 45.
+Not verified: the cost of an MMPX pass or of a link on the PS Vita (the budgets are guesses until measured there), whether the
+shipped shader cache and list match the build (the Oct 10 cache matches none of the 81 current variants and needs a console to
+regenerate).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c3de106..e706f85 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -380,6 +380,18 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_split_renderer_tests COMMAND portablekit_split_renderer_tests)
+ endif()
+ 
++# MMPX, the pixel-art magnifier for the game's small interface textures (host/gpu/mmpx.hpp): flat areas, single pixels, palette
++# and transparency kept; 1:1 edges shaped.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_mmpx_tests
++        "${PORTABLEKIT_ROOT}/tests/mmpx_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/mmpx.cpp")
++    target_compile_features(portablekit_mmpx_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_mmpx_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_mmpx_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_mmpx_tests COMMAND portablekit_mmpx_tests)
++endif()
++
+ # The mip chains of the world textures (host/gpu/mip_chain.hpp): sizes, alpha-weighted colour, kept coverage.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_mip_chain_tests
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index 796cc82..be2f0ac 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -175,6 +175,7 @@ set(PORTABLEKIT_GL_RENDERER_SOURCES
+     host/gpu/gl/gl_shaders.cpp
+     host/gpu/gl/gl_overlay.cpp
+     host/gpu/mip_chain.cpp
++    host/gpu/mmpx.cpp
+     host/gpu/gl/gl_png.cpp
+     host/gpu/gl/gl_hd_textures.cpp
+     host/gpu/gl/gl_hd_movie.cpp
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 83046a0..0d899cd 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -60,6 +60,24 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   gets a program without the test and without `discard`, which on a tile-based GPU holds up the depth test of what
+   lies behind. About 400 of a mission frame's 640 draws qualify; the pictures are identical (replays with and without
+   the HD pack, and a live mission).
++* **Pixel-art upscaling for the HUD** (`GL_UI_UPSCALE`, on). A small texture that only 2D draws sample (through mode:
++  a button glyph, a HUD icon) and that looks like pixel art (a palette texture, or at most 256 colours) is uploaded at
++  twice its size, made by MMPX ([`host/gpu/mmpx.hpp`](../host/gpu/mmpx.hpp); credit in
++  [SOURCE_PROVENANCE.md](SOURCE_PROVENANCE.md)). The guest's texture, its size register and the draw's coordinates are
++  unchanged, so a draw that samples it gets the same UVs and simply finds twice the texels. The pass is a CPU pass done
++  once per texture, so it is metered: `GL_UI_UPSCALE_BUDGET_US` (1500) is what one frame may spend on passes after the
++  first, a texture over it is drawn as the original and done a frame or two later; `GL_UI_UPSCALE_MAX_US` (3000) leaves a
++  texture alone when the earlier passes predict it would take longer than that. 0 removes either limit. Only the
++  HUD changes (checked with a mission's frames, with and without); `ge_replay --stats` prints `ui2x_textures`, `ui2x_us`
++  and `ui2x_deferred`.
++* **Programs linked before they are needed** (`GL_PREWARM`, on). Linking a program is some 50 ms on the Vita, and a
++  mission's first seconds meet a dozen new ones. The renderer keeps a list of the flag sets it has linked
++  (`<data>/shader_variants.txt`, header `# portablekit-gl-variants 1`, one hex flag set a line, appended as each links),
++  reads it, and also a shipped one (`<data>/shader_cache/variants.txt`) at start, and links them from
++  `warm_up_step()`: the split renderer calls it from the GL thread when the queue is empty (`GeWorker::set_idle_work`),
++  at once while the game boots and later only after a lull of 20 ms, and one program per call, so a frame is never held
++  up by more than one link. `GL_VARIANT_DIR` moves the folder. Off, no list is read or written. A list is only a hint:
++  a flag set the renderer cannot build is skipped, and one that is missing costs what it always cost.
+ * **Blending without `glBlendColor`.** `GL_CONSTANT_COLOR` factors are used only where the driver has them and
+   the setting `no_blend_color` is off; otherwise the fragment shader pre-multiplies (`u_blend.x`: 1 doubles the
+   source alpha, 2 doubles and complements, 3 multiplies by a fixed colour, 4 a fixed colour against its
+@@ -218,6 +236,16 @@ every use:
+ 
+ `texture_always_validate=1` is the old behaviour (hash and compare on every use) for comparison.
+ 
++**Decoding.** `decode_texture()` turns a guest texture into RGBA8. A palette texture and a swizzled 16-bit one are read
++straight from guest memory through one pass that unswizzles, looks up the palette and expands in one go, without first
++copying the whole texture (`decode_indexed_fused`); the 16-bit formats expand through 32- and 64-entry channel tables
++instead of a multiply and a divide a channel; a swizzled texture is walked a 16x8-byte block at a time. On a Cortex-A9 this is what makes a
++level load's hundred-odd uploads (5-24 ms each before) shorter; on x86 the palette textures decode about 2.8 times
++faster. `tests/texture_decode_tests.cpp` compares every format (linear and swizzled, odd sizes, buffers wider than the
++texture, palette masks, shifts and offsets) with a plain reference written from the format rules, 1500 random
++textures, bit for bit. `<PREFIX>_NO_FUSED_DECODE=1` turns the fused path off, `<PREFIX>_NO_FAST_TEXTURE_DECODE=1`
++turns all of them off, and `<PREFIX>_CHECK_TEXTURE_DECODE=1` decodes both ways and reports any texel that differs.
++
+ **HD replacements are read off the GL thread** (`HdConfig::async_load`, `<PREFIX>_HD_ASYNC=0` turns it off; the
+ replayer always turns it off, so a replay has every replacement from its first frame). The first time a texture
+ with a replacement is drawn, its original is uploaded and the pack's loader thread is asked for the replacement:
+diff --git a/docs/SOURCE_PROVENANCE.md b/docs/SOURCE_PROVENANCE.md
+index ae2c206..c7a66c2 100644
+--- a/docs/SOURCE_PROVENANCE.md
++++ b/docs/SOURCE_PROVENANCE.md
+@@ -26,6 +26,10 @@ The built-in server (`server.cpp`, used by *Host a session* and `--adhoc-server`
+ 
+ `host/gpu/texture_pack.cpp` and `replacement_textures.cpp` load HD texture packs made for PPSSPP, in its `textures.ini` format. They were written for this project. The format was learnt from PPSSPP's public documentation and pull requests about texture replacement, from reading PPSSPP's GPL-licensed source to find the format's facts (the layout of a key, the hash seeds, how the palette and the texture's dimensions enter the key, the order in which wildcard keys are tried, the ini sections and options), and from the keys a real community pack for Monster Hunter Portable 3rd HD Ver. uses, which the implementation reproduces. Only those facts and constants were taken; no code was copied, adapted or translated line by line. PPSSPP's `quick` hash is not implemented. Hashing uses xxHash, and PNG files are read and written with stb_image and stb_image_write, all unmodified (table below).
+ 
++## MMPX
++
++`host/gpu/mmpx.cpp` and `mmpx.hpp` implement MMPX, the pixel-art magnification filter of Morgan McGuire and Mara Gagiu, "MMPX Style-Preserving Pixel Art Magnification", *Journal of Computer Graphics Techniques* 10(2), 2021 ([paper](https://jcgt.org/published/0010/02/04/)). They are taken from [TeamGDB/Yakumo](https://github.com/TeamGDB/Yakumo) (`profiles/mhp3rd/host/gpu/mmpx.cpp`, MIT, Copyright (c) 2026 PSPRecomp contributors and Yakumo contributors), with the namespace changed and nothing else. Yakumo wrote it from the rules the paper lists; the authors' reference implementation (MIT, Copyright 2020 Morgan McGuire & Mara Gagiu) was not copied by Yakumo and was not used here. `tests/mmpx_tests.cpp` is Yakumo's test.
++
+ ## Profile code
+ 
+ A profile owns its generated AOT corpus, address-specific lowering, HLE behavior and native fast paths. Those files stay in the profile's own repository, and generated code is never committed at all, so they do not become hidden dependencies of the generic framework.
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index a0da853..e3b820a 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -462,7 +462,7 @@
+         entry.mips_tried = true;
+         // An HD replacement brings its own chain, sized for its own level 0: building one from the original's texels would
+         // overwrite its levels with a smaller picture of another size (or of another texture).
+-        if (entry.hd.replaced) return;
++        if (entry.hd.replaced || entry.ui2x) return;   // an interface texture is 2x on the GPU: a chain built from its 1x texels would not fit
+         if (entry.tiny || !entry.power_of_two || entry.uv_verdict == 2u || (entry.volatile_until != 0u && entry.volatile_until >= frames)) return;
+         bind_texture(entry.id);
+         glGenerateMipmap(GL_TEXTURE_2D);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index bce3b33..cf8e2e4 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -15,6 +15,7 @@
+ #include "../../overlay/overlay_menu.hpp"
+ #include "../../settings/port_settings.hpp"
+ #include "../mip_chain.hpp"
++#include "../mmpx.hpp"
+ #include "../texture_decode.hpp"
+ #include "../triangle_indices.hpp"
+ #include "gl_overlay.hpp"
+@@ -282,6 +283,12 @@ struct TextureEntry {
+     bool mips_tried{};
+     std::uint32_t mip_levels{1u};  // levels the GPU texture holds, including level 0
+     HdTextureInfo hd;    // the HD pack's replacement for it, if any (gl_hd_textures.hpp)
++    // ---- settings.ui_upscale: a small pixel-art texture of the interface, uploaded at twice its size ----
++    bool ui_candidate{};           // first sampled by a through-mode draw, of a size and format that suit it
++    bool ui_checked{};             // the colour count of a direct-colour texture was taken
++    bool ui2x{};                   // the GPU holds the 2x picture (entry.width x height stay the guest's size)
++    bool ui_deferred{};            // the pass was put off by the frame's time budget: the original is on the GPU
++    std::uint64_t ui_tried{~0ull}; // the frame the pass was last tried in
+ };
+ 
+ struct Sampler {
+@@ -580,6 +587,86 @@ struct GlRenderer::Impl {
+         return program;
+     }
+ 
++    // ---- the variant lists (settings.prewarm) -------------------------------------------------------------------
++    // One program flags value per line in hex; "#" starts a comment. The first line of a list names the flag layout it
++    // was written for; a list of another layout is not read (and the recorded one is started anew).
++    static constexpr const char *kVariantHeader = "# portablekit-gl-variants 1";
++    std::unordered_set<std::uint32_t> listed_variants;   // in a list already (read, or recorded this run)
++    std::string variant_record_path;                      // where new ones are appended; empty: not recording
++    bool variants_prepared{};
++    std::vector<std::uint32_t> warm_flags;   // what warm_up_step() links, in order
++    std::size_t warm_next{};
++    bool warm_started{}, warm_done{};
++    std::uint32_t warm_linked{}, warm_failed{};
++    std::uint64_t warm_us{};
++    bool variant_file_started{};
++
++    static std::string folder_of(const std::string &path) {
++        const std::size_t slash = path.find_last_of("/\\:");
++        return slash == std::string::npos ? std::string() : path.substr(0, slash + 1u);
++    }
++
++    // Reads one list; returns the flags in file order. `state`: 0 no such file, 1 read, 2 another flag layout (nothing read).
++    static std::vector<std::uint32_t> read_variant_list(const std::string &path, int &state) {
++        std::vector<std::uint32_t> result;
++        state = 0;
++        std::FILE *file = std::fopen(path.c_str(), "rb");
++        if (file == nullptr) return result;
++        state = 1;
++        char line[128];
++        bool first = true;
++        while (std::fgets(line, sizeof line, file) != nullptr) {
++            std::size_t length = std::strlen(line);
++            while (length != 0u && (line[length - 1u] == '\n' || line[length - 1u] == '\r' || line[length - 1u] == ' ')) line[--length] = '\0';
++            if (first) {
++                first = false;
++                if (std::strcmp(line, kVariantHeader) != 0) { state = 2; result.clear(); break; }
++                continue;
++            }
++            if (length == 0u || line[0] == '#') continue;
++            char *end = nullptr;
++            const unsigned long value = std::strtoul(line, &end, 16);
++            if (end != line && value <= 0xFFFFFFFFul) result.push_back(static_cast<std::uint32_t>(value));
++        }
++        std::fclose(file);
++        return result;
++    }
++
++    // The lists' places, and what they hold (once).
++    std::vector<std::uint32_t> prepare_variants() {
++        std::vector<std::uint32_t> flags;
++        if (variants_prepared) return flags;
++        variants_prepared = true;
++        if (!settings.prewarm) return flags;
++        std::string dir = settings.variant_dir;
++        if (dir.empty()) dir = folder_of(port::settings().path());
++        if (dir.empty()) return flags;
++        const std::string shipped = dir + "shader_cache/variants.txt";
++        variant_record_path = dir + "shader_variants.txt";
++        int state = 0;
++        for (const std::uint32_t value : read_variant_list(shipped, state))
++            if (listed_variants.insert(value).second) flags.push_back(value);
++        for (const std::uint32_t value : read_variant_list(variant_record_path, state))
++            if (listed_variants.insert(value).second) flags.push_back(value);
++        variant_file_started = state == 1;   // appended to; a missing or foreign file is written anew
++        return flags;
++    }
++
++    // A program just linked: appended to the recorded list unless a list has it.
++    void record_variant(std::uint32_t flags) {
++        if (!settings.prewarm) return;
++        if (!variants_prepared) (void)prepare_variants();   // names the file and what it holds
++        if (variant_record_path.empty() || !listed_variants.insert(flags).second) return;
++        std::FILE *file = std::fopen(variant_record_path.c_str(), variant_file_started ? "ab" : "wb");
++        if (file == nullptr) return;
++        if (!variant_file_started) {
++            std::fprintf(file, "%s\n", kVariantHeader);
++            variant_file_started = true;
++        }
++        std::fprintf(file, "0x%x\n", static_cast<unsigned>(flags));
++        std::fclose(file);
++    }
++
+     Program *find_or_link_program(std::uint32_t flags) {
+         auto found = programs.find(flags);
+         if (found != programs.end()) return found->second->failed ? nullptr : found->second.get();
+@@ -593,6 +680,7 @@ struct GlRenderer::Impl {
+         if (!program->failed) {
+             use_program(*program);
+             if (program->location[glsl::kUTexture] != -1) glUniform1i(program->location[glsl::kUTexture], 0);
++            record_variant(flags);
+         }
+         Program *raw = program.get();
+         programs[flags] = std::move(program);
+@@ -1050,6 +1138,8 @@ struct GlRenderer::Impl {
+         // pack entry (with mips) when the pack has one for its replacement key.
+         const bool counted = !create;  // an entry being created is added to texture_bytes by the caller
+         if (hd.upload(entry.id, memory, entry.state, entry.hd)) {
++            entry.ui2x = false;   // the replacement's storage has its own size
++            entry.ui_deferred = false;
+             set_gpu_bytes(entry, entry.hd.gpu_bytes, counted);
+             ++st().texture_misses;
+             st().texture_upload_bytes += entry.hd.gpu_bytes;
+@@ -1057,30 +1147,123 @@ struct GlRenderer::Impl {
+         }
+         // A texture with a mip chain is specified anew, not patched: on vitaGL a level-0 update of a texture that has more
+         // levels keeps them and copies the whole chain out of GPU memory first (the chain is stale afterwards anyway).
+-        if (!create && entry.mip_levels > 1u) {
+-            create = true;
+-            set_gpu_bytes(entry, static_cast<std::uint64_t>(entry.width) * entry.height * 4u, counted);
+-        }
++        bool respecify = !create && entry.mip_levels > 1u;
+         if (entry.hd.respecify) {  // it was a replacement: its storage has the replacement's size, so specify it anew
+-            create = true;
++            respecify = true;
+             entry.hd.respecify = false;
+-            set_gpu_bytes(entry, static_cast<std::uint64_t>(entry.width) * entry.height * 4u, counted);
+         }
+         if (!decode_texture(memory, entry.state, decode_buffer)) return false;
++        const bool ui = ui_upscale_texture(entry);   // fills ui_buffer with the 2x picture
++        if (ui != entry.ui2x) respecify = true;       // the storage changes size
++        entry.ui2x = ui;
++        if (respecify) {
++            create = true;
++            set_gpu_bytes(entry, static_cast<std::uint64_t>(entry.width) * entry.height * (ui ? 16u : 4u), counted);
++        }
++        const std::uint32_t scale = ui ? 2u : 1u;
++        const std::uint32_t *pixels = ui ? ui_buffer.data() : decode_buffer.data();
+         bind_texture(entry.id);
+         if (create) {
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(entry.width), static_cast<GLsizei>(entry.height),
+-                         0, GL_RGBA, GL_UNSIGNED_BYTE, decode_buffer.data());
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(entry.width * scale), static_cast<GLsizei>(entry.height * scale),
++                         0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+         } else {
+-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(entry.width), static_cast<GLsizei>(entry.height),
+-                            GL_RGBA, GL_UNSIGNED_BYTE, decode_buffer.data());
++            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(entry.width * scale), static_cast<GLsizei>(entry.height * scale),
++                            GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+         }
+         ++st().texture_misses;
+-        st().texture_upload_bytes += static_cast<std::uint64_t>(entry.width) * entry.height * 4u;
++        st().texture_upload_bytes += static_cast<std::uint64_t>(entry.width) * entry.height * 4u * scale * scale;
++        return true;
++    }
++
++    // ---- settings.ui_upscale ---------------------------------------------------------------------------------------
++    static constexpr std::uint32_t kUi2xMaxPixels = 256u * 256u;   // larger textures are pictures, not sprites
++    static constexpr std::uint32_t kUi2xMaxColours = 256u;         // of a direct-colour texture: more is not pixel art
++    std::vector<std::uint32_t> ui_buffer;     // the 2x picture of the texture being uploaded
++    std::uint64_t ui_budget_frame{~0ull};     // the frame ui_budget_spent_us belongs to
++    std::uint64_t ui_budget_spent_us{};
++    double ui_ns_per_pixel{100.0};             // the passes' running cost (an estimate until the first has run)
++
++    // Whether a texture first sampled by a through-mode draw may be a candidate (decided once, at its creation).
++    bool ui_shape_suits(const TextureState &state) const {
++        if (!settings.ui_upscale) return false;
++        switch (state.format) {
++        case TextureFormat::Rgba8888:   // a copy of a render target (the game's post effects)
++        case TextureFormat::Dxt1:
++        case TextureFormat::Dxt3:
++        case TextureFormat::Dxt5: return false;
++        default: break;
++        }
++        const std::uint32_t pixels = static_cast<std::uint32_t>(state.width) * state.height;
++        return pixels > 256u && std::min(state.width, state.height) >= 8u && pixels <= kUi2xMaxPixels;
++    }
++
++    // At most `limit` distinct colours in `texels`?
++    static bool few_colours(const std::uint32_t *texels, std::size_t count, std::uint32_t limit) {
++        std::uint32_t table[1024]{};      // open addressing; 0 = empty (a colour of 0 is tracked separately)
++        bool zero_seen = false;
++        std::uint32_t distinct = 0u;
++        for (std::size_t i = 0; i < count; ++i) {
++            const std::uint32_t colour = texels[i];
++            if (colour == 0u) {
++                if (!zero_seen) { zero_seen = true; if (++distinct > limit) return false; }
++                continue;
++            }
++            std::uint32_t slot = (colour * 2654435761u) >> 22u;
++            while (table[slot] != 0u && table[slot] != colour) slot = (slot + 1u) & 1023u;
++            if (table[slot] == 0u) {
++                table[slot] = colour;
++                if (++distinct > limit) return false;
++            }
++        }
+         return true;
+     }
+ 
+-    TextureEntry *acquire_texture(const GuestMemory &memory, const TextureState &state) {
++    // decode_buffer holds `entry`'s texels: when the entry is an interface texture that should be 2x, makes the picture
++    // in ui_buffer and says so. False: the original is uploaded (not a candidate, not pixel art, or the frame's time
++    // for such passes is spent; then the entry is tried again in a later frame).
++    bool ui_upscale_texture(TextureEntry &entry) {
++        if (!entry.ui_candidate || !settings.ui_upscale || entry.hd.pending) return false;
++        const std::size_t pixels = static_cast<std::size_t>(entry.width) * entry.height;
++        if (decode_buffer.size() != pixels) return false;
++        if (!entry.ui_checked) {
++            entry.ui_checked = true;
++            if (!is_indexed(entry.state.format) && !few_colours(decode_buffer.data(), pixels, kUi2xMaxColours)) {
++                entry.ui_candidate = false;   // a photograph or a gradient: MMPX would only flatten it
++                return false;
++            }
++        }
++        if (ui_budget_frame != frames) {
++            ui_budget_frame = frames;
++            ui_budget_spent_us = 0u;
++        }
++        const std::uint64_t predicted_us = static_cast<std::uint64_t>(static_cast<double>(pixels) * ui_ns_per_pixel / 1000.0);
++        if (settings.ui_upscale_max_us != 0u && predicted_us > settings.ui_upscale_max_us) {
++            return false;   // too slow on this machine to be worth a frame's time (tried again if its texels change)
++        }
++        if (settings.ui_upscale_budget_us != 0u && ui_budget_spent_us != 0u &&
++            ui_budget_spent_us + predicted_us > settings.ui_upscale_budget_us) {
++            entry.ui_deferred = true;
++            ++st().ui2x_deferred;
++            return false;
++        }
++        const Clock::time_point start = Clock::now();
++        mmpx_2x(decode_buffer.data(), entry.width, entry.height, ui_buffer);
++        const std::uint64_t ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
++        ui_ns_per_pixel = 0.7 * ui_ns_per_pixel + 0.3 * static_cast<double>(ns) / static_cast<double>(pixels);
++        ui_budget_spent_us += ns / 1000u;
++        st().ui2x_us += ns / 1000u;
++        ++st().ui2x_textures;
++        entry.ui_deferred = false;
++        static unsigned logged = 0u;   // the first 300 passes of a run, for the log (what was made 2x, and what it cost)
++        if (logged < 300u && ++logged)
++            std::cerr << "[gl] ui2x " << entry.width << "x" << entry.height << " format " << static_cast<unsigned>(entry.state.format) << " at 0x"
++                      << std::hex << entry.state.address << std::dec << ": " << (static_cast<double>(ns) / 1000.0) << " us\n";
++        return ui_buffer.size() == pixels * 4u;
++    }
++
++    // `interface_draw`: a through-mode (2D) draw is sampling it; the first one decides whether it is an interface texture
++    // (settings.ui_upscale).
++    TextureEntry *acquire_texture(const GuestMemory &memory, const TextureState &state, bool interface_draw = false) {
+         TextureKey key{};
+         key.address = GuestMemory::canonical(state.address);
+         key.size = static_cast<std::uint32_t>(state.width) << 16u | state.height;
+@@ -1122,6 +1305,8 @@ struct GlRenderer::Impl {
+             entry->height = state.height;
+             entry->guest_bytes = bytes;
+             entry->gpu_bytes = static_cast<std::uint64_t>(state.width) * state.height * 4u;
++            entry->ui_candidate = interface_draw && ui_shape_suits(state);
++            entry->ui_tried = frames;
+             glGenTextures(1, &entry->id);
+             if (!decode_into(*entry, memory, true)) {
+                 glDeleteTextures(1, &entry->id);
+@@ -1142,6 +1327,14 @@ struct GlRenderer::Impl {
+         ++st().texture_hits;
+         entry.last_used = frames;
+         ++entry.uses;
++        // Its MMPX pass was put off by the frame's time budget, the original drawn meanwhile: once a frame, try again.
++        if (entry.ui_deferred && entry.ui_tried != frames) {
++            entry.ui_tried = frames;
++            flush();   // the batch may be drawing with the original
++            if (!decode_into(entry, memory, false)) return nullptr;
++            entry.traits_known = false;
++            if (!entry.hd.replaced) decoded_owner = &entry;
++        }
+         // Its HD replacement was being read by the pack's loader thread, the original drawn meanwhile: it has come.
+         if (entry.hd.pending && hd.ready(entry.hd)) {
+             flush();   // the batch may be drawing with the original
+@@ -2166,7 +2359,7 @@ struct GlRenderer::Impl {
+         if (movie::HdFrameStore::instance().in_use() && !texture.swizzled && texture.format == TextureFormat::Rgba8888 &&
+             resolve_hd_movie(memory, call, out))
+             return true;
+-        TextureEntry *entry = acquire_texture(memory, texture);
++        TextureEntry *entry = acquire_texture(memory, texture, call.through);
+         if (entry == nullptr) return false;
+         out.id = entry->id;
+         out.entry = entry;
+@@ -2824,6 +3017,11 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "fill_test") settings.fill_test = flag;
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
++    else if (name == "ui_upscale") settings.ui_upscale = flag;
++    else if (name == "prewarm") settings.prewarm = flag;
++    else if (name == "variant_dir") settings.variant_dir = value;
++    else if (name == "ui_upscale_budget_us") settings.ui_upscale_budget_us = u32;
++    else if (name == "ui_upscale_max_us") settings.ui_upscale_max_us = u32;
+     else if (name == "vgl_skip_redundant") settings.vgl_skip_redundant = flag;
+     else if (name == "depth_bits") settings.depth_bits = u32;
+     else if (name == "target_textures") settings.target_textures = flag;
+@@ -2847,7 +3045,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+@@ -3004,6 +3202,32 @@ bool GlRenderer::capture_frame(const std::string &path) {
+ std::uint64_t GlRenderer::frames_presented() const noexcept { return impl_->frames; }
+ std::uint64_t GlRenderer::draws_submitted() const noexcept { return impl_->draws; }
+ 
++bool GlRenderer::warm_up_step(std::uint64_t quiet_us) {
++    Impl &impl = *impl_;
++    if (!impl.ready || impl.warm_done) return false;
++    if (!impl.warm_started) {
++        impl.warm_started = true;
++        impl.warm_flags = impl.prepare_variants();
++    }
++    // Once frames are coming a link (tens of milliseconds) is done only in a lull: a menu or a loading screen, never play.
++    constexpr std::uint64_t kLullUs = 20000u;
++    if (impl.frames != 0u && quiet_us < kLullUs) return false;
++    while (impl.warm_next < impl.warm_flags.size() && impl.programs.count(impl.warm_flags[impl.warm_next]) != 0u) ++impl.warm_next;
++    if (impl.warm_next >= impl.warm_flags.size()) {
++        impl.warm_done = true;
++        if (!impl.warm_flags.empty())
++            std::cerr << "[gl] warm-up: " << impl.warm_linked << " of " << impl.warm_flags.size() << " listed programs linked, "
++                      << impl.warm_failed << " failed, " << impl.warm_us / 1000u << " ms of linking\n";
++        return false;
++    }
++    const auto start = std::chrono::steady_clock::now();
++    if (impl.find_or_link_program(impl.warm_flags[impl.warm_next]) != nullptr) ++impl.warm_linked;
++    else ++impl.warm_failed;
++    ++impl.warm_next;
++    impl.warm_us += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
++    return true;
++}
++
+ std::size_t GlRenderer::prewarm_shaders() {
+     Impl &impl = *impl_;
+     if (!impl.ready) return 0;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 63dbcd3..1797c29 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -73,6 +73,24 @@ struct GlSettings {
+     // An alpha test that a draw's fragments cannot fail (every alpha is 255: opaque vertices or material, an opaque
+     // texture) is dropped, so the program has no discard. The picture is the same.
+     bool alpha_elide{true};
++    // A small texture that only 2D draws sample (a HUD icon, a button glyph) and that looks like pixel art (a palette
++    // texture, or few colours) is uploaded at twice its size, made by MMPX (mmpx.hpp), so it is not blurred when the
++    // picture is drawn at 2x. The guest's texture and its coordinates are unchanged. Costs a CPU pass once per texture.
++    bool ui_upscale{true};
++    // Programs are linked when a draw first needs one (some 50 ms each on the Vita, a dozen of them in the first seconds of a
++    // mission). A list of the programs earlier runs used is kept (<data>/shader_variants.txt, new ones appended as they
++    // link; a shipped one in <data>/shader_cache/variants.txt) and warm_up_step() links them while the renderer has nothing
++    // to draw: as the game boots, and later only in a lull of 20 ms or more. Off: no list is read or written and every
++    // program links at its first draw.
++    bool prewarm{true};
++    // The folder of the lists above; empty: the folder of the port's settings.txt (no list without one).
++    std::string variant_dir;
++    // Of ui_upscale: the most time (microseconds) the passes of one frame may take once the first has run; a texture
++    // over it is drawn as the original and done at a later frame. 0 = no limit.
++    std::uint32_t ui_upscale_budget_us{1500};
++    // Of ui_upscale: a texture whose pass is predicted (from what the earlier ones cost) to take longer than this many
++    // microseconds is left as it is. 0 = no limit.
++    std::uint32_t ui_upscale_max_us{3000};
+     // Depth buffer precision of every render target: 16 is what ES 2.0 guarantees
+     // (and what the PSP has), 24 needs OES_depth24.
+     std::uint32_t depth_bits{16};
+@@ -174,6 +192,9 @@ struct GlStats {
+     std::uint64_t mip_draws{};          // 3D draws sampled with mips
+     std::uint64_t pixel_lit_draws{};    // draws lit per fragment
+     std::uint64_t alpha_elided{};       // alpha-tested draws whose every fragment has alpha 255: drawn without the test
++    std::uint64_t ui2x_textures{};      // textures uploaded at twice their size (settings.ui_upscale)
++    std::uint64_t ui2x_us{};            // ... and the microseconds the MMPX passes took
++    std::uint64_t ui2x_deferred{};      // passes put off to a later frame by ui_upscale_budget_us
+     std::uint64_t texture_evicted{};
+     std::uint64_t clut_hash_bytes{};
+     std::uint64_t shader_compile_us{};
+@@ -256,6 +277,8 @@ public:
+     // shader cache with every variant (<prefix>_PREWARM_SHADERS=1 once, in the emulator or on the console); a later run
+     // finds them all compiled. Returns the number of programs built (or found already built); failures are logged.
+     std::size_t prewarm_shaders();
++    // Links the programs the variant lists name (GlSettings::prewarm), one a call; logs how many and how long at the end.
++    bool warm_up_step(std::uint64_t quiet_us) override;
+     [[nodiscard]] std::vector<std::string> shader_variant_names() const;
+     [[nodiscard]] std::string gl_description() const;
+     // Texture cache: entries and bytes held.
+diff --git a/host/gpu/mmpx.cpp b/host/gpu/mmpx.cpp
+new file mode 100644
+index 0000000..7e7ae27
+--- /dev/null
++++ b/host/gpu/mmpx.cpp
+@@ -0,0 +1,117 @@
++// MMPX, taken from TeamGDB/Yakumo (profiles/mhp3rd/host/gpu/mmpx.cpp, MIT license, Copyright (c) 2026 PSPRecomp
++// contributors and Yakumo contributors) with its namespace changed. Yakumo wrote it from the rules in McGuire and
++// Gagiu, "MMPX Style-Preserving Pixel Art Magnification", JCGT 10(2), 2021 (Listing 4 of the paper and the text around
++// it); the authors' reference code is under the MIT license and was not copied. See docs/SOURCE_PROVENANCE.md.
++#include "gpu/mmpx.hpp"
++
++#include <algorithm>
++
++namespace portablekit::gpu {
++
++void mmpx_2x(const std::uint32_t *in, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &out) {
++    out.assign(static_cast<std::size_t>(width) * height * 4u, 0u);
++    const auto src = [&](std::int64_t x, std::int64_t y) {
++        x = std::clamp<std::int64_t>(x, 0, static_cast<std::int64_t>(width) - 1);
++        y = std::clamp<std::int64_t>(y, 0, static_cast<std::int64_t>(height) - 1);
++        return in[static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)];
++    };
++    // Dark or opaque colours count as the foreground where a rule has to
++    // choose: the sum of the channels plus one, times 256 minus alpha.
++    const auto luma = [](std::uint32_t c) {
++        return ((c & 0xFFu) + ((c >> 8u) & 0xFFu) + ((c >> 16u) & 0xFFu) + 1u) * (256u - (c >> 24u));
++    };
++    const auto all_eq2 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1) { return b == a0 && b == a1; };
++    const auto all_eq3 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2) {
++        return b == a0 && b == a1 && b == a2;
++    };
++    const auto all_eq4 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t a3) {
++        return b == a0 && b == a1 && b == a2 && b == a3;
++    };
++    const auto any_eq3 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2) {
++        return b == a0 || b == a1 || b == a2;
++    };
++    const auto none_eq2 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1) { return b != a0 && b != a1; };
++    const auto none_eq4 = [](std::uint32_t b, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t a3) {
++        return b != a0 && b != a1 && b != a2 && b != a3;
++    };
++    const std::size_t out_width = static_cast<std::size_t>(width) * 2u;
++    for (std::int64_t y = 0; y < static_cast<std::int64_t>(height); ++y) {
++        for (std::int64_t x = 0; x < static_cast<std::int64_t>(width); ++x) {
++            //       P
++            //     A B C
++            //   Q D E F R
++            //     G H I
++            //       S
++            const std::uint32_t A = src(x - 1, y - 1), B = src(x, y - 1), C = src(x + 1, y - 1);
++            const std::uint32_t D = src(x - 1, y), E = src(x, y), F = src(x + 1, y);
++            const std::uint32_t G = src(x - 1, y + 1), H = src(x, y + 1), I = src(x + 1, y + 1);
++            // The four pixels E becomes: J K on top, L M below.
++            std::uint32_t J = E, K = E, L = E, M = E;
++            // Where all eight neighbours are E there is nothing to shape.
++            if (!(A == E && B == E && C == E && D == E && F == E && G == E && H == E && I == E)) {
++                const std::uint32_t P = src(x, y - 2), S = src(x, y + 2);
++                const std::uint32_t Q = src(x - 2, y), R = src(x + 2, y);
++                const std::uint32_t Bl = luma(B), Dl = luma(D), El = luma(E), Fl = luma(F), Hl = luma(H);
++
++                // Edges at 45 degrees: fill the corner along the edge, on the
++                // darker or more opaque side only, keeping sharp corners and
++                // single-pixel bumps.
++                if ((D == B && D != H && D != F) && (El >= Dl || E == A) && any_eq3(E, A, C, G) &&
++                    (El < Dl || A != D || E != P || E != Q))
++                    J = D;
++                if ((B == F && B != D && B != H) && (El >= Bl || E == C) && any_eq3(E, A, C, I) &&
++                    (El < Bl || C != B || E != P || E != R))
++                    K = B;
++                if ((H == D && H != F && H != B) && (El >= Hl || E == G) && any_eq3(E, A, G, I) &&
++                    (El < Hl || G != H || E != S || E != Q))
++                    L = H;
++                if ((F == H && F != B && F != D) && (El >= Fl || E == I) && any_eq3(E, C, G, I) &&
++                    (El < Fl || I != H || E != R || E != S))
++                    M = F;
++
++                // Where two lines cross, joined unless it is the edge of a
++                // checkerboard dither.
++                if ((E != F && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && (F != src(x + 3, y))) K = M = F;
++                if ((E != D && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && (D != src(x - 3, y))) J = L = D;
++                if ((E != H && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && (H != src(x, y + 3))) L = M = H;
++                if ((E != B && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && (B != src(x, y - 3))) J = K = B;
++
++                // The tips of triangles, which the edge rules would flatten.
++                if (Bl < El && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) J = K = B;
++                if (Hl < El && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) L = M = H;
++                if (Fl < El && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) K = M = F;
++                if (Dl < El && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) J = L = D;
++
++                // Edges two pixels across for one down (and the other seven
++                // ways round): one more output pixel copied along them.
++                if (H != B) {
++                    if (H != A && H != E && H != C) {
++                        if (all_eq3(H, G, F, R) && none_eq2(H, D, src(x + 2, y - 1))) L = M;
++                        if (all_eq3(H, I, D, Q) && none_eq2(H, F, src(x - 2, y - 1))) M = L;
++                    }
++                    if (B != I && B != G && B != E) {
++                        if (all_eq3(B, A, F, R) && none_eq2(B, D, src(x + 2, y + 1))) J = K;
++                        if (all_eq3(B, C, D, Q) && none_eq2(B, F, src(x - 2, y + 1))) K = J;
++                    }
++                }
++                if (F != D) {
++                    if (D != I && D != E && D != C) {
++                        if (all_eq3(D, A, H, S) && none_eq2(D, B, src(x + 1, y + 2))) J = L;
++                        if (all_eq3(D, G, B, P) && none_eq2(D, H, src(x + 1, y - 2))) L = J;
++                    }
++                    if (F != E && F != A && F != G) {
++                        if (all_eq3(F, C, H, S) && none_eq2(F, B, src(x - 1, y + 2))) K = M;
++                        if (all_eq3(F, I, B, P) && none_eq2(F, H, src(x - 1, y - 2))) M = K;
++                    }
++                }
++            }
++            const std::size_t at = static_cast<std::size_t>(y) * 2u * out_width + static_cast<std::size_t>(x) * 2u;
++            out[at] = J;
++            out[at + 1u] = K;
++            out[at + out_width] = L;
++            out[at + out_width + 1u] = M;
++        }
++    }
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/mmpx.hpp b/host/gpu/mmpx.hpp
+new file mode 100644
+index 0000000..78ac80d
+--- /dev/null
++++ b/host/gpu/mmpx.hpp
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace portablekit::gpu {
++
++// MMPX (Morgan McGuire and Mara Gagiu, "MMPX Style-Preserving Pixel Art
++// Magnification", Journal of Computer Graphics Techniques 10(2), 2021):
++// doubles an RGBA8 image (red in the low byte, alpha in the high one),
++// keeping its exact palette, transparency and single-pixel features, and
++// shaping diagonals, curves and corners from each pixel's 5x5 neighbourhood.
++// Taken from TeamGDB/Yakumo (MIT), which wrote it from the rules the paper lists;
++// see docs/SOURCE_PROVENANCE.md. Pixels beyond the edges repeat the edge.
++void mmpx_2x(const std::uint32_t *in, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t> &out);
++
++} // namespace portablekit::gpu
+diff --git a/tests/mmpx_tests.cpp b/tests/mmpx_tests.cpp
+new file mode 100644
+index 0000000..e94e8a6
+--- /dev/null
++++ b/tests/mmpx_tests.cpp
+@@ -0,0 +1,103 @@
++// MMPX, the 2D interface's pixel-art upscaler: what the paper says it keeps
++// (the palette, flat areas, single pixels) and what it shapes (1:1 edges).
++
++#include "gpu/mmpx.hpp"
++
++#include <cstdint>
++#include <iostream>
++#include <random>
++#include <set>
++#include <vector>
++
++namespace {
++
++using portablekit::gpu::mmpx_2x;
++
++int failures{};
++
++void expect(bool condition, const char *what) {
++    if (condition) return;
++    ++failures;
++    std::cout << "FAIL: " << what << "\n";
++}
++
++constexpr std::uint32_t kWhite = 0xFFFFFFFFu;
++constexpr std::uint32_t kBlack = 0xFF000000u;
++constexpr std::uint32_t kRed = 0xFF0000FFu;
++
++std::uint32_t at(const std::vector<std::uint32_t> &image, std::uint32_t width, std::uint32_t x, std::uint32_t y) {
++    return image[static_cast<std::size_t>(y) * width + x];
++}
++
++void test_flat() {
++    const std::vector<std::uint32_t> in(6u * 4u, kRed);
++    std::vector<std::uint32_t> out;
++    mmpx_2x(in.data(), 6u, 4u, out);
++    expect(out.size() == 12u * 8u, "the output is twice as wide and twice as tall");
++    bool flat = true;
++    for (const std::uint32_t pixel : out) flat = flat && pixel == kRed;
++    expect(flat, "a flat image stays flat");
++}
++
++void test_single_pixel() {
++    std::vector<std::uint32_t> in(5u * 5u, kWhite);
++    in[2u * 5u + 2u] = kRed;
++    std::vector<std::uint32_t> out;
++    mmpx_2x(in.data(), 5u, 5u, out);
++    std::size_t red = 0;
++    for (const std::uint32_t pixel : out) red += pixel == kRed ? 1u : 0u;
++    expect(red == 4u, "a single pixel stays one pixel, twice as large");
++    expect(at(out, 10u, 4u, 4u) == kRed && at(out, 10u, 5u, 5u) == kRed, "in its own place");
++}
++
++void test_palette() {
++    std::mt19937 random(7u);
++    const std::uint32_t colours[] = {kWhite, kBlack, kRed, 0x00000000u};
++    std::vector<std::uint32_t> in(16u * 16u);
++    for (std::uint32_t &pixel : in) pixel = colours[random() % 4u];
++    std::vector<std::uint32_t> out;
++    mmpx_2x(in.data(), 16u, 16u, out);
++    const std::set<std::uint32_t> palette(std::begin(colours), std::end(colours));
++    bool kept = true;
++    for (const std::uint32_t pixel : out) kept = kept && palette.count(pixel) != 0u;
++    expect(kept, "no colour is made that the image did not have, transparency included");
++}
++
++void test_diagonal() {
++    // A black line at 45 degrees on white: the steps beside it are filled
++    // half a source pixel out, so the line is smooth rather than a staircase.
++    constexpr std::uint32_t kSize = 8u;
++    std::vector<std::uint32_t> in(kSize * kSize, kWhite);
++    for (std::uint32_t i = 0; i < kSize; ++i) in[i * kSize + i] = kBlack;
++    std::vector<std::uint32_t> out;
++    mmpx_2x(in.data(), kSize, kSize, out);
++    bool filled = true;
++    for (std::uint32_t i = 1; i + 2u < kSize; ++i) {
++        // The white pixel right of (i, i): its bottom-left quarter.
++        filled = filled && at(out, kSize * 2u, 2u * (i + 1u), 2u * i + 1u) == kBlack;
++        // The white pixel below (i, i): its top-right quarter.
++        filled = filled && at(out, kSize * 2u, 2u * i + 1u, 2u * (i + 1u)) == kBlack;
++    }
++    expect(filled, "a 1:1 edge has its steps filled");
++    // Away from the edges, which repeat outwards.
++    bool line = true;
++    for (std::uint32_t i = 1; i + 1u < kSize; ++i)
++        line = line && at(out, kSize * 2u, 2u * i, 2u * i) == kBlack &&
++            at(out, kSize * 2u, 2u * i + 1u, 2u * i + 1u) == kBlack;
++    expect(line, "and the line itself stays");
++}
++
++} // namespace
++
++int main() {
++    test_flat();
++    test_single_pixel();
++    test_palette();
++    test_diagonal();
++    if (failures != 0) {
++        std::cout << failures << " check(s) failed\n";
++        return 1;
++    }
++    std::cout << "mmpx tests passed\n";
++    return 0;
++}
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 8227796..fddf846 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1054,6 +1054,9 @@ int main(int argc, char **argv) {
+         line("approximated blends", t.unsupported_blend);
+         line("3D draws made smooth", t.smooth_draws);
+         line("alpha tests dropped (alpha 255)", t.alpha_elided);
++        line("textures uploaded at 2x (MMPX)", t.ui2x_textures);
++        line("... microseconds spent on them", t.ui2x_us);
++        line("... passes put off by the budget", t.ui2x_deferred);
+         line("full-screen pictures sharpened", t.sharp_draws);
+         line("3D draws sampled with mips", t.mip_draws);
+         line("textures given mips", t.mip_textures);

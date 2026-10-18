@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:22:04 +0000
+Subject: [PATCH] renderer: keep scratch buffers bound between batches, memoise
+ the viewport
+
+- The scratch buffer objects and the batch's attribute offsets stay bound from
+  one batch to the next; a batch only points them at its data (vglBufferData).
+  Blits, post passes and the overlay call client_arrays() before drawing from
+  client arrays. Four GL calls fewer per draw, and vitaGL's vertex layout stays
+  the same between batches.
+- The viewport, scissor, flip, depth range and screen size of a draw are kept
+  from the previous draw when the GE's viewport registers and the target are
+  the same (230 instructions a draw on the Vita's CPU).
+- The renderer trace prints each draw's texture, blend and depth state.
+- docs/GL_RENDERER.md: "The CPU's share of a draw".
+
+Verified: an old-versus-new replay of 328 frames over 15 cases (mission,
+menus, movies, intro; scale 1 and 2; HD pack; --port baseline; --threaded) is
+byte-identical to the build before b2e0cc3. Vita3K: mission 1 played 100 s
+with the split renderer (the scratch-memory batch path), clean exit, menus,
+cutscene and gameplay drawn correctly. Not yet run on a Vita.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index dd27b8d..13b379f 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -70,6 +70,40 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   `MASKALPHA=FF`). Stencil is in the IR but not emulated (see "Not done").
+ * **Texture cache** (below) and **cost counters** (`GlStats`, printed by `ge_replay --stats`).
+ 
++## The CPU's share of a draw
++
++On the PS Vita a mission frame of Infected (650 GE draws, 410 GL draws after merging, 15,000 command words) was
++bound by the CPU, not the GPU: one core walked the lists for 21 ms and ran this renderer and vitaGL for 36 ms. The
++work below was found and checked with ARM instruction counts: ge_replay built for a Cortex-A9 (the Vita's flags, no
++stack protector) and run under QEMU with a plugin that counts the instructions of every translated block between
++two marker functions around the walk and around `submit()`. Over ten gameplay frames it took the renderer from 6.2
++to 3.0 million instructions a frame and the walk from 6.0 to 3.5 million. Every change gives the same pictures
++(replays of the corpus and a live mission, compared byte for byte).
++
++* **Comparisons are word compares**, inlined (`same_words`), not `memcmp`. `DrawState` puts the texture first (most
++  draws that cannot join the batch differ there) and is compared only up to its matrices: those follow from
++  `matrix_serial`, one per transform the renderer computed, and the transform is recomputed only when the walker's
++  `matrix_version` moves (it moves when a matrix value changes, not when the game uploads the same one again).
++* **Uniforms are compared only when they can have changed.** `uniform<U>()` is a template, so the comparison is
++  unrolled for the uniform's size; the lighting environment and the matrices carry serials, and a program that
++  already has the current ones skips them.
++* **Small direct-mapped caches** sit in front of the hash maps a draw would otherwise look into: palette hashes (per
++  display list), textures, samplers, programs. The Cortex-A9 has no divide instruction, and the maps' modulo and
++  hashing cost more than the rest of a lookup. A destroyed texture or sampler empties its front cache.
++* **Index lists are built in place**: a triangle strip is converted two triangles at a time, a list rebased in 16-bit
++  lanes the compiler vectorises.
++* **Batches are written where the GPU reads them.** On the Vita, `BatchBuffer` takes chunks of the frame's GPU scratch
++  memory (`vglAllocFromScratch`) and `append()` writes a draw's vertices and indices there once; a flush points the
++  scratch buffer objects at the batch (`vglBufferData`) and draws, with no staging copy. The buffer objects and the
++  attribute offsets stay bound from one batch to the next; blits, post passes and the overlay call `client_arrays()`
++  first. On desktop GL the same class keeps one heap buffer and draws from client arrays.
++* **The walker sends less**: lighting and material versions move only when a value changes (65 more merged draws a
++  frame), and the split renderer takes a draw's vertex and index storage instead of copying it
++  (`Renderer::submit_taking`).
++
++What is left per GL draw is vitaGL's `glDrawElements` (about 15 µs on the console before this work, measured with
++`gl_timing`), which no change here touches.
++
+ ## Settings that matter on a Vita
+ 
+ `display_scale` (2 = 960x544), `offscreen_scale` (1), `no_blend_color` (on), `depth_bits` (16), `writeback` (0),
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index 6c32382..a0da853 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -77,6 +77,7 @@
+     // no blend, no scissor; the caller binds the destination. `inv_size`: one over the source size and the size.
+     void fullscreen_pass(Program &program, GLuint source, GLenum filter, std::int32_t width, std::int32_t height,
+                          const float *inv_size, bool flip_y) {
++        client_arrays();
+         glDisableVertexAttribArray(1u);
+         glDisableVertexAttribArray(3u);
+         use_program(program);
+@@ -285,6 +286,7 @@
+             ++aux_programs;
+             variant_names.push_back("overlay:ui");
+         }
++        client_arrays();   // the canvas draws from client arrays
+         canvas.begin(width, height, top_is_clip_top);
+         if (menu && overlay_paint) overlay_paint(canvas);
+         // The game is paused while the panel is open, so the counter would only show stale numbers under it.
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 68e12ee..b8bf2bd 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1529,6 +1529,17 @@ struct GlRenderer::Impl {
+     }
+ 
+     GLuint scratch_vbo{}, scratch_ibo{};   // buffer objects whose data is the batch's scratch copy (settings.scratch_buffers)
++    // The scratch buffer objects stay bound, with the batch's attribute pointers as offsets into them, from one batch to
++    // the next: a batch only points them at its own data (four GL calls a draw fewer, and vitaGL's vertex layout stays
++    // the same). Every other draw (blits, post passes, the overlay) draws from client arrays and calls client_arrays().
++    bool scratch_bound{false};
++
++    void client_arrays() {
++        if (!scratch_bound) return;
++        glBindBuffer(GL_ARRAY_BUFFER, 0u);
++        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0u);
++        scratch_bound = false;
++    }
+ 
+     void draw_batch(const DrawState &state) {
+         // Batches in scratch memory are drawn where they are, as buffer objects (the driver neither copies client
+@@ -1536,37 +1547,38 @@ struct GlRenderer::Impl {
+         const bool scratch = batch_vertices.in_scratch() && batch_indices.in_scratch() && !settings.null_draw;
+         const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(batch_vertices.data());
+         const void *indices = batch_indices.data();
++        const auto attributes = [](const std::uint8_t *at) {
++            const auto field = [at](std::size_t offset) -> const void * {
++                return at != nullptr ? static_cast<const void *>(at + offset) : reinterpret_cast<const void *>(offset);
++            };
++            glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, position)));
++            glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, normal)));
++            glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, texcoord)));
++            glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), field(offsetof(Vertex, color)));
++        };
+         if (scratch) {
+-            const void *vertex_copy = batch_vertices.data();
+-            const void *index_copy = batch_indices.data();
+-            if (scratch_vbo == 0u) {
+-                glGenBuffers(1, &scratch_vbo);
+-                glGenBuffers(1, &scratch_ibo);
++            if (!scratch_bound) {
++                if (scratch_vbo == 0u) {
++                    glGenBuffers(1, &scratch_vbo);
++                    glGenBuffers(1, &scratch_ibo);
++                }
++                glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scratch_ibo);
++                attributes(nullptr);  // offsets into the bound buffer
++                scratch_bound = true;
+             }
+-            glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
+-            glp::buffer_use_mapped(GL_ARRAY_BUFFER, vertex_copy);
+-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scratch_ibo);
+-            glp::buffer_use_mapped(GL_ELEMENT_ARRAY_BUFFER, index_copy);
+-            base = nullptr;      // the attribute pointers below are offsets into the bound buffer
++            glp::buffer_use_mapped(GL_ARRAY_BUFFER, batch_vertices.data());
++            glp::buffer_use_mapped(GL_ELEMENT_ARRAY_BUFFER, batch_indices.data());
+             indices = nullptr;
+             ++st().scratch_batches;
++        } else {
++            client_arrays();
++            attributes(base);
+         }
+-        const auto at = [base](std::size_t offset) -> const void * {
+-            return base != nullptr ? static_cast<const void *>(base + offset) : reinterpret_cast<const void *>(offset);
+-        };
+-        glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, position)));
+-        glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, normal)));
+-        glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, texcoord)));
+-        glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), at(offsetof(Vertex, color)));
+         if (!settings.null_draw)
+             timed_draw([&] {
+                 glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT, indices);
+             });
+-        if (scratch) {
+-            // Everything else (the blits, the post passes) draws from client arrays.
+-            glBindBuffer(GL_ARRAY_BUFFER, 0u);
+-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0u);
+-        }
+         ++st().gl_draws;
+         st().bytes_uploaded += batch_vertices.size() * sizeof(Vertex) + batch_indices.size() * sizeof(std::uint16_t);
+         st().vertices_uploaded += batch_vertices.size();
+@@ -2201,6 +2213,71 @@ struct GlRenderer::Impl {
+         ++st().merge_breaks[group];
+     }
+ 
++    // The viewport, flip, depth range, screen size and scissor of a draw (DrawState), from the GE's viewport registers
++    // and the target. Kept from the previous draw when those are the same (they change a few times a frame, and this
++    // was some 230 instructions a draw on the Vita's CPU).
++    struct ViewMemo {
++        ViewportState viewport{};
++        std::uint32_t target{}, scale_bits{}, width{}, height{}, psp_width{}, psp_height{}, through{};
++        std::int32_t viewport_px[4]{}, scissor_px[4]{};
++        float flip[2]{}, depth_range[2]{}, screen[2]{};
++        bool valid{};
++    } view_memo;
++
++    void place_view(const ViewportState &vp, bool through, const Target &target, DrawState &state) {
++        ViewMemo &m = view_memo;
++        std::uint32_t scale_bits{};
++        std::memcpy(&scale_bits, &target.scale, sizeof(scale_bits));
++        const std::uint32_t key[7] = {target.address, scale_bits, target.width, target.height,
++                                      target.psp_width, target.psp_height, through ? 1u : 0u};
++        static_assert(sizeof(ViewportState) % 4u == 0u);
++        if (!m.valid || !same_words(&m.viewport, &vp, sizeof(ViewportState) / 4u) || !same_words(&m.target, key, 7u)) {
++            // The GE maps ndc to the screen as ndc * scale + offset - region offset,
++            // with y pointing down on screen; the shader flips y so that GL's window rows are the PSP's.
++            const float scale = target.scale;
++            const float target_w = static_cast<float>(target.width), target_h = static_cast<float>(target.height);
++            float vx = 0.0f, vy = 0.0f, vw = target_w, vh = target_h;
++            m.flip[0] = 1.0f;
++            m.flip[1] = 1.0f;
++            m.depth_range[0] = 0.0f;
++            m.depth_range[1] = 1.0f;
++            if (!through && vp.x_scale != 0.0f && vp.y_scale != 0.0f) {
++                vx = (vp.x_offset - vp.offset_x - std::fabs(vp.x_scale)) * scale;
++                vy = (vp.y_offset - vp.offset_y - std::fabs(vp.y_scale)) * scale;
++                vw = 2.0f * std::fabs(vp.x_scale) * scale;
++                vh = 2.0f * std::fabs(vp.y_scale) * scale;
++                m.flip[0] = vp.x_scale < 0.0f ? -1.0f : 1.0f;
++                m.flip[1] = vp.y_scale < 0.0f ? -1.0f : 1.0f;
++                if (vp.z_scale != 0.0f) {
++                    m.depth_range[0] = std::clamp((vp.z_offset - vp.z_scale) / 65535.0f, 0.0f, 1.0f);
++                    m.depth_range[1] = std::clamp((vp.z_offset + vp.z_scale) / 65535.0f, 0.0f, 1.0f);
++                }
++            }
++            m.viewport_px[0] = round_away(vx);
++            m.viewport_px[1] = round_away(vy);
++            m.viewport_px[2] = std::max(1, round_away(vw));
++            m.viewport_px[3] = std::max(1, round_away(vh));
++            m.screen[0] = static_cast<float>(target.psp_width);
++            m.screen[1] = static_cast<float>(target.psp_height);
++            const std::uint32_t sx1 = std::min(vp.scissor_x1, target.psp_width - 1u);
++            const std::uint32_t sy1 = std::min(vp.scissor_y1, target.psp_height - 1u);
++            const std::uint32_t sx2 = std::min(std::max(vp.scissor_x2, sx1), target.psp_width - 1u);
++            const std::uint32_t sy2 = std::min(std::max(vp.scissor_y2, sy1), target.psp_height - 1u);
++            m.scissor_px[0] = round_away(static_cast<float>(sx1) * scale);
++            m.scissor_px[1] = round_away(static_cast<float>(sy1) * scale);
++            m.scissor_px[2] = round_away(static_cast<float>(sx2 + 1u) * scale) - m.scissor_px[0];
++            m.scissor_px[3] = round_away(static_cast<float>(sy2 + 1u) * scale) - m.scissor_px[1];
++            m.viewport = vp;
++            std::memcpy(&m.target, key, sizeof(key));
++            m.valid = true;
++        }
++        std::memcpy(state.viewport, m.viewport_px, sizeof(state.viewport));
++        std::memcpy(state.scissor, m.scissor_px, sizeof(state.scissor));
++        std::memcpy(state.flip, m.flip, sizeof(state.flip));
++        std::memcpy(state.depth_range, m.depth_range, sizeof(state.depth_range));
++        std::memcpy(state.screen, m.screen, sizeof(state.screen));
++    }
++
+     void submit(const DrawCall &call, const GuestMemory &memory) {
+         if (!ready) return;
+         ++st().submits;
+@@ -2274,43 +2351,7 @@ struct GlRenderer::Impl {
+                                                                                                          : GL_TRIANGLES;
+         state.target = target.address;
+ 
+-        // Viewport. The GE maps ndc to the screen as ndc * scale + offset - region offset,
+-        // with y pointing down on screen; the shader flips y so that GL's window rows are the PSP's.
+-        const float scale = target.scale;
+-        const float target_w = static_cast<float>(target.width), target_h = static_cast<float>(target.height);
+-        float vx = 0.0f, vy = 0.0f, vw = target_w, vh = target_h;
+-        state.flip[0] = 1.0f;
+-        state.flip[1] = 1.0f;
+-        state.depth_range[0] = 0.0f;
+-        state.depth_range[1] = 1.0f;
+-        if (!through && call.viewport.x_scale != 0.0f && call.viewport.y_scale != 0.0f) {
+-            const ViewportState &vp = call.viewport;
+-            vx = (vp.x_offset - vp.offset_x - std::fabs(vp.x_scale)) * scale;
+-            vy = (vp.y_offset - vp.offset_y - std::fabs(vp.y_scale)) * scale;
+-            vw = 2.0f * std::fabs(vp.x_scale) * scale;
+-            vh = 2.0f * std::fabs(vp.y_scale) * scale;
+-            state.flip[0] = vp.x_scale < 0.0f ? -1.0f : 1.0f;
+-            state.flip[1] = vp.y_scale < 0.0f ? -1.0f : 1.0f;
+-            if (vp.z_scale != 0.0f) {
+-                state.depth_range[0] = std::clamp((vp.z_offset - vp.z_scale) / 65535.0f, 0.0f, 1.0f);
+-                state.depth_range[1] = std::clamp((vp.z_offset + vp.z_scale) / 65535.0f, 0.0f, 1.0f);
+-            }
+-        }
+-        state.viewport[0] = round_away(vx);
+-        state.viewport[1] = round_away(vy);
+-        state.viewport[2] = std::max(1, round_away(vw));
+-        state.viewport[3] = std::max(1, round_away(vh));
+-        state.screen[0] = static_cast<float>(target.psp_width);
+-        state.screen[1] = static_cast<float>(target.psp_height);
+-
+-        const std::uint32_t sx1 = std::min(call.viewport.scissor_x1, target.psp_width - 1u);
+-        const std::uint32_t sy1 = std::min(call.viewport.scissor_y1, target.psp_height - 1u);
+-        const std::uint32_t sx2 = std::min(std::max(call.viewport.scissor_x2, sx1), target.psp_width - 1u);
+-        const std::uint32_t sy2 = std::min(std::max(call.viewport.scissor_y2, sy1), target.psp_height - 1u);
+-        state.scissor[0] = round_away(static_cast<float>(sx1) * scale);
+-        state.scissor[1] = round_away(static_cast<float>(sy1) * scale);
+-        state.scissor[2] = round_away(static_cast<float>(sx2 + 1u) * scale) - state.scissor[0];
+-        state.scissor[3] = round_away(static_cast<float>(sy2 + 1u) * scale) - state.scissor[1];
++        place_view(call.viewport, through, target, state);
+ 
+         // Depth.
+         state.depth_test = settings.depth_test && call.depth.test_enabled && (!through || settings.through_depth) ? 1u : 0u;
+@@ -2490,7 +2531,10 @@ struct GlRenderer::Impl {
+         if (settings.trace)
+             std::cerr << "[gl] draw " << draws << " " << glsl::describe(state.program_flags) << " prim "
+                       << static_cast<int>(call.primitive) << " vertices " << call.vertices.size() << " target 0x"
+-                      << std::hex << target.address << std::dec << (merge ? " (merged)" : "") << "\n";
++                      << std::hex << target.address << " tex 0x" << call.texture.address << std::dec << " gl " << state.texture
++                      << " blend " << state.blend_enable << "/" << state.blend_source << "/" << state.blend_destination
++                      << " depth " << state.depth_test << "/" << state.depth_function << "/" << state.depth_write
++                      << (merge ? " (merged)" : "") << "\n";
+         if (!settings.merge_draws) flush();
+     }
+ 
+@@ -2521,6 +2565,7 @@ struct GlRenderer::Impl {
+     void blit(GLuint texture, std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height, bool flip_y = false,
+               bool write_depth_zero = false) {
+         if (blit_program.id == 0u) return;
++        client_arrays();
+         glDisableVertexAttribArray(1u);
+         glDisableVertexAttribArray(3u);
+         use_program(blit_program);

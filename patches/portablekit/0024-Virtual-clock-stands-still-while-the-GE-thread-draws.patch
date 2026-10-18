@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 07:58:00 +0000
+Subject: [PATCH] Virtual clock stands still while the GE thread draws; texture
+ stats line; menu freeze check inside the pause
+
+* Kernel::wait_host(..., zero_time): with the virtual clock a thread waiting for the GE thread (frames in flight, sceGeListSync/DrawSync) no
+  longer lets the clock jump by the real time the GE thread needs. Threaded and non-threaded desktop runs now see the same emulated time at the
+  same flip (scripted live runs are reproducible, 3 menu openings gave identical times in both modes). Realtime clock (Vita) is unchanged.
+* GlSettings::stats_every (gl_stats_every, Vita default 1800 flips): one compact line with the texture cache and HD residency numbers.
+* hle_media: the "emulated clock moved while the menu was open" check reads the clock after the pause scope is taken.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 79a17f4..917bd29 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -278,6 +278,7 @@ struct GlRenderer::Impl {
+     bool minmax_ok{true};
+     std::string description;
+     std::uint64_t frames{};
++    std::uint64_t next_stats_frame{};
+     std::uint64_t writeback_frames{};
+     std::uint64_t draws{};
+     std::uint64_t frame_draws{};  // draws since the last present, for the draw_first/draw_last debugging switches
+@@ -2182,6 +2183,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "texture_check_interval") settings.texture_check_interval = u32;
+     else if (name == "writeback") settings.writeback = u32;
+     else if (name == "texture_budget_mb") settings.texture_budget = number * 1024ull * 1024ull;
++    else if (name == "stats_every") settings.stats_every = u32;
+     else if (name == "texture_always_validate") settings.texture_always_validate = flag;
+     else if (name == "merge") settings.merge_draws = flag;
+     else if (name == "null_draw") settings.null_draw = flag;
+@@ -2207,7 +2209,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+@@ -2275,6 +2277,18 @@ void GlRenderer::begin_display_list() {
+     if (!impl.ready) return;
+     impl.flush();
+     if (impl.hd.tick(impl.frames)) clear_texture_cache();  // gfx.hd_textures changed: every texture is uploaded again
++    if (impl.settings.stats_every != 0u && impl.frames >= impl.next_stats_frame) {
++        const bool first = impl.next_stats_frame == 0u;
++        impl.next_stats_frame = impl.frames + impl.settings.stats_every;
++        if (!first) {
++            const HdStats &h = impl.hd.stats();
++            std::cout << "[gl] textures: " << impl.textures.size() << " cached " << (impl.texture_bytes >> 10u) << " KiB of "
++                      << (impl.settings.texture_budget >> 20u) << " MB | hd " << hd_mode_name(impl.hd.mode()) << ": resident "
++                      << h.resident_textures << " tex " << (h.resident_bytes >> 10u) << " KiB (peak " << (h.peak_bytes >> 10u)
++                      << " KiB), hits " << h.hits << ", misses " << h.misses << ", over budget " << h.skipped_budget
++                      << ", failed " << h.upload_failed << ", read " << (h.blob_bytes >> 10u) << " KiB" << std::endl;
++        }
++    }
+     ++impl.list_serial;
+     impl.clut_hashes.clear();
+     impl.target_verdicts.clear();
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index ccc9bba..d29e81b 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -32,6 +32,13 @@ struct GlSettings {
+     std::uint32_t texture_check_interval{30};
+     // Textures kept on the GPU, in bytes, before the least recently used go.
+     std::uint64_t texture_budget{96ull * 1024ull * 1024ull};
++    // Every this many presented frames one line says what the texture cache and the HD replacements hold (0: never;
++    // the Vita build sets 1800 = about a minute of play, the memory figures the port reports).
++#if defined(__vita__)
++    std::uint32_t stats_every{1800};
++#else
++    std::uint32_t stats_every{0};
++#endif
+     // Hash and re-decode a texture on every use (the behaviour to compare the cache against).
+     bool texture_always_validate{false};
+     // Merge consecutive draws with the same state into one GL draw.
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index bb46f7d..60c259d 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -534,10 +534,13 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+ #endif
+     // No guest thread, interrupt, timer or vblank runs inside the scope and emulated time stands still; the
+     // listener registered with the renderer silences the audio and restarts the frame statistics afterwards.
+-    const std::uint64_t before_us = kernel().now_us();
+     bool window_open = true;
++    std::uint64_t before_us = 0u;
+     {
+         const Kernel::PauseScope pause(kernel());
++        // Read inside the scope: the pause takes its last reading of the (real time) clock on the way in, and what
++        // passed before that is not the menu's.
++        before_us = kernel().now_us();
+         if (!threaded) renderer.pause_interpolation();
+         window_open = overlay_host::run_modal(renderer, host);
+         // The clock stood still: this is the check that a mission timer cannot have jumped.
+@@ -952,7 +955,7 @@ void register_display_ctrl(HleRegistrar &hle) {
+             kernel().wait_host(ctx, std::nullopt, [wanted](bool) -> std::optional<std::uint32_t> {
+                 if (media().presents_done.load(std::memory_order_acquire) >= wanted) return 0u;
+                 return std::nullopt;
+-            });
++            }, /*zero_time=*/true);
+             return;
+         }
+ #endif
+@@ -1190,7 +1193,7 @@ void register_ge(HleRegistrar &hle) {
+         kernel().wait_host(ctx, std::nullopt, [target, answer = std::move(answer)](bool) -> std::optional<std::uint32_t> {
+             if (gpu::ge_worker().completed() >= target) return answer();
+             return std::nullopt;
+-        });
++        }, /*zero_time=*/true);
+     };
+     hle.add("sceGe_user", "sceGeListSync", [wait_for_jobs](Runtime &, AllegrexContext &ctx) {
+         const std::uint32_t id = arg(ctx, 0);
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index 6058803..ba0b1c9 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -554,6 +554,7 @@ void Kernel::scheduler_loop() {
+                 return;
+             }
+             if (clock_mode_ == ClockMode::Realtime) sleep_until_event(*next);
++            else if (zero_time_host_wait_pending()) sleep_host(200u);   // the GE thread is drawing: the clock waits for it
+             else advance_clock(*next);
+             bringup::check_limits(*runtime_);
+         }
+@@ -636,7 +637,7 @@ void Kernel::delay_current(AllegrexContext &ctx, std::uint64_t microseconds, std
+     block(ctx, wait, result);
+ }
+ 
+-void Kernel::wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeout_us, HostWaitPoll poll) {
++void Kernel::wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeout_us, HostWaitPoll poll, bool zero_time) {
+     // Already satisfied: no thread switch.
+     if (const auto result = poll(false)) {
+         finish(ctx, *result);
+@@ -648,6 +649,7 @@ void Kernel::wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeou
+     }
+     WaitState wait{};
+     wait.type = WaitType::Host;
++    wait.zero_time = zero_time;
+     if (timeout_us) wait.deadline_us = now_us() + *timeout_us;
+     wait.host_poll = std::move(poll);
+     // The poll result replaces v0 when the wait ends.
+@@ -853,6 +855,13 @@ bool Kernel::pace_to_real_time() {
+     return true;
+ }
+ 
++bool Kernel::zero_time_host_wait_pending() const {
++    return std::any_of(threads_.begin(), threads_.end(), [](const auto &entry) {
++        return entry.second->status == ThreadStatus::Waiting && entry.second->wait.type == WaitType::Host &&
++               entry.second->wait.zero_time;
++    });
++}
++
+ std::optional<std::uint64_t> Kernel::next_event_us() const {
+     std::optional<std::uint64_t> next = next_vblank_us_;
+     const auto consider = [&](std::uint64_t value) {
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index 8a5b4a7..4e5199c 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -134,6 +134,7 @@ struct WaitState {
+     std::uint32_t timeout_address{};
+     std::optional<std::uint64_t> deadline_us;
+     HostWaitPoll host_poll;       // WaitType::Host
++    bool zero_time{false};        // WaitType::Host: the host's own work (the GE thread), which takes no emulated time
+ };
+ 
+ struct Thread {
+@@ -401,7 +402,10 @@ public:
+     // looks for work, and at least every kHostWaitPollUs of emulated time,
+     // which the kernel holds to real time. `timeout_us` (emulated time; none
+     // waits indefinitely) makes the last poll a timed-out one.
+-    void wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeout_us, HostWaitPoll poll);
++    // `zero_time`: what is awaited is the host's own computing (the GE thread drawing), which the guest would have found
++    // already done on a PSP that draws as it is told: with the virtual clock no emulated time passes while it runs, so the
++    // run does not depend on how fast the host is (a threaded run then equals an unthreaded one, flip for flip).
++    void wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeout_us, HostWaitPoll poll, bool zero_time = false);
+     // Calls a guest function from an HLE import, in the calling thread, the
+     // way a library calls back into the game: the function runs like any
+     // other guest code, so it may block, and when it has returned `on_return` gets
+@@ -543,6 +547,7 @@ private:
+     // however fast frames are drawn and presented. False when pacing is off.
+     bool pace_to_real_time();
+     [[nodiscard]] std::optional<std::uint64_t> next_event_us() const;
++    [[nodiscard]] bool zero_time_host_wait_pending() const;
+     void process_timers();
+     bool begin_pending_interrupt(AllegrexContext &ctx);
+     void finish_wait_timeout(Thread &thread);

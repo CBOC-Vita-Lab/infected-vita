@@ -1,0 +1,1 @@
+2:shot=menu_open,4:RIGHT,5:-,6:DOWN,7:-,8:RIGHT,9:-,10:DOWN,11:-,12:RIGHT,13:-,14:DOWN,15:-,16:RIGHT,17:-,18:UP,19:-,20:UP,21:-,22:UP,23:-,25:shot=menu_changed,26:R,27:-,28:DOWN,29:-,30:RIGHT,31:-,32:UP,33:-,35:shot=menu_performance,36:L,37:-,38:CIRCLE,39:-

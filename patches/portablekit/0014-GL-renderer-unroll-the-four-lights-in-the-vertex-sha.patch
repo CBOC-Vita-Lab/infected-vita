@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 03:13:09 +0000
+Subject: [PATCH] GL renderer: unroll the four lights in the vertex shader (the
+ loop with a continue never finishes its first draw in Vita3K); log program
+ links under trace
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index a14dbfd..eb0991e 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -401,6 +401,9 @@ struct GlRenderer::Impl {
+         const std::string name = glsl::describe(flags);
+         program->failed = !link(*program, glsl::vertex_source(flags), glsl::fragment_source(flags), name.c_str(), false);
+         variant_names.push_back(name + (program->failed ? " (failed)" : ""));
++        if (settings.trace)
++            std::cerr << "[gl] program " << name << " flags 0x" << std::hex << flags << std::dec
++                      << (program->failed ? " FAILED" : " linked") << " (" << variant_names.size() << " variants)\n";
+         if (!program->failed) {
+             use_program(*program);
+             if (program->location[glsl::kUTexture] != -1) glUniform1i(program->location[glsl::kUTexture], 0);
+diff --git a/host/gpu/gl/gl_shaders.cpp b/host/gpu/gl/gl_shaders.cpp
+index e8870be..4fd16bf 100644
+--- a/host/gpu/gl/gl_shaders.cpp
++++ b/host/gpu/gl/gl_shaders.cpp
+@@ -22,6 +22,41 @@ std::string defines(std::uint32_t flags) {
+     return out;
+ }
+ 
++// One light's term of light_vertex(), instantiated for each of the four lights: no loop and no `continue`
++// (vitaShaRK's GXP for the loop spins forever in Vita3K's translation; unrolled, the branches are plain).
++const char *const kLightTerm = R"GLSL(
++    if (u_light_position[@I@].w >= 0.5) {
++        float type = u_light_direction[@I@].w;
++        float kind = u_light_attenuation[@I@].w;
++        vec3 to_light = u_light_position[@I@].xyz;
++        float scale = 1.0;
++        if (type > 0.5) {
++            to_light -= world_position;
++            float light_distance = length(to_light);
++            vec3 k = u_light_attenuation[@I@].xyz;
++            scale = clamp(1.0 / max(k.x + k.y * light_distance + k.z * light_distance * light_distance, 1e-20), 0.0, 1.0);
++        }
++        to_light = dot(to_light, to_light) > 0.0 ? normalize(to_light) : vec3(0.0, 0.0, 1.0);
++        if (type > 1.5) {
++            vec3 axis = u_light_direction[@I@].xyz;
++            axis = dot(axis, axis) > 0.0 ? normalize(axis) : vec3(0.0, 0.0, 1.0);
++            float angle = dot(axis, -to_light);
++            scale *= angle >= u_light_spot[@I@].y ? pow(max(angle, 0.0), u_light_spot[@I@].x) : 0.0;
++        }
++        float n_dot_l = dot(normal, to_light);
++        float diffuse = max(n_dot_l, 0.0);
++        if (kind > 1.5) diffuse = pow(diffuse, power);
++        sum += (u_light_ambient[@I@].rgb * ambient_material.rgb +
++                u_light_diffuse[@I@].rgb * diffuse_material * diffuse) * scale;
++        if (kind > 0.5 && kind < 1.5 && n_dot_l >= 0.0) {
++            // The viewer is taken to look down z, as the GE does.
++            vec3 half_vector = normalize(to_light + vec3(0.0, 0.0, 1.0));
++            specular += u_light_specular[@I@].rgb * specular_material *
++                        pow(max(dot(normal, half_vector), 0.0), power) * scale;
++        }
++    }
++)GLSL";
++
+ // The GE's per-vertex lighting, evaluated in world space; the same model as
+ // ge.vert's light_vertex() (host/gpu/shaders), in GLSL ES 1.00: no integers
+ // in the masks, no mat3(mat4), loops with constant bounds.
+@@ -82,37 +117,7 @@ void light_vertex(out vec4 color, out vec3 separate_specular) {
+ 
+     vec3 sum = u_emissive.rgb + u_ambient.rgb * ambient_material.rgb;
+     vec3 specular = vec3(0.0);
+-    for (int i = 0; i < 4; ++i) {
+-        if (u_light_position[i].w < 0.5) continue;
+-        float type = u_light_direction[i].w;
+-        float kind = u_light_attenuation[i].w;
+-        vec3 to_light = u_light_position[i].xyz;
+-        float scale = 1.0;
+-        if (type > 0.5) {
+-            to_light -= world_position;
+-            float light_distance = length(to_light);
+-            vec3 k = u_light_attenuation[i].xyz;
+-            scale = clamp(1.0 / max(k.x + k.y * light_distance + k.z * light_distance * light_distance, 1e-20), 0.0, 1.0);
+-        }
+-        to_light = dot(to_light, to_light) > 0.0 ? normalize(to_light) : vec3(0.0, 0.0, 1.0);
+-        if (type > 1.5) {
+-            vec3 axis = u_light_direction[i].xyz;
+-            axis = dot(axis, axis) > 0.0 ? normalize(axis) : vec3(0.0, 0.0, 1.0);
+-            float angle = dot(axis, -to_light);
+-            scale *= angle >= u_light_spot[i].y ? pow(max(angle, 0.0), u_light_spot[i].x) : 0.0;
+-        }
+-        float n_dot_l = dot(normal, to_light);
+-        float diffuse = max(n_dot_l, 0.0);
+-        if (kind > 1.5) diffuse = pow(diffuse, power);
+-        sum += (u_light_ambient[i].rgb * ambient_material.rgb +
+-                u_light_diffuse[i].rgb * diffuse_material * diffuse) * scale;
+-        if (kind > 0.5 && kind < 1.5 && n_dot_l >= 0.0) {
+-            // The viewer is taken to look down z, as the GE does.
+-            vec3 half_vector = normalize(to_light + vec3(0.0, 0.0, 1.0));
+-            specular += u_light_specular[i].rgb * specular_material *
+-                        pow(max(dot(normal, half_vector), 0.0), power) * scale;
+-        }
+-    }
++@LIGHTS@
+     float alpha = u_ambient.a * ambient_material.a;
+     if (u_material_diffuse.w > 0.5) {
+         separate_specular = clamp(specular, 0.0, 1.0);
+@@ -253,7 +258,21 @@ void main() {
+ 
+ const char *uniform_name(Uniform uniform) { return kUniformNames[uniform]; }
+ 
+-std::string vertex_source(std::uint32_t flags) { return "#version 100\n" + defines(flags) + kVertexSource; }
++std::string vertex_source(std::uint32_t flags) {
++    std::string source = kVertexSource;
++    std::string lights;
++    if ((flags & kLight) != 0u) {
++        for (int light = 0; light < 4; ++light) {
++            std::string term = kLightTerm;
++            for (std::size_t at = term.find("@I@"); at != std::string::npos; at = term.find("@I@", at + 1u))
++                term.replace(at, 3u, std::to_string(light));
++            lights += term;
++        }
++    }
++    const std::size_t at = source.find("@LIGHTS@");
++    if (at != std::string::npos) source.replace(at, 8u, lights);
++    return "#version 100\n" + defines(flags) + source;
++}
+ 
+ std::string fragment_source(std::uint32_t flags) { return "#version 100\n" + defines(flags) + kFragmentSource; }
+ 

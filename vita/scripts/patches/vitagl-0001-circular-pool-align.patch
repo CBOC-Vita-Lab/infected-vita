@@ -1,0 +1,15 @@
+diff --git a/source/vgl.c b/source/vgl.c
+index bf5e4d4..9667236 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -147,6 +147,10 @@ static uint8_t *circular_data_pool_limit;
+ #endif
+ uint32_t circular_data_pool_size = CIRCULAR_POOL_SIZE_DEF;
+ uint8_t *vgl_reserve_data_pool(uint32_t size) {
++	// Infected port: every reservation is rounded up to 16 bytes, so the block after an odd-sized one (a U16 index list of
++	// an odd count, say) stays aligned for the float data the next draw writes there. Unpatched, the next block can start
++	// 2 bytes off, which ends in an ARM alignment fault on the console (reported by the strikersVita port, Oct 2026).
++	size = (size + 15u) & ~15u;
+ #ifndef CIRCULAR_POOL_SPEEDHACK
+ 	uint8_t *res = circular_data_pool_ptr[vgl_circular_idx];
+ 	circular_data_pool_ptr[vgl_circular_idx] += size;

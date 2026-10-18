@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:22:38 +0000
+Subject: [PATCH] docs: light specialisation and its measured program sizes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 4099fc6..47cc136 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -50,8 +50,10 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   The choices used to be uniforms too, which kept the programs to eleven; on the PS Vita's GPU that made every
+   fragment program 110 to 190 instructions (read from the compiled GXP headers), most of it comparisons and
+   branches the pixel never takes. Specialised, a textured, fogged, alpha-tested program is a handful of
+-  instructions, and an alpha test that always passes has no `discard`. `GL_SPECIALIZE=0` (`--set specialize=0`)
+-  goes back to the uniform-driven programs; both give the same pictures.
++  instructions, and an alpha test that always passes has no `discard`. Lit programs are also keyed on each
++  light's shape (off, directional, point or spot; plain diffuse or not), which takes the Vita's vertex lighting
++  program from about 600 instructions to 96–182. `GL_SPECIALIZE=0` (`--set specialize=0`) goes back to the
++  uniform-driven programs; both give the same pictures.
+ * **Blending without `glBlendColor`.** `GL_CONSTANT_COLOR` factors are used only where the driver has them and
+   the setting `no_blend_color` is off; otherwise the fragment shader pre-multiplies (`u_blend.x`: 1 doubles the
+   source alpha, 2 doubles and complements, 3 multiplies by a fixed colour, 4 a fixed colour against its

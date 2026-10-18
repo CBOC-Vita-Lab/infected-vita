@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 13:18:33 +0000
+Subject: [PATCH] settings: the HD movies row says EXPERIMENTAL (description
+ and the greyed reason)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 47a8aa3..fc187f5 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -44,7 +44,7 @@ const KeyInfo kTable[kKeyCount] = {
+      "How 480x272 movies are enlarged to the screen.", 2, 0,
+      {"sharp", "bilinear"}, {"Sharp", "Bilinear"}, {L, N}, 0, false},
+     {Key::GfxHdMovies, "gfx.hd_movies", Page::Graphics, "HD movies",
+-     "Replacement movies of higher quality.", 2, 0,
++     "EXPERIMENTAL: 960x544 replacement movies.", 2, 0,
+      {"off", "on"}, {"Off", "On"}, {N, L}, 0, false},
+     {Key::PerfFrameCap, "perf.frame_cap", Page::Performance, "Frame limit",
+      "Most frames shown per second. 30 saves power.", 3, 0,
+@@ -209,7 +209,7 @@ Settings::Settings() {
+     }
+     // What this program cannot offer. A platform or a feature module changes these with set_unavailable().
+     unavailable_[static_cast<std::size_t>(Key::GfxHdTextures)] = "No texture pack installed.";
+-    unavailable_[static_cast<std::size_t>(Key::GfxHdMovies)] = "No replacement movies yet.";
++    unavailable_[static_cast<std::size_t>(Key::GfxHdMovies)] = "Experimental. No replacement movies yet.";
+     unavailable_[static_cast<std::size_t>(Key::PerfThreadedRenderer)] = "Renderer thread not built yet.";
+     // The two gameplay rows belong to a game's profile (infected_tuning.cpp makes them usable); a program without one keeps them greyed.
+     unavailable_[static_cast<std::size_t>(Key::PerfEnemyDensity)] = "Only while the game runs.";

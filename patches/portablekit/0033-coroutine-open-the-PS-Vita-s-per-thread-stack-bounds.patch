@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:32:08 +0000
+Subject: [PATCH] coroutine: open the PS Vita's per-thread stack bounds so
+ guest threads can make system calls
+
+On a retail Vita the kernel ends the process (stop reason 0x10006, no exception) when a
+thread enters the kernel with its stack pointer outside the bounds stored in its TLS block
+(thread pointer - 0x800, words 2 and 3). Every guest thread runs on a heap-allocated
+coroutine stack, so the first file read from a guest thread killed the game 3 s after boot.
+Vita3K does not check this.
+
+Measured with a probe on the console (firmware 3.65): on a foreign stack lseek, read and
+delay fail and pre-emption by another thread kills the process; Sony's fiber library
+rewrites exactly those two words; rewriting them per switch still dies when the thread is
+pre-empted between the write and the stack change; bounds 0..0xFFFFFFFF pass every call
+and 3 s of pre-emption at 3 kHz, on the coroutine stack and on the thread's own.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/coroutine.cpp b/src/coroutine.cpp
+index 912e19f..e131be2 100644
+--- a/src/coroutine.cpp
++++ b/src/coroutine.cpp
+@@ -250,7 +250,33 @@ void Coroutine::release() noexcept {
+     mapped_ = false;
+ }
+ 
++#if defined(__vita__)
++namespace {
++// The PS Vita kernel ends the process (thread stop reason 0x10006 in the crash dump, no exception) when a thread enters
++// the kernel with its stack pointer outside the bounds that thread advertises. It looks on most system calls (file I/O
++// and waits; a plain time read is exempt) and whenever the thread is pre-empted by another one. The bounds are two words
++// of the thread's own storage block, 0x800 below the thread pointer: word 2 = stack top, word 3 = stack bottom. Sony's
++// fiber library rewrites those two words on a fiber switch. A coroutine switch that leaves them alone dies at the guest's
++// first file read; one that rewrites them per switch dies seconds later, pre-empted between the write and the stack
++// change. Opening the bounds once, to the whole address space, is accepted by the kernel on either kind of stack and has
++// no window. Measured on a retail console (firmware 3.65) with the probe in the port's tools/hw/probe: foreign stack with
++// the bounds untouched -> killed at lseek/read/delay and under pre-emption; bounds 0..0xFFFFFFFF -> every call and
++// 3 s of pre-emption at 3 kHz pass, on the coroutine stack and on the thread's own.
++inline void open_system_stack_bounds() noexcept {
++    std::uint32_t *thread_pointer;
++    asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(thread_pointer));
++    auto *block = reinterpret_cast<std::uint32_t *>(reinterpret_cast<std::uint8_t *>(thread_pointer) - 0x800);
++    block[2] = 0xFFFFFFFFu;
++    block[3] = 0u;
++}
++} // namespace
++#endif
++
+ void Coroutine::switch_to(Coroutine &from, Coroutine &to) noexcept {
++#if defined(__vita__)
++    // Per switch and not once: whichever host thread runs coroutines gets it, and two stores cost nothing next to the switch.
++    open_system_stack_bounds();
++#endif
+     pk_co_switch(&from.sp_, to.sp_);
+ }
+ 

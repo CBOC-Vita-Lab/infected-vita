@@ -1,0 +1,881 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 05:02:55 +0000
+Subject: [PATCH] Join the branches: HD textures follow gfx.hd_textures,
+ threaded settings menu, frame cap in the flip limiter
+
+- HD textures read gfx.hd_textures from the port settings (Auto = best pack present), flush and reload live when the
+  setting changes, enable the greyed row when a pack is found; the old HD_TEXTURES env maps to a developer override.
+- HD replacement filtering: the replacement keeps its own mips (no glGenerateMipmap over it); gfx.mipmaps=off uses level 0
+  only, gfx.texture_filter=original keeps minification linear and follows the game's filter for magnification.
+- The settings menu with the GE thread: the guest runs the modal loop under the kernel pause and posts every paint,
+  screenshot and event pump to the GE thread (the GL context is the GE thread's); the menu is never painted while it is
+  updated.
+- perf.frame_cap is the guest-side flip limiter (sceDisplaySetFrameBuf): 60 = one flip per refresh, 30 = every other, off
+  = none. GameProfile::frame_vblanks only places the interpolation grid and never limited anything.
+- perf.threaded_renderer comes from the port settings; the desktop executable runs the guest on a thread of its own and the
+  GE thread on the main one (INFECTED_THREADED_RENDERER=0 for the old single thread).
+- The settings chord does not fire with L or R held (START+SELECT+L+R is the Vita application's exit).
+- ge_replay: --hd follow, --port-switch FLIP:KEY=VALUE.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+index 71ae4cb..5e23be7 100644
+--- a/host/gpu/ge_worker.cpp
++++ b/host/gpu/ge_worker.cpp
+@@ -1,6 +1,7 @@
+ #include "gpu/ge_worker.hpp"
+ 
+ #include "kernel/kernel_platform.hpp"
++#include "settings/port_settings.hpp"
+ #include "profile.hpp"
+ 
+ #include <algorithm>
+@@ -107,30 +108,11 @@ bool ge_worker_setting_enabled() {
+     // The recorder reads guest memory at the moment a list is run and the bench accounts wall time by category on one
+     // thread: both need the lists to run where the guest asked for them.
+     if (portablekit::env("GE_DUMP") != nullptr || portablekit::env("BENCH") != nullptr) return false;
++    // The older developer switch <PREFIX>_THREADED_RENDERER (0/1/on/off), which config.txt's threaded_renderer= exports.
+     if (const char *value = portablekit::env("THREADED_RENDERER")) return parse_flag(value, true);
+-    const char *dir = portablekit::env("DATA_DIR");
+-    if (dir == nullptr || *dir == '\0') return true;
+-    std::string path = dir;
+-    if (path.back() != '/') path += '/';
+-    path += "settings.txt";
+-    std::FILE *file = std::fopen(path.c_str(), "rb");
+-    if (file == nullptr) return true;
+-    bool enabled = true;
+-    char line[256];
+-    while (std::fgets(line, sizeof(line), file) != nullptr) {
+-        std::string text = line;
+-        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+-        const std::size_t equals = text.find('=');
+-        if (equals == std::string::npos) continue;
+-        std::string key = text.substr(0, equals);
+-        while (!key.empty() && key.back() == ' ') key.pop_back();
+-        if (key != "perf.threaded_renderer") continue;
+-        std::size_t begin = equals + 1u;
+-        while (begin < text.size() && text[begin] == ' ') ++begin;
+-        enabled = parse_flag(text.substr(begin), true);
+-    }
+-    std::fclose(file);
+-    return enabled;
++    // perf.threaded_renderer of the port settings (developer override, then settings.txt, then on). The caller has
++    // initialised them (overlay_host::init_settings(), which the system install does when it makes the renderer).
++    return port::threaded_renderer();
+ }
+ 
+ GeWorker::GeWorker(std::uint32_t capacity)
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+index bf7f8c6..b520758 100644
+--- a/host/gpu/ge_worker.hpp
++++ b/host/gpu/ge_worker.hpp
+@@ -46,9 +46,11 @@ struct GeWorkerPlatform {
+ void set_ge_worker_platform(const GeWorkerPlatform &platform) noexcept;
+ [[nodiscard]] const GeWorkerPlatform &ge_worker_platform() noexcept;
+ 
+-// The setting: <PREFIX>_THREADED_RENDERER (0/1/on/off) if set, else `perf.threaded_renderer` in settings.txt in the data
+-// root (<PREFIX>_DATA_DIR; the file's `key=value` lines, unknown keys ignored), else on. Always off while the GE recorder
+-// (<PREFIX>_GE_DUMP) or the bench (<PREFIX>_BENCH) is on.
++// The setting: perf.threaded_renderer of the port settings (host/settings/port_settings.hpp: the developer override
++// <PREFIX>_PERF_THREADED_RENDERER, else settings.txt in the data root, else on); the older <PREFIX>_THREADED_RENDERER (0/1/on/off,
++// config.txt's threaded_renderer=) decides when it is set. Always off while the GE recorder (<PREFIX>_GE_DUMP) or the bench
++// (<PREFIX>_BENCH) is on. The port settings must have been loaded (overlay_host::init_settings(), done when the system is
++// installed). The thread is made once: a change in the overlay takes a restart.
+ [[nodiscard]] bool ge_worker_setting_enabled();
+ 
+ class GeWorker {
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index d9bc17c..7fb34bb 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -1,5 +1,6 @@
+ #include "gl_hd_textures.hpp"
+ 
++#include "../../settings/port_settings.hpp"
+ #include "../texture_decode.hpp"
+ #include "gl_platform.h"
+ 
+@@ -102,6 +103,7 @@ GlHdTextures::~GlHdTextures() = default;
+ 
+ void GlHdTextures::configure(const HdConfig &config) {
+     config_ = config;
++    settings_generation_ = port::settings().generation();
+     if (!config_.dump_dir.empty() && !dump_.active()) dump_.open(config_.dump_dir, config_.dump_raw);
+     open_pack();
+     if (config_.log && (pack_.is_open() || dump_.active()))
+@@ -137,16 +139,15 @@ void GlHdTextures::set_mode(HdMode mode) {
+ 
+ bool GlHdTextures::tick(std::uint64_t frame) {
+     frame_ = frame;
+-    if (frame < last_poll_ || frame >= last_poll_ + 60u) {
+-        last_poll_ = frame;
+-        // The environment decides for the whole run; otherwise settings.txt may have been edited (the overlay saves it).
+-        if (std::getenv("INFECTED_HD_TEXTURES") == nullptr) {
+-            std::error_code error;
+-            const auto time = std::filesystem::last_write_time(config_.data_root / "settings.txt", error);
+-            if (!error && time != settings_time_) {
+-                settings_time_ = time;
+-                set_mode(hd_textures_setting(config_.data_root));
+-            }
++    // gfx.hd_textures is a port setting the overlay changes while the game runs: a new generation of the settings is a
++    // reason to look again (a handful of atomic loads, once per display list). A replayer that named the mode itself does
++    // not follow.
++    if (config_.follow_settings) {
++        const std::uint32_t generation = port::settings().generation();
++        if (generation != settings_generation_) {
++            settings_generation_ = generation;
++            const HdMode wanted = hd_textures_setting(config_.data_root);
++            if (wanted != config_.mode) set_mode(wanted);
+         }
+     }
+     const bool changed = mode_changed_;
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index 61a089c..0673b19 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -44,8 +44,9 @@ public:
+     [[nodiscard]] HdMode mode() const noexcept { return config_.mode; }
+     [[nodiscard]] bool has_pack() const noexcept { return pack_.is_open(); }
+     [[nodiscard]] std::uint32_t scale() const noexcept { return pack_.is_open() ? pack_.scale() : 1u; }
+-    // Once per display list: re-reads the setting now and then; true when the mode changed since the last
+-    // call, i.e. the renderer has to clear its texture cache so every texture is uploaded again.
++    // Once per display list: looks at gfx.hd_textures when the port settings changed (HdConfig::follow_settings); true
++    // when the mode changed since the last call, i.e. the renderer has to clear its texture cache so every texture is
++    // uploaded again.
+     bool tick(std::uint64_t frame);
+ 
+     // Whether the texture hook has anything to do (a pack is loaded or a dump is being written).
+@@ -84,7 +85,7 @@ private:
+     bool logged_exhausted_{};
+     bool missing_logged_{};
+     bool mode_changed_{};
+-    std::uint64_t last_poll_{};
++    std::uint32_t settings_generation_{};   // of the port settings when the mode was last derived from them
+     std::uint64_t frame_{};
+     struct Thrash {
+         std::uint64_t window_start{};
+@@ -93,7 +94,6 @@ private:
+         bool logged{};
+     };
+     std::unordered_map<std::uint64_t, Thrash> thrash_;   // image key -> recolours in the current window
+-    std::filesystem::file_time_type settings_time_{};
+     std::vector<std::uint8_t> blob_;
+     std::vector<std::uint32_t> decode_;
+     std::vector<std::uint32_t> recolour_base_, recolour_level_, recolour_mip_;
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index fe7aac4..162a4b5 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -476,6 +476,15 @@
+ 
+     // A 3D draw is about to sample `entry`: classify it and, with gfx.mipmaps, give it its chain.
+     void note_3d_use(TextureEntry &entry, const DrawCall &call, const GuestMemory &memory) {
++        if (entry.hd.replaced) {
++            // An HD replacement brings its own mip chain (the pack tool built it from the upscaled picture, alpha coverage
++            // kept). Nothing is generated over it: glGenerateMipmap would overwrite the pack's levels (and is not defined
++            // for a compressed texture), and the original's alpha scan and atlas check say nothing about the new texels.
++            // gfx.mipmaps decides only whether the levels are sampled (see the filter choice in submit()).
++            entry.mips_tried = true;
++            entry.mip_levels = std::max<std::uint32_t>(entry.hd.mips, 1u);
++            return;
++        }
+         ensure_traits(entry, memory);
+         if (entry.uv_verdict != 2u && (call.texture.wrap_s != 0u || call.texture.wrap_t != 0u)) check_uv_coverage(entry, call);
+         if (opt.mips && !entry.mips_tried) build_mips(entry, call, memory);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 95f5802..9c6baf7 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1874,9 +1874,16 @@ struct GlRenderer::Impl {
+             state.min_filter = with_mips ? GL_LINEAR_MIPMAP_LINEAR : (linear_min ? GL_LINEAR : GL_NEAREST);
+             state.mag_filter = linear_mag ? GL_LINEAR : GL_NEAREST;
+             if (binding.hd_mips != 0u) {
+-                // An HD replacement has several texels to the game's one: filter it smoothly, through its mips.
+-                state.min_filter = binding.hd_mips > 1u ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR;
+-                state.mag_filter = GL_LINEAR;
++                // An HD replacement has several texels to the game's one, so it is never sampled with NEAREST when it is
++                // made smaller on the screen (a 4x texture drawn at the display's 2x would alias): its minification is
++                // linear through the pack's own mip chain (gfx.mipmaps on) or linear on the base level (off). The
++                // magnification follows gfx.texture_filter: smooth is linear, original keeps the game's own filter. The
++                // replayer's baseline (no port options) behaves as smooth.
++                const bool pack_mips = binding.hd_mips > 1u && (!settings.use_port_options || opt.mips);
++                const bool smooth = !settings.use_port_options || opt.smooth;
++                state.min_filter = pack_mips ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR;
++                state.mag_filter = (smooth || linear_mag) ? GL_LINEAR : GL_NEAREST;
++                if (pack_mips && !through) ++st().mip_draws;
+             }
+             if (sharpen) {
+                 // The shader's weights assume the hardware's bilinear fetch.
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index b563d8d..70ff61e 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -1,6 +1,7 @@
+ #include "hd_texture_pack.hpp"
+ 
+ #include "../profile.hpp"
++#include "../settings/port_settings.hpp"
+ #include "texture_key.hpp"
+ 
+ #include <algorithm>
+@@ -295,33 +296,55 @@ std::filesystem::path hd_data_root() {
+     return std::filesystem::current_path();
+ }
+ 
++namespace {
++// The best pack present in the data root: 4x, else 2x, else none (what gfx.hd_textures=auto means).
++HdMode best_pack_present(const std::filesystem::path &data_root) {
++    // Plain stdio, not std::filesystem::exists: a path like ux0:data/infected/ is the Vita's, and stdio is what the pack
++    // itself is read with.
++    const auto exists = [&data_root](const char *name) {
++        std::FILE *file = std::fopen((data_root / name).string().c_str(), "rb");
++        if (file == nullptr) return false;
++        std::fclose(file);
++        return true;
++    };
++    if (exists("texpack_4x.bin")) return HdMode::X4;
++    if (exists("texpack_2x.bin")) return HdMode::X2;
++    return HdMode::Off;
++}
++} // namespace
++
++bool hd_pack_present(const std::filesystem::path &data_root) { return best_pack_present(data_root) != HdMode::Off; }
++
+ HdMode hd_textures_setting(const std::filesystem::path &data_root) {
+-    // This function is the one place gfx.hd_textures is read; the port settings header replaces its body.
+-    HdMode mode = HdMode::Off;
+-    if (const char *text = env_any("HD_TEXTURES")) {
+-        if (hd_parse_mode(text, mode)) return mode;
+-        std::cerr << "[hdtex] " << text << " is not off, 2x or 4x\n";
++    // THE place gfx.hd_textures is read: the port settings (host/settings/port_settings.hpp), where the developer
++    // override <PREFIX>_GFX_HD_TEXTURES (and its older name <PREFIX>_HD_TEXTURES, mapped in hd_config_from_environment())
++    // and the player's settings.txt are already layered. "auto" is the best pack present.
++    switch (port::hd_textures()) {
++    case port::HdTextures::Off: return HdMode::Off;
++    case port::HdTextures::X2: return HdMode::X2;
++    case port::HdTextures::X4: return HdMode::X4;
++    case port::HdTextures::Auto: break;
+     }
+-    std::ifstream settings(data_root / "settings.txt");
+-    std::string line;
+-    while (std::getline(settings, line)) {
+-        const std::size_t eq = line.find('=');
+-        if (eq == std::string::npos || trim(line.substr(0, eq)) != "gfx.hd_textures") continue;
+-        const std::string value = trim(line.substr(eq + 1));
+-        if (hd_parse_mode(value, mode)) return mode;
+-        break;  // "auto" or a word we do not know: the default below
+-    }
+-    // Default: the best pack present.
+-    std::error_code ignored;
+-    if (std::filesystem::exists(data_root / "texpack_4x.bin", ignored)) return HdMode::X4;
+-    if (std::filesystem::exists(data_root / "texpack_2x.bin", ignored)) return HdMode::X2;
+-    return HdMode::Off;
++    return best_pack_present(data_root);
+ }
+ 
+ HdConfig hd_config_from_environment() {
+     HdConfig config;
+     config.data_root = hd_data_root();
++    // <PREFIX>_HD_TEXTURES=off|2x|4x was the switch before the port settings existed; it stays as a developer override of
++    // gfx.hd_textures (a value that is not a mode is reported and ignored).
++    if (const char *text = env_any("HD_TEXTURES")) {
++        HdMode requested = HdMode::Off;
++        if (hd_parse_mode(text, requested)) {
++            (void)port::settings().override_value(port::Key::GfxHdTextures, hd_mode_name(requested));
++        } else {
++            std::cerr << "[hdtex] " << text << " is not off, 2x or 4x\n";
++        }
++    }
++    // A pack in the data root makes the setting available (the overlay greys the row otherwise).
++    if (hd_pack_present(config.data_root)) port::settings().set_unavailable(port::Key::GfxHdTextures, nullptr);
+     config.mode = hd_textures_setting(config.data_root);
++    config.follow_settings = true;
+     if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = std::strtoull(text, nullptr, 10) * 1024ull * 1024ull;
+     if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
+     config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index 667d17c..147cc2b 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -120,16 +120,20 @@ struct HdConfig {
+     std::filesystem::path dump_dir;    // INFECTED_TEX_DUMP: write every distinct texture seen, empty for none
+     bool dump_raw{};                   // also write <key>.raw (state, texel bytes, palette) for the pack tools
+     bool log{true};
++    // The mode follows gfx.hd_textures (host/settings/port_settings.hpp) while the program runs: GlHdTextures::tick() looks
++    // at the setting's generation and switches (every texture is uploaded again). A replayer that names the mode itself
++    // leaves this off.
++    bool follow_settings{false};
+ };
+ 
+-// THE place gfx.hd_textures is read from. Until host/settings/port_settings.hpp lands this looks at
+-// <PREFIX>_HD_TEXTURES (off|2x|4x) and then at settings.txt in the data root; replace the body by a
+-// lookup in the port settings header. `auto_best` is what the setting's default means: the largest
+-// pack present in the data root.
++// THE place gfx.hd_textures is read from: the port settings (host/settings/port_settings.hpp). `auto` (the setting's
++// default) is the largest pack present in the data root.
+ [[nodiscard]] HdMode hd_textures_setting(const std::filesystem::path &data_root);
+ // The port data root ($<PREFIX>_DATA_DIR).
+ [[nodiscard]] std::filesystem::path hd_data_root();
+-// Mode, data root, budget (<PREFIX>_HD_BUDGET_MB), dump directory (<PREFIX>_TEX_DUMP) from the environment and settings.txt.
++// Whether texpack_2x.bin or texpack_4x.bin is in the data root.
++[[nodiscard]] bool hd_pack_present(const std::filesystem::path &data_root);
++// Mode, data root, budget (<PREFIX>_HD_BUDGET_MB), dump directory (<PREFIX>_TEX_DUMP) from the environment and the port settings.
+ [[nodiscard]] HdConfig hd_config_from_environment();
+ [[nodiscard]] const char *hd_mode_name(HdMode mode);
+ [[nodiscard]] bool hd_parse_mode(const std::string &text, HdMode &mode);
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index c8553bf..061bfa8 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -378,6 +378,47 @@ std::uint64_t frame_start_us(std::uint64_t latest_vblank_us) {
+     return start;
+ }
+ 
++#if defined(PORTABLEKIT_GPU_RENDERER)
++// <prefix>_SCREENSHOT_FLIPS=A,B-C,D-E/STEP: capture the presented picture at those flips (the guest's
++// sceDisplaySetFrameBuf count, 1 for the first; the numbering of <prefix>_SHOT_FLIPS) into
++// <dir>/flip_NNNNNN.png. With it set, <prefix>_SCREENSHOT_EVERY is not used unless given too. Returns the path to
++// capture this flip to (<prefix>_SCREENSHOT_DIR is set), or an empty string.
++std::string screenshot_path_for_flip(std::uint64_t flip) {
++    struct FlipRange {
++        std::uint64_t first{}, last{}, step{1};
++    };
++    static const char *directory = portablekit::env("SCREENSHOT_DIR");
++    static const std::vector<FlipRange> ranges = [] {
++        std::vector<FlipRange> list;
++        const char *text = portablekit::env("SCREENSHOT_FLIPS");
++        if (text == nullptr) return list;
++        std::stringstream items(text);
++        std::string item;
++        while (std::getline(items, item, ',')) {
++            FlipRange r;
++            char *end = nullptr;
++            r.first = std::strtoull(item.c_str(), &end, 10);
++            r.last = r.first;
++            if (*end == '-') r.last = std::strtoull(end + 1, &end, 10);
++            if (*end == '/') r.step = std::max<std::uint64_t>(1u, std::strtoull(end + 1, nullptr, 10));
++            list.push_back(r);
++        }
++        return list;
++    }();
++    if (directory == nullptr || ranges.empty()) return std::string();
++    for (const FlipRange &r : ranges) {
++        if (flip >= r.first && flip <= r.last && (flip - r.first) % r.step == 0u) {
++            char name[64];
++            std::snprintf(name, sizeof name, "/flip_%06llu.png", static_cast<unsigned long long>(flip));
++            return std::string(directory) + name;
++        }
++    }
++    return std::string();
++}
++
++bool run_settings_overlay(gpu::Renderer &renderer);
++#endif
++
+ #if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
+ // The flip with the GE thread: the guest side captures what only it knows now (the display registers, the emulated time,
+ // the picture of a framebuffer the CPU wrote), and the renderer's part runs on the GE thread in order with the lists the
+@@ -412,8 +453,12 @@ void present_frame_threaded(Runtime &rt) {
+         const char *text = portablekit::env("SCREENSHOT_EVERY");
+         return text != nullptr ? std::strtoull(text, nullptr, 10) : 60ull;
+     }();
++    static const bool screenshot_flips_set = portablekit::env("SCREENSHOT_FLIPS") != nullptr &&
++                                             portablekit::env("SCREENSHOT_EVERY") == nullptr;
+     ++media().presents_posted;
+-    gpu::ge_worker().post([&rt, renderer, address, display, picture = std::move(picture), from_memory, fast, real_time] {
++    // <prefix>_SCREENSHOT_FLIPS: the picture this flip presents, captured by the GE thread right after it.
++    const std::string flip_shot = screenshot_path_for_flip(bringup::flip_count() + 1u);
++    gpu::ge_worker().post([&rt, renderer, address, display, picture = std::move(picture), from_memory, fast, real_time, flip_shot] {
+         const perf::Clock::time_point present_start = perf::Clock::now();
+         if (from_memory)
+             renderer->upload_frame(address, picture.data(), display.width, display.height, display.buffer_width);
+@@ -424,7 +469,10 @@ void present_frame_threaded(Runtime &rt) {
+             (void)renderer->present(address, real_time);
+         }
+         perf::add_render_time(perf::Clock::now() - present_start);
+-        if (screenshot_dir != nullptr && screenshot_every != 0u && renderer->frames_presented() % screenshot_every == 0u) {
++        if (!flip_shot.empty() && !renderer->capture_frame(flip_shot))
++            log_once("capture-failed", "[render] cannot capture the frame to " + flip_shot);
++        if (screenshot_dir != nullptr && screenshot_every != 0u && !screenshot_flips_set &&
++            renderer->frames_presented() % screenshot_every == 0u) {
+             const std::string path = std::string(screenshot_dir) + "/frame_" +
+                                      std::to_string(renderer->frames_presented()) + ".bmp";
+             if (!renderer->capture_frame(path))
+@@ -435,6 +483,11 @@ void present_frame_threaded(Runtime &rt) {
+         media().presents_done.fetch_add(1u, std::memory_order_release);
+     });
+     perf::end_frame(kernel().now_us(), true);
++    // The settings menu (chord held, or a platform asked): it opens at the flip, as without the GE thread. The menu is
++    // the guest's, a modal loop under a kernel pause; every GL call of it is posted to the GE thread, which is idle once
++    // it has drawn the picture this flip just handed it.
++    if (overlay_host::open_requested() && !media().window_closed.load(std::memory_order_acquire) && !run_settings_overlay(*renderer))
++        rt.stop("window closed");
+ }
+ #endif
+ 
+@@ -443,11 +496,19 @@ void present_frame_threaded(Runtime &rt) {
+ // panel over it, and the pad drives the menu until it closes. Returns false when the window was closed meanwhile.
+ bool run_settings_overlay(gpu::Renderer &renderer) {
+     overlay_host::ModalHost host;
+-    // The real pad only: the scripted pad runs on emulated time, which stands still in here.
+-    host.device_buttons = [&renderer] {
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++    const bool threaded = ge_threaded();
++#else
++    constexpr bool threaded = false;
++#endif
++    // The real pad only: the scripted pad runs on emulated time, which stands still in here. With the GE thread the
++    // renderer is not touched from this (the guest's) thread at all.
++    host.device_buttons = [&renderer, threaded] {
+         std::uint32_t buttons = 0u;
+-        renderer.sample_pad();
+-        buttons |= renderer.pad().buttons;
++        if (!threaded) {
++            renderer.sample_pad();
++            buttons |= renderer.pad().buttons;
++        }
+         if (const PadProvider provider = pad_provider(); provider != nullptr) {
+             PadSample pad;
+             if (provider(pad)) buttons |= pad.buttons;
+@@ -457,6 +518,19 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+     host.has_device_input = pad_provider() != nullptr;
+ #if defined(PORTABLEKIT_HAS_RENDERER)
+     host.has_device_input = host.has_device_input || media().vulkan != nullptr;
++#endif
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++    if (threaded) {
++        gpu::GeWorker &worker = gpu::ge_worker();
++        // The GE thread draws the panel: the closure of one menu tick is posted to it and waited for. The wait is in host
++        // time (the guest is paused: nothing else of it runs), and the order of the ring guarantees the game's last
++        // picture and everything the GE thread still owed the guest are done before the first tick.
++        host.on_renderer_thread = [&worker](const std::function<void()> &job) {
++            worker.post(job);
++            worker.wait_completed(worker.posted());
++        };
++        worker.wait_completed(worker.posted());
++    }
+ #endif
+     // No guest thread, interrupt, timer or vblank runs inside the scope and emulated time stands still; the
+     // listener registered with the renderer silences the audio and restarts the frame statistics afterwards.
+@@ -464,15 +538,21 @@ bool run_settings_overlay(gpu::Renderer &renderer) {
+     bool window_open = true;
+     {
+         const Kernel::PauseScope pause(kernel());
+-        renderer.pause_interpolation();
++        if (!threaded) renderer.pause_interpolation();
+         window_open = overlay_host::run_modal(renderer, host);
+         // The clock stood still: this is the check that a mission timer cannot have jumped.
+         if (kernel().now_us() != before_us)
+             std::cerr << "[menu] the emulated clock moved while the menu was open: " << before_us << " -> "
+                       << kernel().now_us() << " us" << std::endl;
+     }
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++    if (threaded) {
++        // The frame counter starts over on the GE thread (the pause is not a slow frame).
++        gpu::ge_worker().post([&renderer] { renderer.pause_interpolation(); });
++    }
++#endif
+     std::cerr << "[menu] guest resumed at flip " << bringup::flip_count() << ", emulated time " << kernel().now_us()
+-              << " us (it was " << before_us << " us when the menu opened)" << std::endl;
++              << " us (it was " << before_us << " us when the menu opened)" << (threaded ? " [GE thread]" : "") << std::endl;
+     return window_open;
+ }
+ #endif
+@@ -556,42 +636,13 @@ void present_frame(Runtime &rt) {
+         const char *text = portablekit::env("SCREENSHOT_EVERY");
+         return text != nullptr ? std::strtoull(text, nullptr, 10) : 60ull;
+     }();
+-    // <prefix>_SCREENSHOT_FLIPS=A,B-C,D-E/STEP: capture the presented picture at those flips (the guest's
+-    // sceDisplaySetFrameBuf count, 1 for the first; the numbering of <prefix>_SHOT_FLIPS) into
+-    // <dir>/flip_NNNNNN.png. With it set, <prefix>_SCREENSHOT_EVERY is not used unless given too.
+-    struct FlipRange {
+-        std::uint64_t first{}, last{}, step{1};
+-    };
+-    static const std::vector<FlipRange> screenshot_flips = [] {
+-        std::vector<FlipRange> ranges;
+-        const char *text = portablekit::env("SCREENSHOT_FLIPS");
+-        if (text == nullptr) return ranges;
+-        std::stringstream list(text);
+-        std::string item;
+-        while (std::getline(list, item, ',')) {
+-            FlipRange r;
+-            char *end = nullptr;
+-            r.first = std::strtoull(item.c_str(), &end, 10);
+-            r.last = r.first;
+-            if (*end == '-') r.last = std::strtoull(end + 1, &end, 10);
+-            if (*end == '/') r.step = std::max<std::uint64_t>(1u, std::strtoull(end + 1, nullptr, 10));
+-            ranges.push_back(r);
+-        }
+-        return ranges;
+-    }();
+-    if (screenshot_dir != nullptr && !screenshot_flips.empty()) {
+-        const std::uint64_t flip = bringup::flip_count() + 1u;  // on_flip counts after the present
+-        bool wanted = false;
+-        for (const FlipRange &r : screenshot_flips)
+-            if (flip >= r.first && flip <= r.last && (flip - r.first) % r.step == 0u) wanted = true;
+-        if (wanted) {
+-            char name[64];
+-            std::snprintf(name, sizeof name, "/flip_%06llu.png", static_cast<unsigned long long>(flip));
+-            if (!renderer.capture_frame(std::string(screenshot_dir) + name))
+-                log_once("capture-failed", "[render] cannot capture the frame to " + std::string(screenshot_dir) + name);
+-        }
++    // <prefix>_SCREENSHOT_FLIPS: capture the presented picture at the flips asked for.
++    if (screenshot_dir != nullptr) {
++        const std::string path = screenshot_path_for_flip(bringup::flip_count() + 1u);   // on_flip counts after the present
++        if (!path.empty() && !renderer.capture_frame(path)) log_once("capture-failed", "[render] cannot capture the frame to " + path);
+     }
+-    const bool every_set = portablekit::env("SCREENSHOT_EVERY") != nullptr || screenshot_flips.empty();
++    const bool screenshot_flips_set = portablekit::env("SCREENSHOT_FLIPS") != nullptr;
++    const bool every_set = portablekit::env("SCREENSHOT_EVERY") != nullptr || !screenshot_flips_set;
+     if (screenshot_dir != nullptr && every_set && screenshot_every != 0u &&
+         renderer.frames_presented() % screenshot_every == 0u) {
+         const std::string path = std::string(screenshot_dir) + "/frame_" +
+@@ -851,6 +902,20 @@ std::uint32_t take_ctrl_samples(std::uint32_t count) {
+     return taken;
+ }
+ 
++// The period between two flips the guest is held to, in microseconds of emulated time; 0 for no hold.
++//  * <prefix>_FRAME_LIMIT_US=N, a developer switch, decides alone when it is set.
++//  * Otherwise perf.frame_cap (port settings: the overlay changes it live) with the realtime clock, which is what the
++//    handheld and a desktop run in real time use: 60 is the display's 59.94 Hz, 30 half of it, off none.
++//  * The virtual clock (tests, bench) has no hold unless it is asked for: <prefix>_PERF_FRAME_CAP / <prefix>_FRAME_LIMIT_US,
++//    because there a flip that costs no emulated time is what a replay of the game's work measures.
++std::uint64_t flip_limit_us() {
++    static const char *forced = portablekit::env("FRAME_LIMIT_US");
++    static const std::uint64_t forced_us = forced != nullptr ? static_cast<std::uint64_t>(std::strtoull(forced, nullptr, 10)) : 0u;
++    if (forced != nullptr) return forced_us;
++    if (!kernel().realtime() && !port::settings().overridden(port::Key::PerfFrameCap)) return 0u;
++    return port::frame_cap_period_us();
++}
++
+ void register_display_ctrl(HleRegistrar &hle) {
+     hle.add("sceDisplay", "sceDisplaySetMode", [](Runtime &, AllegrexContext &ctx) {
+         media().display.mode = arg(ctx, 0);
+@@ -891,18 +956,14 @@ void register_display_ctrl(HleRegistrar &hle) {
+             return;
+         }
+ #endif
+-        // <prefix>_FRAME_LIMIT_US=N: a flip comes at least N microseconds of
+-        // emulated time after the one before, as with a frame limiter. A game
+-        // that does not wait for the vblank then runs at the pace a display
+-        // would give it (16683 for 60 Hz), where it otherwise measures frames
+-        // that cost no emulated time at all.
+-        // With the realtime clock (<prefix>_CLOCK=realtime) the display's own period is the
+-        // default: a game that presents faster than 59.94 Hz is held to it.
+-        static const std::uint64_t limit_us = [] {
+-            const char *text = portablekit::env("FRAME_LIMIT_US");
+-            if (text != nullptr) return static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10));
+-            return kernel().realtime() ? kVBlankPeriodUs : std::uint64_t{0};
+-        }();
++        // What bounds the flip rate. Infected does not wait for the vblank (sceDisplaySetFrameBuf with sync = 0, then a
++        // sceKernelDelayThread of 300 us), so without this hold its loop would flip as fast as the host runs it; GameProfile::
++        // frame_vblanks (2, "a 30 fps game") is only the grid the frame interpolation of the Vulkan renderer spaces its
++        // presents by and has no part in it. The hold is here: a flip comes at least `limit_us` microseconds of emulated
++        // time after the one before, as with a frame limiter, and perf.frame_cap sets the period (60: the display's
++        // 16683 us, 30: twice that, off: no hold). The game measures elapsed time, so a longer period lowers the picture's
++        // rate and not the game's speed.
++        const std::uint64_t limit_us = flip_limit_us();
+         if (limit_us != 0u) {
+             static std::uint64_t last_flip_us = 0u;
+             const std::uint64_t now = kernel().now_us();
+@@ -1536,6 +1597,9 @@ static bool create_gl_renderer() {
+     auto renderer = std::make_unique<gpu::GlRenderer>();
+     // <prefix>_GL_<NAME> sets one of gpu::GlSettings (OFFSCREEN_SCALE=2, MERGE=0, TRACE=1, ...).
+     gpu::GlSettings settings = renderer->settings();
++    // perf.frame_cap paces the guest's flips (flip_limit_us(), in sceDisplaySetFrameBuf), not the present: a second hold
++    // in the renderer would only beat against it.
++    settings.apply_frame_cap = false;
+     for (const std::string &name : gpu::gl_setting_names()) {
+         std::string upper = name;
+         for (char &c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+diff --git a/host/main.cpp b/host/main.cpp
+index a326b2a..f8ea05e 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -13,6 +13,7 @@
+ #include "install/installer.hpp"
+ #include "install/user_data.hpp"
+ #include "gpu/ge_state.hpp"
++#include "gpu/ge_worker.hpp"
+ #include "kernel/kernel.hpp"
+ #include "perf/bringup_stats.hpp"
+ 
+@@ -32,6 +33,7 @@
+ #include <iostream>
+ #include <limits>
+ #include <optional>
++#include <stdexcept>
+ #include <string>
+ #include <thread>
+ 
+@@ -426,7 +428,32 @@ int main(int argc, char **argv) {
+ 
+         // The scheduler runs the guest, from the loader thread (install_system started it at
+         // the entry point) until the game ends, the runtime stops or a limit is reached.
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++        // The GLES2 renderer alone (the Vita's, and the headless desktop build): with perf.threaded_renderer on, the guest
++        // runs on a thread of its own and this thread, which owns the GL context, walks the display lists and draws
++        // (host/gpu/ge_worker.hpp). Off, everything runs here.
++        bool ran_threaded = false;
++        if (portablekit::gpu::ge_worker_setting_enabled()) {
++            struct GuestRun {
++                std::string error;
++            } guest;
++            const auto guest_main = [](void *arg) {
++                auto *run = static_cast<GuestRun *>(arg);
++                try {
++                    portablekit::kernel().run_main();
++                } catch (const std::exception &e) {
++                    run->error = e.what();
++                    portablekit::kernel().runtime().stop(std::string("exception: ") + e.what());
++                }
++            };
++            std::cout << "Threaded renderer: guest executor on its own thread, GE thread on this one\n";
++            ran_threaded = portablekit::gpu::ge_worker().run_with_guest_thread(guest_main, &guest, 0, 8u << 20u, 1);
++            if (ran_threaded && !guest.error.empty()) throw std::runtime_error(guest.error);
++        }
++        if (!ran_threaded) portablekit::kernel().run_main();
++#else
+         portablekit::kernel().run_main();
++#endif
+         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
+         portablekit::bringup::finish();
+         // Quit from the menu, a closed window or the game ending: the network
+diff --git a/host/overlay/overlay_host.cpp b/host/overlay/overlay_host.cpp
+index aae0f21..8af7d78 100644
+--- a/host/overlay/overlay_host.cpp
++++ b/host/overlay/overlay_host.cpp
+@@ -1,7 +1,9 @@
+ #include "overlay/overlay_host.hpp"
+ 
++#include "kernel/kernel_platform.hpp"
+ #include "profile.hpp"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -39,6 +41,15 @@ void init_settings() {
+     }
+     options.env = [](const char *name) { return portablekit::env(name); };
+     settings.init(options);
++    // The renderer thread exists on every platform this runtime builds for.
++    settings.set_unavailable(port::Key::PerfThreadedRenderer, nullptr);
++    // <PREFIX>_THREADED_RENDERER (config.txt's threaded_renderer=) is an older spelling of the developer override.
++    if (const char *legacy = portablekit::env("THREADED_RENDERER"); legacy != nullptr && *legacy != '\0') {
++        const std::string text = legacy;
++        const bool off = text == "0" || text == "off" || text == "false" || text == "no";
++        settings.override_value(port::Key::PerfThreadedRenderer, off ? "off" : "on");
++    }
++    settings.mark_started();   // the overrides above are part of what this run started with
+ }
+ 
+ overlay::Menu &menu() {
+@@ -102,24 +113,33 @@ bool run_modal(gpu::Renderer &renderer, const ModalHost &host) {
+     // A run nobody can close the menu in is closed for it: a scripted run that forgot to, or no input at all.
+     const std::uint64_t frame_limit = scripted ? 3600u : (host.has_device_input ? 0u : kHeadlessFrames);
+ 
+-    std::fprintf(stderr, "[menu] open%s\n", scripted ? " (scripted)" : "");
++    std::fprintf(stderr, "[menu] open%s%s\n", scripted ? " (scripted)" : "", host.on_renderer_thread ? " (renderer thread)" : "");
+     m.open(device());
++    const auto on_renderer = [&host](const std::function<void()> &job) {
++        if (host.on_renderer_thread) host.on_renderer_thread(job);
++        else job();
++    };
+     bool window_open = true;
+     std::uint64_t frame = 0;
+     auto next = std::chrono::steady_clock::now();
+     while (m.is_open()) {
+         const std::uint32_t buttons = scripted ? script.buttons_at(frame) : device();
+         m.update(buttons);
+-        renderer.present_overlay();
+-        if (scripted && shot_dir != nullptr && *shot_dir != '\0') {
+-            const std::string name = script.shot_at(frame);
+-            if (!name.empty()) {
+-                const std::string path = std::string(shot_dir) + "/" + name + ".png";
+-                if (renderer.capture_frame(path)) std::fprintf(stderr, "[menu] shot %s\n", path.c_str());
+-                else std::fprintf(stderr, "[menu] cannot write %s\n", path.c_str());
++        // The menu is painted by the renderer's thread while this one waits: the state it reads does not change meanwhile.
++        bool alive = true;
++        on_renderer([&] {
++            renderer.present_overlay();
++            if (scripted && shot_dir != nullptr && *shot_dir != '\0') {
++                const std::string name = script.shot_at(frame);
++                if (!name.empty()) {
++                    const std::string path = std::string(shot_dir) + "/" + name + ".png";
++                    if (renderer.capture_frame(path)) std::fprintf(stderr, "[menu] shot %s\n", path.c_str());
++                    else std::fprintf(stderr, "[menu] cannot write %s\n", path.c_str());
++                }
+             }
+-        }
+-        if (!renderer.pump_events()) {
++            alive = renderer.pump_events();
++        });
++        if (!alive) {
+             window_open = false;
+             m.close(0u);
+             break;
+@@ -133,8 +153,17 @@ bool run_modal(gpu::Renderer &renderer, const ModalHost &host) {
+         }
+         next += kTick;
+         const auto now = std::chrono::steady_clock::now();
+-        if (next < now) next = now;   // a slow tick does not make the next ones run fast
+-        else std::this_thread::sleep_until(next);
++        if (next < now) {
++            next = now;   // a slow tick does not make the next ones run fast
++        } else {
++            // Sleep on the platform's event (a thread of the renderer may wake it early: look at the clock again).
++            for (auto at = std::chrono::steady_clock::now(); at < next; at = std::chrono::steady_clock::now()) {
++                const auto left = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(next - at).count());
++                const KernelPlatform &platform = kernel_platform();
++                if (platform.wait_event != nullptr) platform.wait_event(std::min<std::uint64_t>(left, 4000u));
++                else std::this_thread::sleep_for(std::chrono::microseconds(left));
++            }
++        }
+     }
+     std::fprintf(stderr, "[menu] closed after %llu frames\n", static_cast<unsigned long long>(frame));
+     return window_open;
+diff --git a/host/overlay/overlay_host.hpp b/host/overlay/overlay_host.hpp
+index cca1eda..43cf7a0 100644
+--- a/host/overlay/overlay_host.hpp
++++ b/host/overlay/overlay_host.hpp
+@@ -45,12 +45,18 @@ struct ModalHost {
+     // Whether device_buttons can ever change (a window, a platform pad). Without input and without an
+     // <prefix>_OVERLAY_SCRIPT the menu closes by itself after kHeadlessFrames, so a headless run never hangs.
+     bool has_device_input{false};
++    // Where the renderer's calls run. A runtime whose renderer lives on a thread of its own (the GE thread: the GL context
++    // belongs to it) runs the closure there and returns once it has finished, so the modal loop, which is the guest's, never
++    // makes a GL call and never touches the menu while the renderer paints it (the loop updates the menu, then waits for the
++    // paint). Without it the closure runs on the calling thread.
++    std::function<void(const std::function<void()> &)> on_renderer_thread;
+ };
+ 
+ inline constexpr std::uint32_t kHeadlessFrames = 180;
+ 
+ // Runs the menu until it closes: one tick per display refresh draws the game's last picture with the panel and feeds
+-// the buttons in. The caller has paused the guest. <prefix>_OVERLAY_SCRIPT drives it instead of the pad ("frame:
++// the buttons in. The caller has paused the guest and, with a renderer thread, drained it (the game's last picture is on
++// screen) and set ModalHost::on_renderer_thread. <prefix>_OVERLAY_SCRIPT drives it instead of the pad ("frame:
+ // BUTTON+BUTTON,frame:-,frame:shot=name"; see overlay::Script) and <prefix>_OVERLAY_SHOT_DIR (else
+ // <prefix>_SCREENSHOT_DIR) is where shot=name writes <name>.png. Returns false when the window was closed meanwhile.
+ bool run_modal(gpu::Renderer &renderer, const ModalHost &host);
+diff --git a/host/overlay/overlay_menu.cpp b/host/overlay/overlay_menu.cpp
+index 01b8091..39632ae 100644
+--- a/host/overlay/overlay_menu.cpp
++++ b/host/overlay/overlay_menu.cpp
+@@ -31,7 +31,9 @@ std::uint32_t by_name(std::string_view name) noexcept {
+ 
+ bool Menu::poll_chord(std::uint32_t held, std::uint64_t now_us) {
+     constexpr std::uint32_t kChord = button::kSelect | button::kStart;
+-    if ((held & kChord) != kChord) {
++    // SELECT+START with a shoulder button is not the chord: START+SELECT+L+R is the Vita application's way out of the game, and
++    // a menu must not open in front of it.
++    if ((held & (kChord | button::kL | button::kR)) != kChord) {
+         chord_down_ = false;
+         chord_fired_ = false;
+         return false;
+diff --git a/tests/overlay_tests.cpp b/tests/overlay_tests.cpp
+index 8e0227f..2ee11a1 100644
+--- a/tests/overlay_tests.cpp
++++ b/tests/overlay_tests.cpp
+@@ -76,6 +76,11 @@ int main() {
+     check(!menu.poll_chord(chord, 1'900'000u), "and only once per press");
+     check(!menu.poll_chord(btn::kSelect, 2'000'000u) && !menu.poll_chord(chord, 2'100'000u), "letting go re-arms it");
+     check(menu.poll_chord(chord, 2'700'000u), "...and a second press opens it again");
++    check(!menu.poll_chord(btn::kSelect, 2'800'000u) && !menu.poll_chord(chord | btn::kL | btn::kR, 2'900'000u) &&
++              !menu.poll_chord(chord | btn::kL | btn::kR, 4'000'000u),
++          "SELECT+START+L+R (the Vita application's exit) is not the chord");
++    check(!menu.poll_chord(btn::kSelect, 4'100'000u) && !menu.poll_chord(chord, 4'200'000u) && menu.poll_chord(chord, 4'700'000u),
++          "...and the plain chord still works afterwards");
+     check(menu.filter_for_game(chord | btn::kCross) == btn::kCross, "the game does not see the chord");
+     check(menu.filter_for_game(btn::kStart) == btn::kStart, "START alone reaches the game");
+     menu.request_open();
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 98fdc4e..66144c7 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -30,8 +30,11 @@
+ //     --menu PAGE         draw the settings overlay (page 1 or 2) over each picture
+ //     --shader-lint       no dump: compile and link every shader variant the renderer can use, and check the sources against
+ //                         the rules of vitaGL's shader translator (reserved names, the 10-varying limit)
+-//     --hd off|2x|4x      HD texture pack mode (gfx.hd_textures); default off in the replayer unless
+-//                         INFECTED_HD_TEXTURES is set
++//     --hd off|2x|4x|follow  HD texture pack mode (gfx.hd_textures); default off in the replayer unless
++//                         INFECTED_HD_TEXTURES is set. `follow` takes the mode from the port settings and follows them
++//                         while the replay runs (see --port-switch)
++//     --port-switch LIST  FLIP:KEY=VALUE,...: change a port option before replaying that flip, as the overlay would
++//                         (the renderer sees the new generation at the next frame; with --hd follow the pack is switched)
+ //     --pack-dir DIR      where texpack_2x.bin / texpack_4x.bin are (default $INFECTED_DATA_DIR)
+ //     --hd-budget-mb N    GPU memory the replacements may use
+ //     --hd-switch LIST    FLIP=MODE,FLIP=MODE: switch the mode before replaying that flip (run-time switching)
+@@ -116,6 +119,7 @@ struct Options {
+     std::string pack_dir;
+     std::string hd_budget_mb;
+     std::string hd_switch;
++    std::string port_switch;
+     std::string tex_dump;
+     bool tex_dump_raw{};
+ };
+@@ -515,6 +519,7 @@ int main(int argc, char **argv) {
+         else if (arg == "--pack-dir") options.pack_dir = value();
+         else if (arg == "--hd-budget-mb") options.hd_budget_mb = value();
+         else if (arg == "--hd-switch") options.hd_switch = value();
++        else if (arg == "--port-switch") options.port_switch = value();
+         else if (arg == "--tex-dump") options.tex_dump = value();
+         else if (arg == "--tex-dump-raw") options.tex_dump_raw = true;
+         else if (arg == "--null-draw") options.null_draw = true;
+@@ -588,6 +593,26 @@ int main(int argc, char **argv) {
+         return 1;
+     }
+ 
++    // FLIP:KEY=VALUE,...: port options changed between flips.
++    std::multimap<std::uint64_t, std::pair<std::string, std::string>> port_switches;
++    {
++        const std::string text = options.port_switch;
++        std::size_t at = 0;
++        while (at < text.size()) {
++            std::size_t end = text.find(',', at);
++            if (end == std::string::npos) end = text.size();
++            const std::string item = text.substr(at, end - at);
++            const std::size_t colon = item.find(':'), eq = item.find('=');
++            if (colon == std::string::npos || eq == std::string::npos || eq < colon ||
++                port::key_from_name(item.substr(colon + 1, eq - colon - 1)) == port::Key::Count) {
++                std::cerr << "--port-switch wants FLIP:KEY=VALUE,...\n";
++                return 2;
++            }
++            port_switches.emplace(std::strtoull(item.c_str(), nullptr, 10),
++                                  std::make_pair(item.substr(colon + 1, eq - colon - 1), item.substr(eq + 1)));
++            at = end + 1;
++        }
++    }
+     std::map<std::uint64_t, gpu::HdMode> hd_switches;
+     {
+         std::string text = options.hd_switch;
+@@ -638,7 +663,12 @@ int main(int argc, char **argv) {
+         {
+             gpu::HdConfig hd = gpu::hd_config_from_environment();
+             if (!options.pack_dir.empty()) hd.data_root = options.pack_dir;
+-            if (!options.hd.empty()) {
++            hd.follow_settings = false;
++            if (options.hd == "follow") {
++                hd.follow_settings = true;
++                if (gpu::hd_pack_present(hd.data_root)) port::settings().set_unavailable(port::Key::GfxHdTextures, nullptr);
++                hd.mode = gpu::hd_textures_setting(hd.data_root);
++            } else if (!options.hd.empty()) {
+                 if (!gpu::hd_parse_mode(options.hd, hd.mode)) {
+                     std::cerr << "--hd wants off, 2x or 4x\n";
+                     return 2;
+@@ -703,6 +733,11 @@ int main(int argc, char **argv) {
+     const auto replay = [&]() -> int {
+     for (std::uint32_t pass = 0; pass < options.repeat; ++pass) {
+         for (const std::uint64_t flip : flips) {
++            for (auto [first, last] = port_switches.equal_range(flip); first != last; ++first) {
++                drain();   // the GE thread has finished the flips before: the option changes between frames
++                if (!port::settings().set(first->second.first, first->second.second))
++                    std::cerr << "--port-switch: " << first->second.first << "=" << first->second.second << " is not allowed\n";
++            }
+ #if defined(GE_REPLAY_HAS_GL)
+             if (gl != nullptr) {
+                 const auto found = hd_switches.find(flip);

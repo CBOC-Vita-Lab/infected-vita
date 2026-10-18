@@ -1,0 +1,426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:07:05 +0000
+Subject: [PATCH] renderer: specialised fragment programs; a fill-rate test
+ switch
+
+The texture function, the use of the texture's alpha, an alpha-less texture, the alpha test's comparison and the blend
+fix-up were uniforms, chosen per fragment by a chain of comparisons. The PS Vita's compiler turns that into fragment
+programs of 110 to 190 instructions (read from the compiled GXP headers of the shipped shader cache). They are now part
+of the program key and compiled in: the programs Infected uses in a mission are 5 to 25 instructions, and an alpha test
+that always passes has no discard. GL_SPECIALIZE=0 (--set specialize=0) restores the uniform-driven programs.
+
+Verified: 25 gameplay frames replayed on desktop GL are pixel-identical with and without specialisation; the shader
+lint compiles all 466 programs; in Vita3K (vitaGL's translator and the real shader compiler) a bot completed mission 1
+with 17 specialised programs, all linked. Not yet measured on a console.
+
+GL_FILL_TEST=1 cuts every game draw and clear to a 2x2 scissor, to tell a fill-bound frame from one bound elsewhere.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 58354be..4099fc6 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -44,9 +44,14 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+ * **A draw is a vertex run plus a `DrawState`**: every GL state, uniform and texture it needs, as plain 32-bit
+   words. A draw whose state is memcmp-equal to the batch in flight is appended to it; anything else flushes the
+   batch. Applying a batch goes through caches that skip every GL call whose result is already in effect.
+-* **Programs are keyed by six flags** (through, light, fog, texture, alpha test, rect clamp); everything else
+-  a draw varies in (texture function, alpha function and reference, blend mode, lights, fog, matrices) is a
+-  uniform. Eleven programs are enough for Infected from the logos to a mission.
++* **Programs are keyed by six flags** (through, light, fog, texture, alpha test, rect clamp) **and, by default, the
++  fragment stage's choices** (texture function, whether the texture's alpha is used, an alpha-less texture, the
++  alpha test's comparison, the blend fix-up below). Lights, fog, matrices and the alpha reference are uniforms.
++  The choices used to be uniforms too, which kept the programs to eleven; on the PS Vita's GPU that made every
++  fragment program 110 to 190 instructions (read from the compiled GXP headers), most of it comparisons and
++  branches the pixel never takes. Specialised, a textured, fogged, alpha-tested program is a handful of
++  instructions, and an alpha test that always passes has no `discard`. `GL_SPECIALIZE=0` (`--set specialize=0`)
++  goes back to the uniform-driven programs; both give the same pictures.
+ * **Blending without `glBlendColor`.** `GL_CONSTANT_COLOR` factors are used only where the driver has them and
+   the setting `no_blend_color` is off; otherwise the fragment shader pre-multiplies (`u_blend.x`: 1 doubles the
+   source alpha, 2 doubles and complements, 3 multiplies by a fixed colour, 4 a fixed colour against its
+@@ -141,6 +146,10 @@ transform+light+alpha           lit, no texture
+ ```
+ 
+ A game that uses more flags compiles more programs on first use; the count stays small enough to list and warm.
++With specialisation each of these splits by texture function, alpha comparison and blend fix-up: a few dozen
++programs in practice, compiled on first use and kept by vitaGL's shader cache (the VPK ships the ones a bot run
++compiled). `glsl::specialized_lint_flags()` is a sample with every choice at least once, for the shader lint
++(`ge_replay --shader-lint`) and `PREWARM_SHADERS`.
+ 
+ ## The texture cache
+ 
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 57a4fc5..fdecc69 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1195,9 +1195,13 @@ struct GlRenderer::Impl {
+             std::memcpy(cache.viewport, state.viewport, sizeof(cache.viewport));
+             ++st().viewport_changes;
+         }
+-        if (std::memcmp(cache.scissor, state.scissor, sizeof(cache.scissor)) != 0) {
+-            glScissor(state.scissor[0], state.scissor[1], state.scissor[2], state.scissor[3]);
+-            std::memcpy(cache.scissor, state.scissor, sizeof(cache.scissor));
++        // fill_test: every draw is cut to a 2x2 corner, so the GPU rasterises and shades almost nothing while the vertex
++        // work, the driver and the CPU stay the same (a fill-bound frame gets much faster, a CPU-bound one does not).
++        static constexpr std::int32_t kFillTestScissor[4] = {0, 0, 2, 2};
++        const std::int32_t *scissor = settings.fill_test ? kFillTestScissor : state.scissor;
++        if (std::memcmp(cache.scissor, scissor, sizeof(cache.scissor)) != 0) {
++            glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
++            std::memcpy(cache.scissor, scissor, sizeof(cache.scissor));
+             ++st().scissor_changes;
+         }
+         apply_depth(state);
+@@ -1403,6 +1407,10 @@ struct GlRenderer::Impl {
+                                 static_cast<std::int32_t>(std::lround(top * scale)), 0, 0};
+         rect[2] = static_cast<std::int32_t>(std::lround(right * scale)) - rect[0];
+         rect[3] = static_cast<std::int32_t>(std::lround(bottom * scale)) - rect[1];
++        if (settings.fill_test) {
++            rect[0] = rect[1] = 0;
++            rect[2] = rect[3] = 2;
++        }
+         bind_target(*target);
+         if (std::memcmp(cache.scissor, rect, sizeof(rect)) != 0) {
+             glScissor(rect[0], rect[1], rect[2], rect[3]);
+@@ -2106,6 +2114,14 @@ struct GlRenderer::Impl {
+             state.alpha[0] = static_cast<float>(call.alpha_test.function);
+             state.alpha[1] = static_cast<float>(call.alpha_test.reference);
+         }
++        // The texture function, the alpha comparison and the blend fix-up compiled into the fragment program
++        // (settings.specialize): a few instructions per pixel instead of a hundred on the Vita.
++        if (settings.specialize) {
++            state.program_flags = glsl::specialize(
++                state.program_flags, static_cast<std::uint32_t>(state.texenv[0] + 0.5f), state.texenv[1] > 0.5f,
++                state.texenv[2] > 0.5f, static_cast<std::uint32_t>(state.alpha[0] + 0.5f),
++                static_cast<std::uint32_t>(state.shader_blend[0] + 0.5f));
++        }
+         // Transform.
+         if (!through) {
+             if (!memo_valid || call.world != memo_world || call.view != memo_view || call.projection != memo_projection) {
+@@ -2406,6 +2422,8 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "texture_always_validate") settings.texture_always_validate = flag;
+     else if (name == "merge") settings.merge_draws = flag;
+     else if (name == "null_draw") settings.null_draw = flag;
++    else if (name == "fill_test") settings.fill_test = flag;
++    else if (name == "specialize") settings.specialize = flag;
+     else if (name == "depth_bits") settings.depth_bits = u32;
+     else if (name == "target_textures") settings.target_textures = flag;
+     else if (name == "use_glclear") settings.use_glclear = flag;
+@@ -2428,7 +2446,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+@@ -2576,6 +2594,13 @@ std::size_t GlRenderer::prewarm_shaders() {
+         if (impl.program_for(flags) != nullptr) ++built;
+         else ++failed;
+     }
++    // With specialised programs, a sample that has every compiled-in choice at least once (the rest compile on first use).
++    if (impl.settings.specialize) {
++        for (const std::uint32_t flags : glsl::specialized_lint_flags()) {
++            if (impl.program_for(flags) != nullptr) ++built;
++            else ++failed;
++        }
++    }
+     // The post passes: FXAA and the bicubic enlargement (the multisample resolve is a desktop preview and is not built here).
+     if (impl.ensure_post_program(impl.fxaa_program, impl.fxaa_failed, [] { return glsl::fxaa_fragment_source(); }, "fxaa")) ++built;
+     else ++failed;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index bc8687c..78cbc73 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -58,6 +58,11 @@ struct GlSettings {
+     bool merge_draws{true};
+     // Skip the glDraw* calls (the replayer's null-draw mode: everything else still runs).
+     bool null_draw{false};
++    // Cut every game draw and clear to a 2x2 scissor: a test of how much of the frame is the GPU's fill (FILL_TEST=1).
++    bool fill_test{false};
++    // Compile each draw's texture function, alpha comparison and blend fix-up into its fragment program (more programs,
++    // far shorter ones); off, one program per flag set chooses them per fragment from uniforms.
++    bool specialize{true};
+     // Depth buffer precision of every render target: 16 is what ES 2.0 guarantees
+     // (and what the PSP has), 24 needs OES_depth24.
+     std::uint32_t depth_bits{16};
+diff --git a/host/gpu/gl/gl_shaders.cpp b/host/gpu/gl/gl_shaders.cpp
+index cb11341..ef4956e 100644
+--- a/host/gpu/gl/gl_shaders.cpp
++++ b/host/gpu/gl/gl_shaders.cpp
+@@ -1,5 +1,6 @@
+ #include "gl_shaders.hpp"
+ 
++#include <algorithm>
+ #include <cstdio>
+ 
+ namespace portablekit::gpu::glsl {
+@@ -30,6 +31,27 @@ std::string defines(std::uint32_t flags) {
+     return out;
+ }
+ 
++// The fragment stage's compiled-in choices of a specialised program (see specialize()).
++std::string specialization_defines(std::uint32_t flags) {
++    if ((flags & kSpecialized) == 0u) return {};
++    // Texture functions 5..7 do not exist on the GE; the uniform-driven code treats them as "add", and so does this.
++    static const char *const kTexEnvDefine[8] = {"TEXENV_MODULATE", "TEXENV_DECAL", "TEXENV_BLEND", "TEXENV_REPLACE",
++                                                 "TEXENV_ADD",      "TEXENV_ADD",   "TEXENV_ADD",   "TEXENV_ADD"};
++    static const char *const kAlphaDefine[8] = {"ATEST_NEVER", "ATEST_ALWAYS", "ATEST_EQUAL",   "ATEST_NOTEQUAL",
++                                                "ATEST_LESS",  "ATEST_LEQUAL", "ATEST_GREATER", "ATEST_GEQUAL"};
++    static const char *const kBlendDefine[8] = {nullptr,           "BLENDFIX_DOUBLE", "BLENDFIX_INVDOUBLE", "BLENDFIX_FIXED",
++                                                "BLENDFIX_FIXED2", "BLENDFIX_FIXED2", "BLENDFIX_FIXED2",    "BLENDFIX_FIXED2"};
++    std::string out = "#define SPECIALIZED 1\n";
++    if ((flags & kTexture) != 0u) {
++        out += std::string("#define ") + kTexEnvDefine[(flags >> kSpecTexEnvShift) & 7u] + " 1\n";
++        if ((flags & kSpecTextureAlpha) != 0u) out += "#define TEXALPHA 1\n";
++        if ((flags & kSpecTextureRgb) != 0u) out += "#define TEXRGB 1\n";
++    }
++    if ((flags & kAlphaTest) != 0u) out += std::string("#define ") + kAlphaDefine[(flags >> kSpecAlphaShift) & 7u] + " 1\n";
++    if (const char *blend = kBlendDefine[(flags >> kSpecBlendShift) & 7u]) out += std::string("#define ") + blend + " 1\n";
++    return out;
++}
++
+ // The GE's lighting, evaluated in world space; the same model as ge.vert's light_vertex() (host/gpu/shaders), in
+ // GLSL ES 1.00: no integers in the masks, no mat3(mat4), loops with constant bounds. It runs per vertex (the
+ // GE's own way) or, with gfx.pixel_lighting, per fragment from an interpolated position and normal: the same
+@@ -241,6 +263,44 @@ void main() {
+     vec4 texel = texture2D(u_texture, v_texcoord);
+ #endif
+ #endif
++#ifdef SPECIALIZED
++    // The texture function compiled in (one of TEXENV_*; TEXALPHA: the texture's alpha is used; TEXRGB: a texture with
++    // no alpha, a 5650 render target). Same arithmetic as the uniform-driven code below.
++#ifdef TEXRGB
++    texel.a = 1.0;
++#endif
++#ifdef TEXENV_MODULATE
++    color.rgb *= texel.rgb;
++#ifdef TEXALPHA
++    color.a *= texel.a;
++#endif
++#endif
++#ifdef TEXENV_DECAL
++#ifdef TEXALPHA
++    color.rgb = mix(color.rgb, texel.rgb, texel.a);
++#else
++    color.rgb = texel.rgb;
++#endif
++#endif
++#ifdef TEXENV_BLEND
++    color.rgb = mix(color.rgb, texel.rgb, texel.rgb);
++#ifdef TEXALPHA
++    color.a *= texel.a;
++#endif
++#endif
++#ifdef TEXENV_REPLACE
++    color.rgb = texel.rgb;
++#ifdef TEXALPHA
++    color.a = texel.a;
++#endif
++#endif
++#ifdef TEXENV_ADD
++    color.rgb = min(color.rgb + texel.rgb, vec3(1.0));
++#ifdef TEXALPHA
++    color.a *= texel.a;
++#endif
++#endif
++#else
+     if (u_texenv.z > 0.5) texel.a = 1.0;   // a texture without alpha (a 5650 render target)
+     float texenv_function = u_texenv.x;
+     bool texture_alpha = u_texenv.y > 0.5;
+@@ -260,6 +320,7 @@ void main() {
+         if (texture_alpha) color.a *= texel.a;
+     }
+ #endif
++#endif
+ #ifdef LIGHT_VERTEX
+     // A separate specular term is added after texturing; neither it nor fog touches alpha.
+     color.rgb = min(color.rgb + v_specular, vec3(1.0));
+@@ -273,6 +334,30 @@ void main() {
+ #ifdef ALPHATEST
+     // The GE's alpha test on the 8-bit alpha: 0 never, 1 always, 2 equal, 3 not equal,
+     // 4 less, 5 less or equal, 6 greater, 7 greater or equal.
++#ifdef SPECIALIZED
++    // One comparison compiled in (ATEST_*); "always" has no discard at all, so the GPU keeps its early depth rejection.
++#ifdef ATEST_NEVER
++    discard;
++#endif
++#ifdef ATEST_EQUAL
++    if (floor(color.a * 255.0 + 0.5) != u_alpha.y) discard;
++#endif
++#ifdef ATEST_NOTEQUAL
++    if (floor(color.a * 255.0 + 0.5) == u_alpha.y) discard;
++#endif
++#ifdef ATEST_LESS
++    if (floor(color.a * 255.0 + 0.5) >= u_alpha.y) discard;
++#endif
++#ifdef ATEST_LEQUAL
++    if (floor(color.a * 255.0 + 0.5) > u_alpha.y) discard;
++#endif
++#ifdef ATEST_GREATER
++    if (floor(color.a * 255.0 + 0.5) <= u_alpha.y) discard;
++#endif
++#ifdef ATEST_GEQUAL
++    if (floor(color.a * 255.0 + 0.5) < u_alpha.y) discard;
++#endif
++#else
+     float alpha8 = floor(color.a * 255.0 + 0.5);
+     float reference = u_alpha.y;
+     float test = u_alpha.x;
+@@ -286,10 +371,26 @@ void main() {
+     else if (test < 6.5) passed = alpha8 > reference;
+     else passed = alpha8 >= reference;
+     if (!passed) discard;
++#endif
+ #endif
+     // Blend factors the hardware cannot give (a doubled source alpha, a fixed
+     // colour without glBlendColor) scale the source here, and the blend unit
+     // is told "one".
++#ifdef SPECIALIZED
++#ifdef BLENDFIX_DOUBLE
++    color.rgb *= clamp(color.a * 2.0, 0.0, 1.0);
++#endif
++#ifdef BLENDFIX_INVDOUBLE
++    color.rgb *= clamp(1.0 - color.a * 2.0, 0.0, 1.0);
++#endif
++#ifdef BLENDFIX_FIXED
++    color.rgb *= u_blend.yzw;
++#endif
++#ifdef BLENDFIX_FIXED2
++    color.rgb *= u_blend.yzw;
++    color.a = u_blend.y;
++#endif
++#else
+     if (u_blend.x > 0.5) {
+         if (u_blend.x < 1.5) color.rgb *= clamp(color.a * 2.0, 0.0, 1.0);
+         else if (u_blend.x < 2.5) color.rgb *= clamp(1.0 - color.a * 2.0, 0.0, 1.0);
+@@ -299,6 +400,7 @@ void main() {
+             color.a = u_blend.y;       // destination by the rest, through the alpha it is given
+         }
+     }
++#endif
+     gl_FragColor = color;
+ }
+ )GLSL";
+@@ -384,7 +486,7 @@ std::string vertex_source(std::uint32_t flags) {
+ }
+ 
+ std::string fragment_source(std::uint32_t flags) {
+-    std::string out = "#version 100\n" + defines(flags) + kFragmentHead;
++    std::string out = "#version 100\n" + defines(flags) + specialization_defines(flags) + kFragmentHead;
+     if ((flags & kLight) != 0u && (flags & kPixelLight) != 0u) {
+         out += kLightUniforms;
+         out += light_function_source();
+@@ -411,6 +513,40 @@ std::vector<std::uint32_t> valid_program_flags() {
+     return out;
+ }
+ 
++std::uint32_t specialize(std::uint32_t flags, std::uint32_t texture_function, bool texture_alpha, bool texture_rgb,
++                         std::uint32_t alpha_function, std::uint32_t blend_fix) {
++    std::uint32_t out = (flags & ((1u << kProgramFlagBits) - 1u)) | kSpecialized;
++    if ((flags & kTexture) != 0u) {
++        out |= (std::min(texture_function, 7u) << kSpecTexEnvShift);
++        if (texture_alpha) out |= kSpecTextureAlpha;
++        if (texture_rgb) out |= kSpecTextureRgb;
++    }
++    if ((flags & kAlphaTest) != 0u) out |= (std::min(alpha_function, 7u) << kSpecAlphaShift);
++    out |= (std::min(blend_fix, 7u) << kSpecBlendShift);
++    return out;
++}
++
++std::vector<std::uint32_t> specialized_lint_flags() {
++    // Every texture function with and without texture alpha, every alpha comparison and every blend fix-up, each on the
++    // programs it can meet; not the full product (it would be thousands), which the compiler does not need to see.
++    std::vector<std::uint32_t> out;
++    for (const std::uint32_t flags : valid_program_flags()) {
++        const bool textured = (flags & kTexture) != 0u, tested = (flags & kAlphaTest) != 0u;
++        out.push_back(specialize(flags, 0u, true, false, 6u, 0u));
++        if (textured) {
++            for (std::uint32_t function = 0; function < 5u; ++function)
++                for (std::uint32_t alpha = 0; alpha < 2u; ++alpha) out.push_back(specialize(flags, function, alpha != 0u, alpha == 0u, 6u, 0u));
++        }
++        if (tested) {
++            for (std::uint32_t function = 0; function < 8u; ++function) out.push_back(specialize(flags, 0u, true, false, function, 0u));
++        }
++        for (std::uint32_t blend = 1; blend < 5u; ++blend) out.push_back(specialize(flags, 0u, true, false, 6u, blend));
++    }
++    std::sort(out.begin(), out.end());
++    out.erase(std::unique(out.begin(), out.end()), out.end());
++    return out;
++}
++
+ std::string describe(std::uint32_t flags) {
+     std::string out = (flags & kThrough) != 0u ? "through" : "transform";
+     if ((flags & kLight) != 0u) out += (flags & kPixelLight) != 0u ? "+light(pixel)" : "+light";
+@@ -419,6 +555,23 @@ std::string describe(std::uint32_t flags) {
+     if ((flags & kAlphaTest) != 0u) out += "+alpha";
+     if ((flags & kRectClamp) != 0u) out += "+rect";
+     if ((flags & kSharpen) != 0u) out += "+sharp";
++    if ((flags & kSpecialized) != 0u) {
++        static const char *const kTexEnv[8] = {"mod", "decal", "blend", "replace", "add", "add", "add", "add"};
++        static const char *const kAlpha[8] = {"never", "always", "eq", "ne", "lt", "le", "gt", "ge"};
++        out += "[";
++        if ((flags & kTexture) != 0u) {
++            out += kTexEnv[(flags >> kSpecTexEnvShift) & 7u];
++            out += (flags & kSpecTextureAlpha) != 0u ? "+ta" : "";
++            out += (flags & kSpecTextureRgb) != 0u ? "+rgb" : "";
++        }
++        if ((flags & kAlphaTest) != 0u) {
++            out += (flags & kTexture) != 0u ? "," : "";
++            out += kAlpha[(flags >> kSpecAlphaShift) & 7u];
++        }
++        const std::uint32_t blend = (flags >> kSpecBlendShift) & 7u;
++        if (blend != 0u) out += ",bfix" + std::to_string(blend);
++        out += "]";
++    }
+     return out;
+ }
+ 
+diff --git a/host/gpu/gl/gl_shaders.hpp b/host/gpu/gl/gl_shaders.hpp
+index 08db916..db92a97 100644
+--- a/host/gpu/gl/gl_shaders.hpp
++++ b/host/gpu/gl/gl_shaders.hpp
+@@ -20,6 +20,15 @@ enum ProgramFlag : std::uint32_t {
+     kPixelLight = 1u << 6,// with kLight: the lighting is evaluated per fragment, not per vertex (gfx.pixel_lighting)
+     kSharpen = 1u << 7,   // with kThrough, kTexture and kRectClamp: the texture is enlarged bicubically (gfx.movie_filter)
+     kProgramFlagBits = 8,
++    // A specialised program (GL_SPECIALIZE, on by default): the fragment stage's texture function, alpha comparison and
++    // blend fix-up are compiled in instead of being chosen per fragment from u_texenv, u_alpha.x and u_blend.x. On the
++    // Vita's GPU the uniform-driven fragment program is 110 to 190 instructions; a specialised one is a handful.
++    kSpecialized = 1u << 8,
++    kSpecTexEnvShift = 9,          // 3 bits: the GE texture function (0 modulate .. 4 add)
++    kSpecTextureAlpha = 1u << 12,  // the texture's alpha is used
++    kSpecTextureRgb = 1u << 13,    // a texture with no alpha (texel alpha is 1)
++    kSpecAlphaShift = 14,          // 3 bits: the alpha test's comparison (with kAlphaTest)
++    kSpecBlendShift = 17,          // 3 bits: the blend fix-up (u_blend.x)
+ };
+ 
+ // The uniforms every program may have; a program that lacks one (the compiler
+@@ -57,6 +66,12 @@ enum Uniform : std::uint32_t {
+ [[nodiscard]] const char *uniform_name(Uniform uniform);
+ [[nodiscard]] std::string vertex_source(std::uint32_t flags);
+ [[nodiscard]] std::string fragment_source(std::uint32_t flags);
++// `flags` (the low kProgramFlagBits) made into a specialised program for this texture function, texture alpha use,
++// alpha-less texture, alpha comparison and blend fix-up; the parts that `flags` does not use are left out of the key.
++[[nodiscard]] std::uint32_t specialize(std::uint32_t flags, std::uint32_t texture_function, bool texture_alpha,
++                                       bool texture_rgb, std::uint32_t alpha_function, std::uint32_t blend_fix);
++// A sample of specialised programs that covers every compiled-in choice at least once (for the shader lint).
++[[nodiscard]] std::vector<std::uint32_t> specialized_lint_flags();
+ // A short name for logs and the readiness note: "through+tex+alpha".
+ [[nodiscard]] std::string describe(std::uint32_t flags);
+ // Every flag combination the renderer can ask for (the others make no sense: fog or lights on a screen-space draw, a pixel-lit
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 8f3c122..4fa0d07 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -405,6 +405,8 @@ int run_shader_lint(const Options &options) {
+     std::vector<Variant> variants;
+     for (const std::uint32_t flags : glsl::valid_program_flags())
+         variants.push_back({glsl::describe(flags), glsl::vertex_source(flags), glsl::fragment_source(flags)});
++    for (const std::uint32_t flags : glsl::specialized_lint_flags())
++        variants.push_back({glsl::describe(flags), glsl::vertex_source(flags), glsl::fragment_source(flags)});
+     const std::size_t world = variants.size();
+     variants.push_back({"post:blit", glsl::blit_vertex_source(), glsl::blit_fragment_source()});
+     variants.push_back({"post:fxaa", glsl::blit_vertex_source(), glsl::fxaa_fragment_source()});

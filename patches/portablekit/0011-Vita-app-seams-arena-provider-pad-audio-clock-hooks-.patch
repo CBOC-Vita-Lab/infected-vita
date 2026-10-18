@@ -1,0 +1,774 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 01:05:10 +0000
+Subject: [PATCH] Vita app seams: arena provider, pad/audio/clock hooks, phase
+ timers, desktop-only stubs
+
+- guest_memory: ArenaProvider so the app can hand out the 66 MiB arena (1 MiB aligned memblock)
+- pad_provider.hpp, audio_sink AudioOutput, KernelPlatform clock: plat-backed input/audio/time on Vita
+- perf/phase_timers.hpp: per-phase us counters (GE walk, GL submit, present, decode, audio, ISO read, idle)
+- kernel: switch_count(); hle_media: media_renderer(); gl_platform.h: vitaGL shims (no glBlendColor/GL_DITHER)
+- corpus_library/overlays/game_font/adhoc: whole-file stubs under __vita__ (dlfcn, mman, ifaddrs absent)
+- CMake: PORTABLEKIT_PLATFORM_CUSTOM + NO_HOST_THREADS for pk_runtime on VITA
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fb96372..4ce2aaa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -462,8 +462,15 @@ if(PSPRECOMP_BUILD_TESTS OR PORTABLEKIT_BUILD_RUNTIME_LIBRARY)
+     target_compile_features(pk_runtime PUBLIC cxx_std_20)
+     target_include_directories(pk_runtime PUBLIC "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party")
+     target_link_libraries(pk_runtime PUBLIC psprecomp_core)
+-    find_package(Threads REQUIRED)
+-    target_link_libraries(pk_runtime PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
++    if(VITA)
++        # vitasdk (vita.toolchain.cmake sets VITA): pthread-embedded is part of the SDK and there is no dlopen. The
++        # kernel uses the platform seam instead of host threads, and the sources a Vita build cannot compile
++        # (corpus_library, overlays, game_font, the ad hoc server) carry #if defined(__vita__) stubs.
++        target_compile_definitions(pk_runtime PUBLIC PORTABLEKIT_PLATFORM_CUSTOM=1 PORTABLEKIT_NO_HOST_THREADS=1)
++    else()
++        find_package(Threads REQUIRED)
++        target_link_libraries(pk_runtime PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
++    endif()
+     if(WIN32)
+         target_link_libraries(pk_runtime PUBLIC ws2_32 iphlpapi)
+     endif()
+diff --git a/host/adhoc/discovery.cpp b/host/adhoc/discovery.cpp
+index 9866569..d1af12d 100644
+--- a/host/adhoc/discovery.cpp
++++ b/host/adhoc/discovery.cpp
+@@ -1,3 +1,37 @@
++#if defined(__vita__)
++// The Vita build has no local-network discovery (no ifaddrs, no multicast sockets in newlib): every call is a no-op
++// and no host is ever found. The ad hoc client itself is unaffected.
++#include "adhoc/discovery.hpp"
++
++namespace portablekit::adhoc {
++
++std::vector<LocalAddress> local_addresses() { return {}; }
++std::string local_host_name() { return {}; }
++std::string FoundHost::join_address() const { return address; }
++
++struct Discovery::Impl {};
++
++Discovery::Discovery() = default;
++Discovery::~Discovery() = default;
++Discovery &Discovery::get() {
++    static Discovery instance;
++    return instance;
++}
++void Discovery::start_announcing(std::uint16_t, std::function<Announcement()>) {}
++void Discovery::stop_announcing() {}
++void Discovery::start_listening() {}
++void Discovery::query(const std::vector<std::string> &) {}
++std::vector<FoundHost> Discovery::hosts() const { return {}; }
++DiscoveryStatus Discovery::status() const {
++    DiscoveryStatus status;
++    status.announce_note = "not available on this platform";
++    status.listen_error = "not available on this platform";
++    return status;
++}
++void Discovery::shutdown() noexcept {}
++
++} // namespace portablekit::adhoc
++#else
+ #include "adhoc/discovery.hpp"
+ 
+ #include "adhoc/client.hpp"
+@@ -567,3 +601,4 @@ DiscoveryStatus Discovery::status() const {
+ }
+ 
+ } // namespace portablekit::adhoc
++#endif // defined(__vita__)
+diff --git a/host/adhoc/server.cpp b/host/adhoc/server.cpp
+index d136927..0da9f08 100644
+--- a/host/adhoc/server.cpp
++++ b/host/adhoc/server.cpp
+@@ -1,3 +1,24 @@
++#if defined(__vita__)
++// The ad hoc server (the host side of a session) is not part of the Vita build.
++#include "adhoc/server.hpp"
++
++namespace portablekit::adhoc {
++
++struct Server::Impl {};
++
++Server::Server() = default;
++Server::~Server() = default;
++bool Server::start(const ServerConfig &) { return false; }
++void Server::stop() {}
++bool Server::running() const { return false; }
++ServerStatus Server::status() const {
++    ServerStatus status;
++    status.error = "the ad hoc server is not available on this platform";
++    return status;
++}
++
++} // namespace portablekit::adhoc
++#else
+ #include "adhoc/server.hpp"
+ 
+ #include "adhoc/client.hpp"
+@@ -778,3 +799,4 @@ ServerStatus Server::status() const {
+ }
+ 
+ } // namespace portablekit::adhoc
++#endif // defined(__vita__)
+diff --git a/host/audio/atrac_decoder.cpp b/host/audio/atrac_decoder.cpp
+index f80f1e6..e50ad5d 100644
+--- a/host/audio/atrac_decoder.cpp
++++ b/host/audio/atrac_decoder.cpp
+@@ -1,5 +1,7 @@
+ #include "audio/atrac_decoder.hpp"
+ 
++#include "perf/phase_timers.hpp"
++
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -88,6 +90,7 @@ AtracCodec AtracDecoder::codec() const noexcept { return impl_->codec; }
+ std::size_t AtracDecoder::decode(std::span<const std::uint8_t> frame, std::int16_t *out) {
+     Impl &impl = *impl_;
+     if (impl.context == nullptr || frame.empty()) return 0u;
++    const portablekit::phase::Scope timer(portablekit::phase::Decode);
+     av_packet_unref(impl.packet);
+     if (av_new_packet(impl.packet, static_cast<int>(frame.size())) < 0) return 0u;
+     std::memcpy(impl.packet->data, frame.data(), frame.size());
+diff --git a/host/audio/audio_sink.cpp b/host/audio/audio_sink.cpp
+index 5f14ac7..11b3eab 100644
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -1,6 +1,7 @@
+ #include "../profile.hpp"
+ #include "audio/audio_sink.hpp"
+ 
++#include "perf/phase_timers.hpp"
+ #include "settings/settings.hpp"
+ 
+ #include <algorithm>
+@@ -21,6 +22,8 @@
+ namespace portablekit::audio {
+ namespace {
+ 
++AudioOutput g_output;
++
+ // ~186 ms. Long enough that a slow guest frame does not underrun, short enough
+ // that the guest's audio never lags visibly behind what is on screen.
+ constexpr std::size_t kRingFrames = 8192u;
+@@ -117,6 +120,7 @@ struct AudioSink::Impl {
+     std::uint64_t seconds{};
+ 
+     float gain{1.0f};
++    bool output_open{};   // g_output is the device
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     SDL_AudioStream *stream{};
+ #endif
+@@ -192,6 +196,8 @@ void SDLCALL feed_device(void *user, SDL_AudioStream *stream, int additional, in
+ 
+ } // namespace
+ 
++void set_audio_output(const AudioOutput &output) noexcept { g_output = output; }
++
+ AudioSink::AudioSink() : impl_(std::make_unique<Impl>()) {}
+ AudioSink::~AudioSink() { shutdown(); }
+ 
+@@ -220,6 +226,16 @@ void AudioSink::initialize() {
+         std::cout << "Audio: disabled by " << portablekit::env_name("NO_AUDIO") << "\n";
+         return;
+     }
++    if (g_output.write != nullptr) {
++        if (g_output.open != nullptr && !g_output.open()) {
++            std::cerr << "Audio: the platform device did not open; running silent\n";
++            return;
++        }
++        impl.output_open = true;
++        if (g_output.set_gain != nullptr) g_output.set_gain(impl.gain);
++        std::cout << "Audio: 44100 Hz stereo playback open (platform device)\n";
++        return;
++    }
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+         std::cerr << "Audio: SDL_InitSubSystem failed (" << SDL_GetError() << "); running silent\n";
+@@ -246,6 +262,10 @@ void AudioSink::shutdown() {
+     Impl &impl = *impl_;
+     if (impl.closed) return;
+     impl.closed = true;
++    if (impl.output_open) {
++        impl.output_open = false;
++        if (g_output.close != nullptr) g_output.close();
++    }
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     if (impl.stream != nullptr) {
+         SDL_DestroyAudioStream(impl.stream);
+@@ -266,6 +286,7 @@ void AudioSink::shutdown() {
+ void AudioSink::set_volume(float gain) {
+     Impl &impl = *impl_;
+     impl.gain = std::clamp(gain, 0.0f, 1.0f);
++    if (impl.output_open && g_output.set_gain != nullptr) g_output.set_gain(impl.gain);
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     if (impl.stream != nullptr) {
+         SDL_SetAudioStreamGain(impl.stream, impl.gain);
+@@ -275,6 +296,7 @@ void AudioSink::set_volume(float gain) {
+ }
+ 
+ bool AudioSink::has_device() const {
++    if (impl_->output_open) return true;
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     return impl_->stream != nullptr;
+ #else
+@@ -283,6 +305,7 @@ bool AudioSink::has_device() const {
+ }
+ 
+ void AudioSink::set_paused(bool paused) {
++    if (impl_->output_open && g_output.set_paused != nullptr) g_output.set_paused(paused);
+ #if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+     Impl &impl = *impl_;
+     if (impl.stream == nullptr) return;
+@@ -297,6 +320,7 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
+                     std::uint32_t left_volume, std::uint32_t right_volume) {
+     if (count == 0u) return;
+     Impl &impl = *impl_;
++    const phase::Scope timer(phase::Audio);
+     std::lock_guard<std::mutex> guard(impl.lock);
+ 
+     // A buffer larger than the whole ring would overwrite its own start; only
+@@ -344,6 +368,14 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
+         const auto ready = static_cast<std::size_t>(impl.write_end - impl.read_position - kPrebufferFrames);
+         impl.scratch.resize(ready * kChannels);
+         impl.retire(ready, impl.scratch.data(), true);
++        // A platform device takes what was retired; what its queue has no room for is lost, as on a device that falls behind.
++        if (impl.output_open) {
++            const std::size_t taken = g_output.write(impl.scratch.data(), ready);
++            if (taken < ready) {
++                impl.window_dropped += ready - taken;
++                impl.total_dropped += ready - taken;
++            }
++        }
+     }
+ }
+ 
+diff --git a/host/audio/audio_sink.hpp b/host/audio/audio_sink.hpp
+index 93b83b6..2b68bd8 100644
+--- a/host/audio/audio_sink.hpp
++++ b/host/audio/audio_sink.hpp
+@@ -9,6 +9,20 @@ namespace portablekit::audio {
+ inline constexpr std::uint32_t kSampleRate = 44'100u;
+ inline constexpr std::uint32_t kChannels = 2u;
+ 
++// A platform layer's playback device, for a build without SDL audio (the Vita's: a pump thread fed through a ring).
++// The sink pushes the frames it retires: everything older than its prebuffer, as soon as a producer has mixed past it.
++// Install it with set_audio_output() before AudioSink::initialize().
++struct AudioOutput {
++    // Opens the device for 44100 Hz stereo s16; false: run silent.
++    bool (*open)() = nullptr;
++    // Hands the device `count` interleaved stereo frames; returns how many it took (the rest are dropped and counted).
++    std::size_t (*write)(const std::int16_t *frames, std::size_t count) = nullptr;
++    void (*close)() = nullptr;
++    void (*set_gain)(float gain) = nullptr;       // optional, 0..1
++    void (*set_paused)(bool paused) = nullptr;    // optional
++};
++void set_audio_output(const AudioOutput &output) noexcept;
++
+ // Host playback for the guest's 44100 Hz stereo stream.
+ //
+ // The guest and the audio device run on unrelated clocks: the kernel's virtual
+diff --git a/host/corpus_library.cpp b/host/corpus_library.cpp
+index ec17aaf..481012a 100644
+--- a/host/corpus_library.cpp
++++ b/host/corpus_library.cpp
+@@ -1,3 +1,20 @@
++#if defined(__vita__)
++// vitasdk has no dlopen: a Vita build links its corpus into the executable and never opens one.
++#include "corpus_library.hpp"
++
++namespace portablekit {
++
++std::optional<CorpusLibrary> open_corpus_library(const std::filesystem::path &, std::string_view, std::string &error) {
++    error = "shared corpus libraries are not available on this platform";
++    return std::nullopt;
++}
++
++std::filesystem::path variant_corpus_path(const ProfileVariant &variant) {
++    return std::filesystem::path("corpora") / std::string(variant.key);
++}
++
++} // namespace portablekit
++#else
+ #include "corpus_library.hpp"
+ 
+ #include "app_paths.hpp"
+@@ -73,3 +90,4 @@ std::filesystem::path variant_corpus_path(const ProfileVariant &variant) {
+ }
+ 
+ } // namespace portablekit
++#endif // defined(__vita__)
+diff --git a/host/fonts/game_font.cpp b/host/fonts/game_font.cpp
+index 808864c..72a07b5 100644
+--- a/host/fonts/game_font.cpp
++++ b/host/fonts/game_font.cpp
+@@ -1,3 +1,49 @@
++#if defined(__vita__)
++// The Vita build rasterises no host fonts (no system font files, no memory mapping): the game's sceLibFont calls see
++// a font that never loads, exactly as on a desktop with no font installed. Infected does not import sceLibFont.
++#include "fonts/game_font.hpp"
++
++#include <cctype>
++#include <cstdlib>
++
++namespace portablekit::fonts {
++namespace {
++void (*g_reload_hook)() = nullptr;
++std::uint64_t g_generation = 0;
++} // namespace
++
++bool ready() { return false; }
++GlyphMetrics metrics(std::uint32_t) { return {}; }
++GlyphBitmap render(std::uint32_t, float, float) { return {}; }
++void reload() {
++    ++g_generation;
++    if (g_reload_hook != nullptr) g_reload_hook();
++}
++void set_reload_hook(void (*hook)()) { g_reload_hook = hook; }
++std::uint64_t generation() { return g_generation; }
++void start_catalog() {}
++std::vector<FontChoice> catalog(bool &done) {
++    done = true;
++    return {};
++}
++std::string user_font_folder() { return {}; }
++std::string active_name() { return {}; }
++std::string fallback_name() { return {}; }
++std::string problem() { return "host fonts are not available on this platform"; }
++
++void parse_value(const std::string &value, std::string &path, int &face) {
++    path = value;
++    face = 0;
++    const std::size_t hash = value.rfind('#');
++    if (hash == std::string::npos || hash + 1 >= value.size()) return;
++    for (std::size_t i = hash + 1; i < value.size(); ++i)
++        if (std::isdigit(static_cast<unsigned char>(value[i])) == 0) return;
++    path = value.substr(0, hash);
++    face = std::atoi(value.c_str() + hash + 1);
++}
++
++} // namespace portablekit::fonts
++#else
+ #include "fonts/game_font.hpp"
+ 
+ #include "app_paths.hpp"
+@@ -669,3 +715,4 @@ void parse_value(const std::string &value, std::string &path, int &face) {
+ }
+ 
+ } // namespace portablekit::fonts
++#endif // defined(__vita__)
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index b48405d..7161db1 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -11,6 +11,13 @@
+ //     in and the desktop build can also force, to test the narrower path).
+ #if defined(__vita__)
+ #include <vitaGL.h>
++// vitaGL has no constant blend colour (GXM has none): Caps::blend_color is false there and the renderer builds those blends in the
++// fragment shader, so these only have to compile. It has no dithering either (see glp::disable_dither).
++#ifndef GL_CONSTANT_COLOR
++#define GL_CONSTANT_COLOR 0x8001
++#define GL_ONE_MINUS_CONSTANT_COLOR 0x8002
++#endif
++static inline void glBlendColor(GLfloat, GLfloat, GLfloat, GLfloat) {}
+ #else
+ #define GL_GLEXT_PROTOTYPES 1
+ #include <GLES2/gl2.h>
+@@ -49,5 +56,11 @@ void destroy_context();
+ // Ends a frame on the window; nothing without one.
+ void swap_buffers();
+ [[nodiscard]] Caps &caps();
++// Turns dithering off where the driver has it (GL_DITHER is on by default in ES 2; vitaGL has no such state).
++inline void disable_dither() {
++#if !defined(__vita__)
++    glDisable(GL_DITHER);
++#endif
++}
+ 
+ } // namespace portablekit::gpu::glp
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 958f861..34f8b25 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1991,7 +1991,7 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     impl.blend_color_ok = caps.blend_color && !impl.settings.force_no_blend_color;
+     impl.minmax_ok = caps.blend_minmax;
+     impl.description = caps.renderer + " (" + caps.vendor + ", " + caps.version + ")";
+-    glDisable(GL_DITHER);
++    glp::disable_dither();
+     glEnable(GL_SCISSOR_TEST);
+     glEnableVertexAttribArray(0u);
+     glEnableVertexAttribArray(1u);
+diff --git a/host/hle/hle_common.hpp b/host/hle/hle_common.hpp
+index 4f714de..5316b04 100644
+--- a/host/hle/hle_common.hpp
++++ b/host/hle/hle_common.hpp
+@@ -89,6 +89,12 @@ void register_sysmem(HleRegistrar &hle);
+ void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick);
+ void register_system(HleRegistrar &hle);
+ void register_media(HleRegistrar &hle);
++
++namespace gpu {
++class Renderer;
++}
++// The GE backend register_media created; nullptr without one (headless, or not built). For a platform layer's statistics.
++[[nodiscard]] gpu::Renderer *media_renderer() noexcept;
+ void register_atrac(HleRegistrar &hle);
+ void register_mpeg(HleRegistrar &hle);
+ void register_psmfplayer(HleRegistrar &hle);
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index a6cd823..a92e481 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -19,10 +19,12 @@
+ #include "camera/camera_input.hpp"
+ #include "camera/camera_driver.hpp"
+ #include "input/bindings.hpp"
++#include "input/pad_provider.hpp"
+ #include "settings/settings.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_dump.hpp"
+ #include "perf/frame_stats.hpp"
++#include "perf/phase_timers.hpp"
+ #include "perf/bringup_stats.hpp"
+ // A GE backend is built: the Vulkan one with its window and interface
+ // (PORTABLEKIT_HAS_RENDERER), the GLES2 one without (PORTABLEKIT_HAS_GL_RENDERER), or both.
+@@ -210,7 +212,10 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
+         media().ge.set_raw_vertices(renderer.gpu_decode(), renderer.check_gpu_decode());
+         const bool statistics = bringup::wants_draws();
+         media().ge.set_draw_sink([&renderer, &memory, statistics](const gpu::DrawCall &call) {
+-            renderer.submit(call, memory);
++            {
++                const phase::Scope submit(phase::GlSubmit);
++                renderer.submit(call, memory);
++            }
+             if (statistics) bringup::on_draw(call);
+         });
+     } else if (bringup::wants_draws()) {
+@@ -227,6 +232,7 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
+     if (dumping) gpu::gedump::on_list_run(rt.memory(), media().ge, id, list.pc, list.stall);
+     try {
+         const perf::SplitScope split(perf::Split::Lists);
++        const phase::Scope walk(phase::GeWalk);
+         list.pc = media().ge.execute(rt.memory(), list.pc, list.stall, finished);
+     } catch (const psprecomp::Error &error) {
+         // A malformed list must not take the whole run down: drop it and carry on.
+@@ -328,6 +334,7 @@ void present_frame(Runtime &rt) {
+ #if defined(PORTABLEKIT_HAS_RENDERER)
+     ui::draw_over_game();
+ #endif
++    const phase::Scope present_scope(phase::Present);
+     renderer.write_back_frame(rt.memory());
+     // A load running fast flips far more often than the display refreshes.
+     renderer.set_fast_forward(fast_loading::active());
+@@ -477,6 +484,19 @@ CtrlSample sample_ctrl() {
+         }
+     }
+ #endif
++    // The platform layer's own controller (the Vita), for a build without the Vulkan window's input.
++    if (const PadProvider provider = pad_provider(); provider != nullptr) {
++        PadSample pad;
++        if (provider(pad)) {
++            sample.buttons |= pad.buttons;
++            stall_watchdog::note_pad(sample.buttons);
++            fast_loading::note_buttons(sample.buttons != 0u);
++            sample.analog_x = pad.analog_x;
++            sample.analog_y = pad.analog_y;
++            sample.right_x = pad.right_x;
++            sample.right_y = pad.right_y;
++        }
++    }
+     // A scripted pad (<prefix>_PAD_SCRIPT) is for runs without a window, and adds to a real one.
+     if (const auto scripted = bringup::scripted_buttons(kernel().now_us())) sample.buttons |= *scripted;
+     // The script's sticks (LX=, LY=, RX=, RY=) replace a centred stick.
+@@ -1254,6 +1274,14 @@ void show_cpu_picture_in_vram(Runtime &rt, std::uint32_t address, std::uint32_t
+ #endif
+ }
+ 
++gpu::Renderer *media_renderer() noexcept {
++#if defined(PORTABLEKIT_GPU_RENDERER)
++    return media().renderer.get();
++#else
++    return nullptr;
++#endif
++}
++
+ void register_media(HleRegistrar &hle) {
+     bringup::install(hle.runtime(), media().ge);
+     initialize_renderer();
+diff --git a/host/input/pad_provider.hpp b/host/input/pad_provider.hpp
+new file mode 100644
+index 0000000..3e8eb0c
+--- /dev/null
++++ b/host/input/pad_provider.hpp
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <cstdint>
++
++// A platform layer's controller, for a build whose renderer has no window and no pad of its own (the GLES2 backend):
++// the Vita build's buttons and sticks. sample_ctrl() (hle/hle_media.cpp) asks it for every sceCtrl read, in the PSP's bit
++// layout; a scripted pad (<prefix>_PAD_SCRIPT) is added on top, as with a window.
++namespace portablekit {
++
++struct PadSample {
++    std::uint32_t buttons{};
++    std::uint8_t analog_x{0x80u};
++    std::uint8_t analog_y{0x80u};
++    std::uint8_t right_x{0x80u};
++    std::uint8_t right_y{0x80u};
++};
++
++// Fills `out` with the pad as it is now; false when it cannot be read (the sample then stays neutral).
++using PadProvider = bool (*)(PadSample &out);
++
++inline PadProvider g_pad_provider = nullptr;
++inline void set_pad_provider(PadProvider provider) noexcept { g_pad_provider = provider; }
++[[nodiscard]] inline PadProvider pad_provider() noexcept { return g_pad_provider; }
++
++} // namespace portablekit
+diff --git a/host/kernel/iso_image.cpp b/host/kernel/iso_image.cpp
+index a0272e2..50c43d5 100644
+--- a/host/kernel/iso_image.cpp
++++ b/host/kernel/iso_image.cpp
+@@ -1,5 +1,6 @@
+ #include "iso_image.hpp"
+ 
++#include "perf/phase_timers.hpp"
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
+@@ -74,6 +75,7 @@ std::optional<IsoImage::Entry> IsoImage::find(std::string path) const {
+ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output) {
+     if (offset >= size_bytes_) return 0u;
+     const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
++    const phase::Scope timer(phase::IsoRead);
+     file_.clear();
+     file_.seekg(static_cast<std::streamoff>(offset));
+     file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index a23656c..f1f4d74 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -7,6 +7,7 @@
+ #include "kernel/load_trace.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "perf/bringup_stats.hpp"
++#include "perf/phase_timers.hpp"
+ #include "settings/settings.hpp"
+ #include "psprecomp/common.hpp"
+ #include "psprecomp/interpreter.hpp"
+@@ -92,6 +93,7 @@ const char *wait_name(WaitType type) {
+ }
+ 
+ void sleep_host(std::uint64_t microseconds) {
++    const phase::Scope timer(phase::Idle);
+ #if !defined(PORTABLEKIT_NO_HOST_THREADS)
+     std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
+ #else
+@@ -387,6 +389,7 @@ bool Kernel::better_thread_ready(bool or_equal) noexcept {
+ void Kernel::transfer(psprecomp::Coroutine &to) {
+     psprecomp::Coroutine &from = *running_;
+     running_ = &to;
++    ++switch_count_;
+     psprecomp::Coroutine::switch_to(from, to);
+     // Whatever switched back to this coroutine made it the running one.
+ }
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index 080ded6..5b0ab2f 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -277,6 +277,8 @@ public:
+         return now_us_;
+     }
+     [[nodiscard]] std::uint64_t vblank_count() const noexcept { return vblank_count_; }
++    // Coroutine switches since the start (every guest thread change, scheduler included): a cost counter for the status line.
++    [[nodiscard]] std::uint64_t switch_count() const noexcept { return switch_count_; }
+     // Emulated time of the latest vblank, at or before now_us().
+     [[nodiscard]] std::uint64_t last_vblank_us() const noexcept { return next_vblank_us_ - kVBlankPeriodUs; }
+     // Forgets how far emulated time was ahead of or behind real time. Called
+@@ -547,6 +549,7 @@ private:
+         std::string switched_to;
+     };
+     std::map<std::uint32_t, SpinSite> spin_sites_;
++    std::uint64_t switch_count_{};
+     std::uint64_t spin_calls_{};
+     std::uint64_t spin_interrupts_{};
+     bool starve_equal_{};
+diff --git a/host/movie/avc_decoder.cpp b/host/movie/avc_decoder.cpp
+index ed15394..f4d9bd4 100644
+--- a/host/movie/avc_decoder.cpp
++++ b/host/movie/avc_decoder.cpp
+@@ -1,5 +1,7 @@
+ #include "movie/avc_decoder.hpp"
+ 
++#include "perf/phase_timers.hpp"
++
+ #include <cstring>
+ 
+ #if defined(PORTABLEKIT_HAS_FFMPEG)
+@@ -87,6 +89,7 @@ bool AvcDecoder::is_open() const noexcept { return impl_->context != nullptr; }
+ bool AvcDecoder::decode(std::span<const std::uint8_t> unit, Picture &picture) {
+     Impl &impl = *impl_;
+     if (impl.context == nullptr || unit.empty() || impl.draining) return false;
++    const portablekit::phase::Scope timer(portablekit::phase::Decode);
+     av_packet_unref(impl.packet);
+     if (av_new_packet(impl.packet, static_cast<int>(unit.size())) < 0) return false;
+     std::memcpy(impl.packet->data, unit.data(), unit.size());
+diff --git a/host/overlays.cpp b/host/overlays.cpp
+index 67c1380..4e50eee 100644
+--- a/host/overlays.cpp
++++ b/host/overlays.cpp
+@@ -1,3 +1,21 @@
++#if defined(__vita__)
++// vitasdk has no dlopen, so overlay corpora cannot be loaded: a Vita build links everything it runs into the
++// executable. A game that loads code into slots runs those slots in the interpreter (the dispatch miss is not hooked).
++#include "overlays.hpp"
++
++namespace portablekit {
++
++namespace {
++CodeMissHook g_code_miss_hook = nullptr;
++}
++
++void install_overlay_support(psprecomp::Runtime &) {}
++void revalidate_overlays(psprecomp::Runtime &) {}
++void forget_unmatched_overlays() {}
++void set_code_miss_hook(CodeMissHook hook) { g_code_miss_hook = hook; }
++
++} // namespace portablekit
++#else
+ // Run-time overlay support. The game copies overlay code into fixed slots, so
+ // the corpus for an overlay can only be installed once its bytes are in guest
+ // memory. Each recompiled overlay is a shared library next to the executable,
+@@ -371,3 +389,4 @@ void install_overlay_support(Runtime &runtime) {
+ }
+ 
+ } // namespace portablekit
++#endif // defined(__vita__)
+diff --git a/host/perf/phase_timers.hpp b/host/perf/phase_timers.hpp
+new file mode 100644
+index 0000000..2db96ff
+--- /dev/null
++++ b/host/perf/phase_timers.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++// Where a frame's time goes, for a platform layer that reports it (the Vita build's per-second status line). Off until the
++// platform installs a clock with set_clock(); a scope then costs two clock reads and one atomic add, with it off one
++// pointer test. The totals are 32-bit microsecond counters that wrap (take differences), so another thread may read them
++// while the owners of the phases write them.
++//
++// Phases are leaves of the guest's work and do not nest into each other except GeWalk, which contains the GlSubmit of
++// its draws. What is left of a frame is the guest's own code and the HLE calls that were not timed.
++namespace portablekit::phase {
++
++enum Phase : unsigned {
++    GeWalk,    // running a display list (GeState::execute): command decode, vertex decode, GlSubmit included
++    GlSubmit,  // the renderer's handling of a draw call from the list
++    Present,   // the flip: texture uploads for movies, write-back, the renderer's present and swap
++    Hle,       // HLE calls that returned without switching threads (needs the import hook: <app> stats_hle)
++    Decode,    // ATRAC3plus and H.264 decoding
++    Audio,     // mixing into the audio sink
++    IsoRead,   // reading the disc image
++    Idle,      // the kernel waiting for real time
++    kCount
++};
++
++struct Table {
++    std::atomic<std::uint32_t> us[kCount];
++    std::atomic<std::uint32_t> calls[kCount];
++};
++inline Table g_table{};
++inline std::uint64_t (*g_clock)() = nullptr;
++
++inline void set_clock(std::uint64_t (*clock)()) noexcept { g_clock = clock; }
++[[nodiscard]] inline bool enabled() noexcept { return g_clock != nullptr; }
++[[nodiscard]] inline std::uint64_t stamp() noexcept { return g_clock != nullptr ? g_clock() : 0u; }
++inline void add(Phase phase, std::uint64_t microseconds) noexcept {
++    g_table.us[phase].fetch_add(static_cast<std::uint32_t>(microseconds), std::memory_order_relaxed);
++    g_table.calls[phase].fetch_add(1u, std::memory_order_relaxed);
++}
++[[nodiscard]] inline std::uint32_t total_us(Phase phase) noexcept { return g_table.us[phase].load(std::memory_order_relaxed); }
++[[nodiscard]] inline std::uint32_t total_calls(Phase phase) noexcept { return g_table.calls[phase].load(std::memory_order_relaxed); }
++
++class Scope {
++public:
++    explicit Scope(Phase phase) noexcept : phase_(phase), start_(stamp()) {}
++    ~Scope() {
++        if (g_clock != nullptr) add(phase_, g_clock() - start_);
++    }
++    Scope(const Scope &) = delete;
++    Scope &operator=(const Scope &) = delete;
++
++private:
++    Phase phase_;
++    std::uint64_t start_;
++};
++
++} // namespace portablekit::phase
+diff --git a/include/psprecomp/guest_memory.hpp b/include/psprecomp/guest_memory.hpp
+index 8ee7c7c..57d2993 100644
+--- a/include/psprecomp/guest_memory.hpp
++++ b/include/psprecomp/guest_memory.hpp
+@@ -12,6 +12,15 @@
+ 
+ namespace psprecomp {
+ 
++// Where the 66 MiB arena comes from, for a platform that cannot get it from mmap or aligned_alloc (the Vita hands out a
++// dedicated, 1 MiB aligned memory block and keeps it out of the C heap). Set before the first GuestMemory is made; the
++// default is mmap on Linux and aligned_alloc elsewhere. `allocate` returns zeroed memory aligned to 1 MiB or nullptr.
++struct ArenaProvider {
++    std::uint8_t *(*allocate)(std::size_t bytes) = nullptr;
++    void (*release)(std::uint8_t *arena, std::size_t bytes) = nullptr;
++};
++void set_arena_provider(const ArenaProvider &provider) noexcept;
++
+ // Each generated AOT unit is one enormous function, and MSVC stops inlining
+ // into a caller that large -- measured: moving the fast paths into this header
+ // grew the linked image by only 2 KB, so the calls survived.  Roughly a third of
+diff --git a/src/guest_memory.cpp b/src/guest_memory.cpp
+index 2ebcf59..20001d7 100644
+--- a/src/guest_memory.cpp
++++ b/src/guest_memory.cpp
+@@ -105,7 +105,10 @@ void set_write_watch(std::uint32_t address, std::uint32_t size) {
+ // platforms, the Vita among them, allocate and clear it.
+ namespace {
+ 
++ArenaProvider g_arena_provider{};
++
+ std::uint8_t *arena_allocate(std::size_t bytes) {
++    if (g_arena_provider.allocate != nullptr) return g_arena_provider.allocate(bytes);
+ #if defined(__linux__)
+     void *mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+     return mapping == MAP_FAILED ? nullptr : static_cast<std::uint8_t *>(mapping);
+@@ -119,6 +122,10 @@ std::uint8_t *arena_allocate(std::size_t bytes) {
+ 
+ void arena_release(std::uint8_t *arena, std::size_t bytes) noexcept {
+     if (arena == nullptr) return;
++    if (g_arena_provider.release != nullptr) {
++        g_arena_provider.release(arena, bytes);
++        return;
++    }
+ #if defined(__linux__)
+     munmap(arena, bytes);
+ #else
+@@ -129,6 +136,8 @@ void arena_release(std::uint8_t *arena, std::size_t bytes) noexcept {
+ 
+ } // namespace
+ 
++void set_arena_provider(const ArenaProvider &provider) noexcept { g_arena_provider = provider; }
++
+ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+     : write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
+     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {

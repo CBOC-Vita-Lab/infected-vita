@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 13:35:45 +0000
+Subject: [PATCH] settings: the greyed reason of the HD movies row fits the
+ overlay (28 characters)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index fc187f5..812e656 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -209,7 +209,7 @@ Settings::Settings() {
+     }
+     // What this program cannot offer. A platform or a feature module changes these with set_unavailable().
+     unavailable_[static_cast<std::size_t>(Key::GfxHdTextures)] = "No texture pack installed.";
+-    unavailable_[static_cast<std::size_t>(Key::GfxHdMovies)] = "Experimental. No replacement movies yet.";
++    unavailable_[static_cast<std::size_t>(Key::GfxHdMovies)] = "Experimental. No movies yet.";
+     unavailable_[static_cast<std::size_t>(Key::PerfThreadedRenderer)] = "Renderer thread not built yet.";
+     // The two gameplay rows belong to a game's profile (infected_tuning.cpp makes them usable); a program without one keeps them greyed.
+     unavailable_[static_cast<std::size_t>(Key::PerfEnemyDensity)] = "Only while the game runs.";

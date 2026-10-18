@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 04:30:10 +0000
+Subject: [PATCH] textures: read whole swizzle blocks when a texture does not
+ fill them; leave those out of the HD packs
+
+A swizzled texture narrower than 16 bytes (a 16 x 16 palette texture is 8 bytes wide) was unswizzled as if it had no padding between
+rows, so the small HUD icons, button glyphs and mission icons came out as dot patterns. Decoding now reads the padded blocks.
+The HD packs built earlier hold that garbage as the picture for these textures, so they are skipped for them
+(texture_has_padded_blocks) and the original texels are used.
+
+Verified: desktop screenshots of the HUD and button glyphs before and after. Not verified: on the PS Vita.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 8e4e551..9f95285 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -713,7 +713,9 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+ 
+     info.recoloured = false;
+     bool replaced = false;
+-    if (pack_.is_open()) {
++    // The packs hold what the decoder made of a swizzled texture that does not fill its blocks before it read the blocks whole (dot
++    // patterns for the small HUD icons, button glyphs and mission icons): those keep the original.
++    if (pack_.is_open() && !texture_has_padded_blocks(state)) {
+         const Clock::time_point lookup_start = Clock::now();
+         HdRecord record;
+         const bool found = pack_.find(key, record);
+diff --git a/host/gpu/texture_decode.cpp b/host/gpu/texture_decode.cpp
+index 9217bd4..c4e89ca 100644
+--- a/host/gpu/texture_decode.cpp
++++ b/host/gpu/texture_decode.cpp
+@@ -57,24 +57,39 @@ bool reuse_buffers() {
+     return !no_reuse && !perf::alternate_off(perf::NewPath::Reuse);
+ }
+ 
+-// Swizzled textures are stored as 16-byte wide, 8-row blocks.
++// Swizzled textures are stored as 16-byte wide, 8-row blocks, and a texture that does not fill its last block (or is narrower than
++// one: a 16 x 16 palette texture is 8 bytes wide, an 8 x 8 one 4) still occupies whole blocks, the unused bytes padding. The
++// stored size is therefore not row_bytes * rows. The decoder used to leave such a texture as it was stored, which showed the
++// padding between the rows: the small HUD icons, the button glyphs and the mission icons came out as dot patterns.
++std::uint32_t swizzled_stored_rows(std::uint32_t rows) { return (rows + 7u) & ~7u; }
++std::uint32_t swizzled_stored_row_bytes(std::uint32_t row_bytes) { return (row_bytes + 15u) & ~15u; }
++std::size_t swizzled_stored_bytes(std::uint32_t row_bytes, std::uint32_t rows) {
++    return static_cast<std::size_t>(swizzled_stored_row_bytes(row_bytes)) * swizzled_stored_rows(rows);
++}
++
++// `data` holds the stored blocks (at least swizzled_stored_bytes(), or just row_bytes * rows when the guest memory ends first: the
++// missing bytes read as zero); it leaves holding row_bytes * rows bytes, row after row.
+ void unswizzle(std::vector<std::uint8_t> &data, std::uint32_t row_bytes, std::uint32_t rows) {
+-    if (row_bytes % 16u != 0u || rows % 8u != 0u) return;
++    if (row_bytes == 0u || rows == 0u) return;
+     thread_local std::vector<std::uint8_t> kept;
+     std::vector<std::uint8_t> fresh;
+     std::vector<std::uint8_t> &source = reuse_buffers() ? kept : fresh;
+     source.assign(data.begin(), data.end());
+-    const std::uint32_t block_columns = row_bytes / 16u;
++    const std::uint32_t block_columns = (row_bytes + 15u) / 16u;
++    const std::uint32_t block_rows = (rows + 7u) / 8u;
++    data.assign(static_cast<std::size_t>(row_bytes) * rows, 0u);
+     std::size_t offset = 0u;
+-    for (std::uint32_t block_row = 0; block_row < rows / 8u; ++block_row) {
++    for (std::uint32_t block_row = 0; block_row < block_rows; ++block_row) {
+         for (std::uint32_t block_column = 0; block_column < block_columns; ++block_column) {
+-            for (std::uint32_t row = 0; row < 8u; ++row) {
+-                const std::size_t destination = static_cast<std::size_t>(block_row * 8u + row) * row_bytes +
+-                                                static_cast<std::size_t>(block_column) * 16u;
+-                if (offset + 16u > source.size() || destination + 16u > data.size()) return;
+-                std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(offset), 16u,
++            const std::uint32_t column_bytes = std::min<std::uint32_t>(16u, row_bytes - block_column * 16u);
++            for (std::uint32_t row = 0; row < 8u; ++row, offset += 16u) {
++                const std::uint32_t y = block_row * 8u + row;
++                if (y >= rows) continue;
++                const std::size_t destination = static_cast<std::size_t>(y) * row_bytes + static_cast<std::size_t>(block_column) * 16u;
++                if (offset >= source.size()) continue;
++                const std::size_t count = std::min<std::size_t>(column_bytes, source.size() - offset);
++                std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(offset), count,
+                             data.begin() + static_cast<std::ptrdiff_t>(destination));
+-                offset += 16u;
+             }
+         }
+     }
+@@ -345,6 +360,14 @@ void decode_texels(ReadClut read_entry, const TextureState &texture, std::uint32
+ 
+ } // namespace
+ 
++bool texture_has_padded_blocks(const TextureState &texture) {
++    if (!texture.swizzled) return false;
++    const std::uint32_t bits = bits_per_texel(texture.format);
++    if (bits == 0u) return false;
++    const std::uint32_t stride_texels = texture.buffer_width != 0u ? texture.buffer_width : texture.width;
++    return (stride_texels * bits / 8u) % 16u != 0u || texture.height % 8u != 0u;
++}
++
+ bool decode_texture(const GuestMemory &memory, const TextureState &texture, std::vector<std::uint32_t> &out) {
+     const std::uint32_t width = texture.width;
+     const std::uint32_t height = texture.height;
+@@ -387,20 +410,23 @@ bool decode_texture(const GuestMemory &memory, const TextureState &texture, std:
+     const std::uint32_t row_bytes = stride_texels * bits / 8u;
+     const std::size_t total = static_cast<std::size_t>(row_bytes) * height;
+     if (total == 0u || !memory.contains(texture.address, total)) return false;
++    // A swizzled texture is stored in whole blocks: read them all when guest memory has them (see swizzled_stored_bytes).
++    const std::size_t stored = texture.swizzled ? swizzled_stored_bytes(row_bytes, height) : total;
++    const std::size_t load = stored > total && memory.contains(texture.address, stored) ? stored : total;
+ 
+     thread_local std::vector<std::uint8_t> kept;
+     std::vector<std::uint8_t> fresh;
+     std::vector<std::uint8_t> &data = reuse_buffers() ? kept : fresh;
+-    data.assign(total, 0u);
++    data.assign(load, 0u);
+     static const bool slow = portablekit::env("NO_FAST_TEXTURE_DECODE") != nullptr;
+     if (slow) return decode_texels_slow(memory, texture, width, height, row_bytes, data, out);
+     // The texels as one run of host memory where they are one, else byte by byte.
+-    if (const std::uint8_t *source = memory.raw_pointer(texture.address, total)) {
+-        std::memcpy(data.data(), source, total);
++    if (const std::uint8_t *source = memory.raw_pointer(texture.address, load)) {
++        std::memcpy(data.data(), source, load);
+     } else {
+         // Not one run of host memory (a picture that wraps past the end of VRAM): run by run. Byte by byte this was
+         // 80 ms per megabyte on a 444 MHz ARM, which is every frame of a movie whose picture sits at the end of VRAM.
+-        memory.copy_out(texture.address, std::span<std::uint8_t>(data.data(), total));
++        memory.copy_out(texture.address, std::span<std::uint8_t>(data.data(), load));
+     }
+     if (texture.swizzled) unswizzle(data, row_bytes, height);
+     decode_texels([&](std::uint32_t index) { return read_clut(memory, texture, index); }, texture, width, height,
+@@ -410,7 +436,7 @@ bool decode_texture(const GuestMemory &memory, const TextureState &texture, std:
+     if (check) {
+         static std::uint64_t checked = 0u;
+         static std::uint64_t differed = 0u;
+-        std::vector<std::uint8_t> again(total, 0u);
++        std::vector<std::uint8_t> again(load, 0u);
+         std::vector<std::uint32_t> expected(out.size(), 0xFF000000u);
+         decode_texels_slow(memory, texture, width, height, row_bytes, again, expected);
+         ++checked;
+@@ -432,7 +458,9 @@ bool snapshot_texture(const GuestMemory &memory, const TextureState &texture, Te
+     const std::uint32_t row_bytes = stride_texels * bits / 8u;
+     const std::size_t total = static_cast<std::size_t>(row_bytes) * height;
+     if (total == 0u || !memory.contains(texture.address, total)) return false;
+-    const std::uint8_t *texels = memory.raw_pointer(texture.address, total);
++    const std::size_t stored = texture.swizzled ? swizzled_stored_bytes(row_bytes, height) : total;
++    const std::size_t load = stored > total && memory.contains(texture.address, stored) ? stored : total;
++    const std::uint8_t *texels = memory.raw_pointer(texture.address, load);
+     if (texels == nullptr) return false;
+     const bool indexed = texture.format == TextureFormat::Clut4 || texture.format == TextureFormat::Clut8 ||
+                          texture.format == TextureFormat::Clut16 || texture.format == TextureFormat::Clut32;
+@@ -445,7 +473,7 @@ bool snapshot_texture(const GuestMemory &memory, const TextureState &texture, Te
+     }
+     snapshot.texture = texture;
+     snapshot.row_bytes = row_bytes;
+-    snapshot.texels.assign(texels, texels + total);
++    snapshot.texels.assign(texels, texels + load);
+     return true;
+ }
+ 
+@@ -487,9 +515,14 @@ std::uint64_t texture_key(const GuestMemory &memory, const TextureState &texture
+     }
+     const std::uint32_t bits = bits_per_texel(texture.format);
+     // DXT1 blocks hold half a byte per texel, DXT3 and DXT5 blocks a byte.
+-    const std::uint32_t size = bits != 0u                               ? texture.width * texture.height * bits / 8u
+-                               : texture.format == TextureFormat::Dxt1 ? texture.width * texture.height / 2u
+-                                                                       : texture.width * texture.height;
++    std::uint32_t size = bits != 0u                               ? texture.width * texture.height * bits / 8u
++                         : texture.format == TextureFormat::Dxt1 ? texture.width * texture.height / 2u
++                                                                 : texture.width * texture.height;
++    // A swizzled texture that does not fill its blocks is stored in whole blocks: the padding rows hold picture too.
++    if (texture_has_padded_blocks(texture)) {
++        const std::uint32_t stride_texels = texture.buffer_width != 0u ? texture.buffer_width : texture.width;
++        size = static_cast<std::uint32_t>(swizzled_stored_bytes(stride_texels * bits / 8u, texture.height));
++    }
+     // Resolve the texture once; this runs for every textured draw.
+     if (const std::uint8_t *data = memory.raw_pointer(texture.address, static_cast<std::size_t>(size) + 3u)) {
+         // <prefix>_SAMPLED_TEXTURE_KEYS=1 samples small textures too, as before.
+diff --git a/host/gpu/texture_decode.hpp b/host/gpu/texture_decode.hpp
+index bb70e0a..27e5368 100644
+--- a/host/gpu/texture_decode.hpp
++++ b/host/gpu/texture_decode.hpp
+@@ -28,6 +28,11 @@ bool snapshot_texture(const GuestMemory &memory, const TextureState &texture, Te
+ // unswizzles the snapshot's texels in place.
+ bool decode_snapshot(TextureSnapshot &snapshot, std::vector<std::uint32_t> &out);
+ 
++// Whether the texture is swizzled and does not fill whole 16-byte x 8-row blocks, so that its stored layout has padding between the
++// rows (a 16 x 16 palette texture is 8 bytes wide in 16-byte blocks). Decoding has to read the whole blocks. The HD texture packs
++// built before that was understood hold the padding as picture for these textures, so the renderers leave them out.
++[[nodiscard]] bool texture_has_padded_blocks(const TextureState &texture);
++
+ // Key that identifies the decoded contents of a texture for caching.
+ [[nodiscard]] std::uint64_t texture_key(const GuestMemory &memory, const TextureState &texture);
+ 

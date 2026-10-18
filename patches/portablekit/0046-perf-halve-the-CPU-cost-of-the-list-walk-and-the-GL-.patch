@@ -1,0 +1,2029 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:05:30 +0000
+Subject: [PATCH] perf: halve the CPU cost of the list walk and the GL renderer
+ per draw
+
+Measured with ARM instruction counts (a Cortex-A9 build of ge_replay under QEMU,
+ten gameplay frames of Infected): the renderer's own work per frame went from
+6.2 to 3.0 million instructions and the list walk's from 6.0 to 3.5 million.
+On the Vita the frame was CPU-bound on the GE thread (walk 21 ms, submit 36 ms).
+
+List walk (GeState):
+- the command loop keeps its per-word checks to a subtraction and a compare;
+  the list trace is read on the slow path only, and handle_command() is
+  inlined into it; matrix uploads, BASE, VADDR, IADDR, VTYPE are handled in
+  the loop
+- register traces and block transfers moved out of the hot handler
+- lighting and material versions move only when a value changes (a game sends
+  the same values per model): fewer renderer refreshes and 65 more merged
+  draws per frame; a new matrix_version does the same for world/view/proj
+- ignored commands are counted in an array, not a map
+- decoded vertices use an allocator that does not construct on resize()
+- vertex placement memoised per vertex type; 16-bit indices copied, ranged
+  and rebased in vectorisable loops; NEON skinning multiplies by lane (scalar
+  operands went through the stack) and skips zero weights before converting
+- the split renderer takes a draw's vertex and index storage instead of
+  copying it (Renderer::submit_taking)
+
+GL renderer:
+- inline word compares instead of memcmp; DrawState reordered (texture first)
+  and compared only up to the matrices, which follow from a transform serial
+- uniform uploads templated on the uniform; lighting and matrices compared
+  only when they changed since the program last had them
+- the matrix memo keyed by matrix_version; lround inlined
+- direct-mapped front caches for palette hashes, textures, samplers and
+  programs (no hash/modulo per draw)
+- triangle strips converted two triangles at a time, lists in 16-bit lanes
+- batches are appended straight into the frame's GPU scratch memory on the
+  Vita (BatchBuffer): no staging copy at the flush
+- merge-break statistics only with ge_replay --stats
+
+Verified: 25 replayed gameplay frames pixel-identical to the previous build
+(direct and --threaded); a live mission-1 run, threaded and split, gives the
+same screenshots at four points as the build before; ctest 42/42; the NEON
+skinning matched the scalar decoder over 100,000 runs (QEMU). The Vulkan
+renderer was only syntax-checked. Not yet run on a Vita.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index c8af07a..1a9c1af 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <bit>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+@@ -173,7 +174,7 @@ float decode_float24(std::uint32_t data) {
+     return value;
+ }
+ 
+-std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
++[[gnu::always_inline]] inline std::uint32_t expand_color(std::uint32_t value, std::uint32_t format) {
+     switch (format) {
+     case 4u: {  // 5650
+         const std::uint32_t r = (value & 0x1Fu) * 255u / 31u;
+@@ -343,23 +344,34 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+                 const std::uint8_t *at = base + layout.weight_offset;
+                 float32x4_t position = vdupq_n_f32(0.0f);
+                 float32x4_t normal = vdupq_n_f32(0.0f);
+-                const float p0 = vertex.position[0], p1 = vertex.position[1], p2 = vertex.position[2];
+-                const float n0 = vertex.normal[0], n1 = vertex.normal[1], n2 = vertex.normal[2];
++                // The vertex's position and normal as vectors, multiplied in by lane: scalar operands made the compiler
++                // move each through core registers and the stack for every bone (four times the instructions).
++                alignas(16) const float pv[4] = {vertex.position[0], vertex.position[1], vertex.position[2], 0.0f};
++                alignas(16) const float nv[4] = {vertex.normal[0], vertex.normal[1], vertex.normal[2], 0.0f};
++                const float32x4_t pq = vld1q_f32(pv), nq = vld1q_f32(nv);
++                const float32x2_t p01 = vget_low_f32(pq), p2x = vget_high_f32(pq);
++                const float32x2_t n01 = vget_low_f32(nq), n2x = vget_high_f32(nq);
+                 for (std::uint32_t bone = 0; bone < bones; ++bone) {
++                    // A zero weight is skipped before it is converted (most vertices have one or two bones).
++                    if constexpr (WeightType == 1u) {
++                        if (at[bone] == 0u) continue;
++                    } else if constexpr (WeightType == 2u) {
++                        if (read_raw<std::uint16_t>(at + bone * 2u) == 0u) continue;
++                    }
+                     const float weight = read_field<WeightType, false>(at + bone * weight_size) * weight_scale;
+                     if (weight == 0.0f) continue;
+                     // Columns m[0..2], m[3..5], m[6..8], m[9..11] of the bone's matrix; the fourth lane is never used.
+                     const float *column = columns[bone];
+                     const float32x4_t c0 = vld1q_f32(column), c1 = vld1q_f32(column + 4), c2 = vld1q_f32(column + 8),
+                                       c3 = vld1q_f32(column + 12);
+-                    float32x4_t p = vmulq_n_f32(c0, p0);
+-                    p = vmlaq_n_f32(p, c1, p1);
+-                    p = vmlaq_n_f32(p, c2, p2);
++                    float32x4_t p = vmulq_lane_f32(c0, p01, 0);
++                    p = vmlaq_lane_f32(p, c1, p01, 1);
++                    p = vmlaq_lane_f32(p, c2, p2x, 0);
+                     p = vaddq_f32(p, c3);
+                     position = vmlaq_n_f32(position, p, weight);
+-                    float32x4_t n = vmulq_n_f32(c0, n0);
+-                    n = vmlaq_n_f32(n, c1, n1);
+-                    n = vmlaq_n_f32(n, c2, n2);
++                    float32x4_t n = vmulq_lane_f32(c0, n01, 0);
++                    n = vmlaq_lane_f32(n, c1, n01, 1);
++                    n = vmlaq_lane_f32(n, c2, n2x, 0);
+                     normal = vmlaq_n_f32(normal, n, weight);
+                 }
+                 vertex.position[0] = vgetq_lane_f32(position, 0);
+@@ -375,6 +387,11 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+                 std::array<float, 3> position{};
+                 std::array<float, 3> normal{};
+                 for (std::uint32_t bone = 0; bone < bones; ++bone) {
++                    if constexpr (WeightType == 1u) {
++                        if (at[bone] == 0u) continue;
++                    } else if constexpr (WeightType == 2u) {
++                        if (read_raw<std::uint16_t>(at + bone * 2u) == 0u) continue;
++                    }
+                     const float weight = read_field<WeightType, false>(at + bone * weight_size) * weight_scale;
+                     if (weight == 0.0f) continue;
+                     const float *m = bone_matrices + bone * 12u;
+@@ -449,7 +466,7 @@ VertexFormat vertex_format(std::uint32_t vertex_type) noexcept {
+ }
+ 
+ std::uint32_t decode_vertices(const GuestMemory &memory, std::uint32_t address, std::uint32_t vertex_type,
+-                              std::uint32_t count, std::vector<Vertex> &out, const float *bone_matrices) {
++                              std::uint32_t count, VertexList &out, const float *bone_matrices) {
+     // Field order is weights, texcoords, color, normal, position; every field is
+     // aligned to its component size and the vertex to the largest of them.
+     const std::uint32_t texcoord_type = vertex_type & 3u;
+@@ -464,25 +481,40 @@ std::uint32_t decode_vertices(const GuestMemory &memory, std::uint32_t address,
+     static constexpr std::uint32_t kComponentSize[4] = {0u, 1u, 2u, 4u};
+     static constexpr std::uint32_t kColorSize[8] = {0u, 0u, 0u, 0u, 2u, 2u, 2u, 4u};
+ 
+-    std::uint32_t offset = 0u;
+-    std::uint32_t biggest = 1u;
+-    const auto place = [&](std::uint32_t component, std::uint32_t components) {
+-        if (component == 0u) return std::uint32_t{0xFFFFFFFFu};
+-        offset = align_up(offset, component);
+-        biggest = std::max(biggest, component);
+-        const std::uint32_t at = offset;
+-        offset += component * components;
+-        return at;
++    // Where each field lies depends on the vertex type alone; the placement of the last type is kept (a draw asks
++    // twice, and consecutive draws mostly share a type).
++    struct Placement {
++        std::uint32_t vertex_type{0xFFFFFFFFu};  // never a vertex type (24 bits)
++        std::uint32_t weight_offset{}, texcoord_offset{}, color_offset{}, normal_offset{}, position_offset{}, stride{};
+     };
+-
+-    const std::uint32_t weight_offset = place(kComponentSize[weight_type], weight_count);
++    static thread_local Placement placement;
++    if (placement.vertex_type != vertex_type) {
++        std::uint32_t offset = 0u;
++        std::uint32_t biggest = 1u;
++        const auto place = [&](std::uint32_t component, std::uint32_t components) {
++            if (component == 0u) return std::uint32_t{0xFFFFFFFFu};
++            offset = align_up(offset, component);
++            biggest = std::max(biggest, component);
++            const std::uint32_t at = offset;
++            offset += component * components;
++            return at;
++        };
++        placement.weight_offset = place(kComponentSize[weight_type], weight_count);
++        placement.texcoord_offset = place(kComponentSize[texcoord_type], 2u);
++        placement.color_offset = place(kColorSize[color_type], 1u);
++        placement.normal_offset = place(kComponentSize[normal_type], 3u);
++        placement.position_offset = place(kComponentSize[position_type], 3u);
++        placement.stride = align_up(offset, biggest) * morph_count;
++        placement.vertex_type = vertex_type;
++    }
++    const std::uint32_t weight_offset = placement.weight_offset;
+     const bool skinned = weight_type != 0u && bone_matrices != nullptr && !through;
+-    const std::uint32_t texcoord_offset = place(kComponentSize[texcoord_type], 2u);
++    const std::uint32_t texcoord_offset = placement.texcoord_offset;
+     const std::uint32_t color_component = kColorSize[color_type];
+-    const std::uint32_t color_offset = place(color_component, 1u);
+-    const std::uint32_t normal_offset = place(kComponentSize[normal_type], 3u);
+-    const std::uint32_t position_offset = place(kComponentSize[position_type], 3u);
+-    const std::uint32_t stride = align_up(offset, biggest) * morph_count;
++    const std::uint32_t color_offset = placement.color_offset;
++    const std::uint32_t normal_offset = placement.normal_offset;
++    const std::uint32_t position_offset = placement.position_offset;
++    const std::uint32_t stride = placement.stride;
+     if (stride == 0u) return 0u;
+ 
+     // Resolve the whole vertex run once and read it directly; a run that is not
+@@ -512,7 +544,7 @@ std::uint32_t decode_vertices(const GuestMemory &memory, std::uint32_t address,
+     }
+     // <prefix>_CHECK_DECODE: the fast run's vertices, compared below with the
+     // general loop's.
+-    static std::vector<Vertex> fast_copy;
++    static VertexList fast_copy;
+     const bool compare = check_decode && fast_run != nullptr;
+     if (compare) fast_copy = out;
+     const auto load8 = [&](std::uint32_t at) -> std::uint8_t {
+@@ -649,8 +681,9 @@ std::uint32_t decode_vertices(const GuestMemory &memory, std::uint32_t address,
+     return stride;
+ }
+ 
+-void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, std::uint32_t data) {
+-    registers_[command] = data;
++// The register traces (<prefix>_TRACE_MATERIAL, <prefix>_TRACE_LIGHTING), out of handle_command() so that its frame
++// stays small: it runs for most command words of a list.
++[[gnu::noinline, gnu::cold]] void GeState::trace_register_write(std::uint32_t command, std::uint32_t data) {
+     // Which of 0x53..0x5C actually carries the colour the guest sets is worth
+     // reading off the game rather than recalling: <prefix>_TRACE_MATERIAL reports
+     // every distinct value each of them is given.
+@@ -672,6 +705,98 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+             std::cout << "[lighting] cmd=0x" << std::hex << command << " value=0x" << data << std::dec
+                       << " float=" << decode_float24(data) << "\n";
+     }
++}
++
++// The value of a field of the lighting or material state, and the version that says it changed: moved only when the
++// value does, since a game sends the same values with each model and every move costs the renderer a refresh and
++// keeps two draws apart.
++template <typename T> inline void set_tracked(T &field, T value, std::uint64_t &version) {
++    if constexpr (std::is_same_v<T, float>) {
++        // Bit for bit: -0 and 0 are the same number but not the same register value.
++        if (std::bit_cast<std::uint32_t>(field) == std::bit_cast<std::uint32_t>(value)) return;
++    } else {
++        if (field == value) return;
++    }
++    field = value;
++    ++version;
++}
++
++// One value of a matrix upload. 3x4 matrices arrive as 12 values, three basis rows then a translation row; the
++// projection matrix has all 16. The 3x4 forms are expanded into the column-major 4x4 the shader multiplies as M * v.
++// Also called from execute() directly: matrix values are a third of the command words of a frame.
++inline void GeState::store_matrix_value(std::uint32_t command, std::uint32_t data) {
++    const float value = decode_float24(data);
++    // matrix_version_ moves when a value of the world, view or projection matrix changes (bit for bit): a game
++    // uploads the same matrices again for each model.
++    const auto set = [&](float &slot, float to) {
++        if (std::bit_cast<std::uint32_t>(slot) == std::bit_cast<std::uint32_t>(to)) return;
++        slot = to;
++        ++matrix_version_;
++    };
++    const auto store_3x4 = [&](std::array<float, 16> &matrix, std::uint32_t &index) {
++        if (index < 12u) {
++            set(matrix[(index / 3u) * 4u + (index % 3u)], value);
++            set(matrix[3], 0.0f);
++            set(matrix[7], 0.0f);
++            set(matrix[11], 0.0f);
++            set(matrix[15], 1.0f);
++        }
++        ++index;
++    };
++    switch (command) {
++    case kBoneMatrixData:
++        if (bone_write_index_ < bone_matrices_.size()) bone_matrices_[bone_write_index_] = value;
++        ++bone_write_index_;
++        break;
++    case kWorldMatrixData: store_3x4(world_, world_write_index_); break;
++    case kViewMatrixData: store_3x4(view_, view_write_index_); break;
++    case kTexGenMatrixData: {
++        // Not one of the matrices matrix_version_ stands for.
++        const std::uint64_t version = matrix_version_;
++        store_3x4(texture_matrix_, texture_write_index_);
++        matrix_version_ = version;
++        break;
++    }
++    default:  // kProjMatrixData
++        if (projection_write_index_ < 16u) set(projection_[projection_write_index_], value);
++        ++projection_write_index_;
++        break;
++    }
++}
++
++// TRSTART: a block transfer, from the registers the list set before it. Out of handle_command() (see
++// trace_register_write()).
++[[gnu::noinline]] void GeState::start_transfer(std::uint32_t data) {
++    BlockTransfer transfer{};
++    const auto address = [&](std::uint32_t low, std::uint32_t width) {
++        return resolve_ge_address(((registers_[width] << 8u) & 0xFF000000u) | (registers_[low] & 0x00FFFFFFu));
++    };
++    transfer.source = address(kTransferSourceAddress, kTransferSourceWidth);
++    transfer.source_stride = registers_[kTransferSourceWidth] & 0xFFFFu;
++    transfer.destination = address(kTransferDestinationAddress, kTransferDestinationWidth);
++    transfer.destination_stride = registers_[kTransferDestinationWidth] & 0xFFFFu;
++    transfer.source_x = registers_[kTransferSourcePosition] & 0x3FFu;
++    transfer.source_y = (registers_[kTransferSourcePosition] >> 10u) & 0x3FFu;
++    transfer.destination_x = registers_[kTransferDestinationPosition] & 0x3FFu;
++    transfer.destination_y = (registers_[kTransferDestinationPosition] >> 10u) & 0x3FFu;
++    transfer.width = (registers_[kTransferSize] & 0x3FFu) + 1u;
++    transfer.height = ((registers_[kTransferSize] >> 10u) & 0x3FFu) + 1u;
++    transfer.bytes_per_pixel = (data & 1u) != 0u ? 4u : 2u;
++    static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
++    if (trace)
++        std::cout << "[fbtex] block transfer 0x" << std::hex << transfer.source << std::dec << " ("
++                  << transfer.source_x << "," << transfer.source_y << " row " << transfer.source_stride
++                  << ") -> 0x" << std::hex << transfer.destination << std::dec << " (" << transfer.destination_x
++                  << "," << transfer.destination_y << " row " << transfer.destination_stride << ") "
++                  << transfer.width << "x" << transfer.height << " x" << transfer.bytes_per_pixel << " bytes\n";
++    if (transfer_sink_) transfer_sink_(transfer);
++}
++
++// Inlined into execute(), its only caller, so that a command costs a jump through one table rather than a call.
++[[gnu::always_inline]] inline void GeState::handle_command(const GuestMemory &memory, std::uint32_t command,
++                                                           std::uint32_t data) {
++    registers_[command] = data;
++    if (trace_registers_) trace_register_write(command, data);
+     switch (command) {
+     // Addresses in a display list are relative: BASE supplies four high bits and
+     // OFFSET_ADDR is added on top of them. Conflating the two — and letting
+@@ -784,39 +909,36 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+     case kOffsetX: viewport_.offset_x = static_cast<float>(data & 0xFFFFu) / 16.0f; break;
+     case kOffsetY: viewport_.offset_y = static_cast<float>(data & 0xFFFFu) / 16.0f; break;
+ 
+-    // The material registers; each write moves material_version_.
++    // The material registers; a write that changes one moves material_version_.
+     case kMaterialAmbient:
+-        material_color_ = (material_color_ & 0xFF000000u) | (data & 0x00FFFFFFu);
+-        ++material_version_;
++        set_tracked(material_color_, (material_color_ & 0xFF000000u) | (data & 0x00FFFFFFu), material_version_);
+         break;
+     case kMaterialAlpha:
+-        material_color_ = (material_color_ & 0x00FFFFFFu) | ((data & 0xFFu) << 24u);
+-        ++material_version_;
++        set_tracked(material_color_, (material_color_ & 0x00FFFFFFu) | ((data & 0xFFu) << 24u), material_version_);
+         break;
+-    case kReverseNormal: lighting_.reverse_normals = (data & 1u) != 0u; ++material_version_; break;
+-    case kMaterialUpdate: lighting_.material_update = data & 7u; ++material_version_; break;
+-    case kMaterialEmissive: lighting_.material_emissive = data & 0x00FFFFFFu; ++material_version_; break;
+-    case kMaterialDiffuse: lighting_.material_diffuse = data & 0x00FFFFFFu; ++material_version_; break;
+-    case kMaterialSpecular: lighting_.material_specular = data & 0x00FFFFFFu; ++material_version_; break;
+-    case kMaterialSpecularPower: lighting_.specular_power = decode_float24(data); ++material_version_; break;
+-    case kLightMode: lighting_.mode = data & 1u; ++material_version_; break;
++    case kReverseNormal: set_tracked(lighting_.reverse_normals, (data & 1u) != 0u, material_version_); break;
++    case kMaterialUpdate: set_tracked(lighting_.material_update, data & 7u, material_version_); break;
++    case kMaterialEmissive: set_tracked(lighting_.material_emissive, data & 0x00FFFFFFu, material_version_); break;
++    case kMaterialDiffuse: set_tracked(lighting_.material_diffuse, data & 0x00FFFFFFu, material_version_); break;
++    case kMaterialSpecular: set_tracked(lighting_.material_specular, data & 0x00FFFFFFu, material_version_); break;
++    case kMaterialSpecularPower: set_tracked(lighting_.specular_power, decode_float24(data), material_version_); break;
++    case kLightMode: set_tracked(lighting_.mode, data & 1u, material_version_); break;
+ 
+     // The lighting environment: global ambient, lights and fog parameters;
+-    // each write moves environment_version_.
+-    case kAmbientColor: lighting_.ambient_color = data & 0x00FFFFFFu; ++environment_version_; break;
+-    case kAmbientAlpha: lighting_.ambient_alpha = data & 0xFFu; ++environment_version_; break;
++    // a write that changes one moves environment_version_.
++    case kAmbientColor: set_tracked(lighting_.ambient_color, data & 0x00FFFFFFu, environment_version_); break;
++    case kAmbientAlpha: set_tracked(lighting_.ambient_alpha, data & 0xFFu, environment_version_); break;
+     case kLightEnable0:
+     case kLightEnable0 + 1:
+     case kLightEnable0 + 2:
+     case kLightEnable0 + 3:
+-        lighting_.lights[command - kLightEnable0].enabled = (data & 1u) != 0u;
+-        ++environment_version_;
++        set_tracked(lighting_.lights[command - kLightEnable0].enabled, (data & 1u) != 0u, environment_version_);
+         break;
+ 
+     case kFogEnable: fog_.enabled = (data & 1u) != 0u; break;
+-    case kFogEnd: fog_.end = decode_float24(data); ++environment_version_; break;
+-    case kFogScale: fog_.scale = decode_float24(data); ++environment_version_; break;
+-    case kFogColor: fog_.color = data & 0x00FFFFFFu; ++environment_version_; break;
++    case kFogEnd: set_tracked(fog_.end, decode_float24(data), environment_version_); break;
++    case kFogScale: set_tracked(fog_.scale, decode_float24(data), environment_version_); break;
++    case kFogColor: set_tracked(fog_.color, data & 0x00FFFFFFu, environment_version_); break;
+ 
+     case kWorldMatrixNumber: world_write_index_ = data & 0xFu; break;
+     case kViewMatrixNumber: view_write_index_ = data & 0xFu; break;
+@@ -828,43 +950,15 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+     case kViewMatrixData:
+     case kTexGenMatrixData:
+     case kProjMatrixData:
+-    case kBoneMatrixData: {
+-        // 3x4 matrices arrive as 12 values, three basis rows then a translation
+-        // row; the projection matrix has all 16. Expand the 3x4 forms into the
+-        // column-major 4x4 the shader multiplies as M * v.
+-        const float value = decode_float24(data);
+-        const auto store_3x4 = [&](std::array<float, 16> &matrix, std::uint32_t &index) {
+-            if (index < 12u) {
+-                matrix[(index / 3u) * 4u + (index % 3u)] = value;
+-                matrix[3] = matrix[7] = matrix[11] = 0.0f;
+-                matrix[15] = 1.0f;
+-            }
+-            ++index;
+-        };
+-        if (command == kProjMatrixData) {
+-            if (projection_write_index_ < 16u) projection_[projection_write_index_] = value;
+-            ++projection_write_index_;
+-        } else if (command == kWorldMatrixData) {
+-            store_3x4(world_, world_write_index_);
+-        } else if (command == kViewMatrixData) {
+-            store_3x4(view_, view_write_index_);
+-        } else if (command == kTexGenMatrixData) {
+-            store_3x4(texture_matrix_, texture_write_index_);
+-        } else {
+-            if (bone_write_index_ < bone_matrices_.size()) bone_matrices_[bone_write_index_] = value;
+-            ++bone_write_index_;
+-        }
+-        break;
+-    }
++    case kBoneMatrixData: store_matrix_value(command, data); break;
+ 
+     case kLightType0:
+     case kLightType0 + 1:
+     case kLightType0 + 2:
+     case kLightType0 + 3: {
+         LightState &light = lighting_.lights[command - kLightType0];
+-        light.kind = data & 3u;
+-        light.type = (data >> 8u) & 3u;
+-        ++environment_version_;
++        set_tracked(light.kind, data & 3u, environment_version_);
++        set_tracked(light.type, (data >> 8u) & 3u, environment_version_);
+         break;
+     }
+ 
+@@ -883,32 +977,7 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+     case kTransferDestinationPosition:
+     case kTransferSize:
+         break;  // read from registers_ when the transfer starts
+-    case kTransferStart: {
+-        BlockTransfer transfer{};
+-        const auto address = [&](std::uint32_t low, std::uint32_t width) {
+-            return resolve_ge_address(((registers_[width] << 8u) & 0xFF000000u) | (registers_[low] & 0x00FFFFFFu));
+-        };
+-        transfer.source = address(kTransferSourceAddress, kTransferSourceWidth);
+-        transfer.source_stride = registers_[kTransferSourceWidth] & 0xFFFFu;
+-        transfer.destination = address(kTransferDestinationAddress, kTransferDestinationWidth);
+-        transfer.destination_stride = registers_[kTransferDestinationWidth] & 0xFFFFu;
+-        transfer.source_x = registers_[kTransferSourcePosition] & 0x3FFu;
+-        transfer.source_y = (registers_[kTransferSourcePosition] >> 10u) & 0x3FFu;
+-        transfer.destination_x = registers_[kTransferDestinationPosition] & 0x3FFu;
+-        transfer.destination_y = (registers_[kTransferDestinationPosition] >> 10u) & 0x3FFu;
+-        transfer.width = (registers_[kTransferSize] & 0x3FFu) + 1u;
+-        transfer.height = ((registers_[kTransferSize] >> 10u) & 0x3FFu) + 1u;
+-        transfer.bytes_per_pixel = (data & 1u) != 0u ? 4u : 2u;
+-        static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
+-        if (trace)
+-            std::cout << "[fbtex] block transfer 0x" << std::hex << transfer.source << std::dec << " ("
+-                      << transfer.source_x << "," << transfer.source_y << " row " << transfer.source_stride
+-                      << ") -> 0x" << std::hex << transfer.destination << std::dec << " (" << transfer.destination_x
+-                      << "," << transfer.destination_y << " row " << transfer.destination_stride << ") "
+-                      << transfer.width << "x" << transfer.height << " x" << transfer.bytes_per_pixel << " bytes\n";
+-        if (transfer_sink_) transfer_sink_(transfer);
+-        break;
+-    }
++    case kTransferStart: start_transfer(data); break;
+ 
+     case kLoadClut: {
+         // Blocks of 32 bytes. The PSP reads at most 0x3F of them; a count of
+@@ -931,28 +1000,26 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+         // three colours per light.
+         if (command >= kLightPosition0 && command < kLightDirection0) {
+             const std::uint32_t at = command - kLightPosition0;
+-            lighting_.lights[at / 3u].position[at % 3u] = decode_float24(data);
++            set_tracked(lighting_.lights[at / 3u].position[at % 3u], decode_float24(data), environment_version_);
+         } else if (command >= kLightDirection0 && command < kLightAttenuation0) {
+             const std::uint32_t at = command - kLightDirection0;
+-            lighting_.lights[at / 3u].direction[at % 3u] = decode_float24(data);
++            set_tracked(lighting_.lights[at / 3u].direction[at % 3u], decode_float24(data), environment_version_);
+         } else if (command >= kLightAttenuation0 && command < kSpotExponent0) {
+             const std::uint32_t at = command - kLightAttenuation0;
+-            lighting_.lights[at / 3u].attenuation[at % 3u] = decode_float24(data);
++            set_tracked(lighting_.lights[at / 3u].attenuation[at % 3u], decode_float24(data), environment_version_);
+         } else if (command >= kSpotExponent0 && command < kSpotCutoff0) {
+-            lighting_.lights[command - kSpotExponent0].spot_exponent = decode_float24(data);
++            set_tracked(lighting_.lights[command - kSpotExponent0].spot_exponent, decode_float24(data), environment_version_);
+         } else if (command >= kSpotCutoff0 && command < kLightColor0) {
+-            lighting_.lights[command - kSpotCutoff0].spot_cutoff = decode_float24(data);
++            set_tracked(lighting_.lights[command - kSpotCutoff0].spot_cutoff, decode_float24(data), environment_version_);
+         } else if (command >= kLightColor0 && command <= kLightColorEnd) {
+             const std::uint32_t at = command - kLightColor0;
+             LightState &light = lighting_.lights[at / 3u];
+             std::uint32_t &color = at % 3u == 0u ? light.ambient : at % 3u == 1u ? light.diffuse : light.specular;
+-            color = data & 0x00FFFFFFu;
++            set_tracked(color, data & 0x00FFFFFFu, environment_version_);
+         } else {
+             ++unhandled_commands_;
+             trace_unhandled(command, data);
+-            break;
+         }
+-        ++environment_version_;
+         break;
+     }
+ }
+@@ -1001,6 +1068,12 @@ struct IgnoredCommand {
+     std::uint64_t count{};
+     std::uint32_t first_value{};
+ };
++// The commands of a list by number (a game sends some of them every draw, so this is an array, not a map), and the
++// few made-up numbers above 0xFF in a map.
++std::array<IgnoredCommand, 256> &ignored_list_commands() {
++    static std::array<IgnoredCommand, 256> commands{};
++    return commands;
++}
+ std::map<std::uint32_t, IgnoredCommand> &ignored_commands() {
+     static std::map<std::uint32_t, IgnoredCommand> commands;
+     return commands;
+@@ -1008,7 +1081,7 @@ std::map<std::uint32_t, IgnoredCommand> &ignored_commands() {
+ } // namespace
+ 
+ void GeState::trace_unhandled(std::uint32_t command, std::uint32_t data) {
+-    IgnoredCommand &entry = ignored_commands()[command];
++    IgnoredCommand &entry = command < 256u ? ignored_list_commands()[command] : ignored_commands()[command];
+     if (entry.count == 0u) entry.first_value = data;
+     ++entry.count;
+     static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
+@@ -1017,9 +1090,12 @@ void GeState::trace_unhandled(std::uint32_t command, std::uint32_t data) {
+ }
+ 
+ void GeState::report_ignored_commands() {
+-    if (ignored_commands().empty()) return;
+-    std::cout << "GE commands ignored: " << ignored_commands().size() << " distinct\n";
+-    for (const auto &[command, entry] : ignored_commands())
++    std::map<std::uint32_t, IgnoredCommand> all = ignored_commands();
++    for (std::uint32_t command = 0; command < 256u; ++command)
++        if (ignored_list_commands()[command].count != 0u) all[command] = ignored_list_commands()[command];
++    if (all.empty()) return;
++    std::cout << "GE commands ignored: " << all.size() << " distinct\n";
++    for (const auto &[command, entry] : all)
+         std::cout << "  0x" << std::hex << command << std::dec << " x" << entry.count << " first=0x" << std::hex
+                   << entry.first_value << std::dec << "\n";
+ }
+@@ -1057,6 +1133,7 @@ void GeState::fill_draw_state(DrawCall &call) const {
+     call.world = world_;
+     call.view = view_;
+     call.projection = projection_;
++    call.matrix_version = matrix_version_;
+     call.texture_matrix = texture_matrix_;
+ }
+ 
+@@ -1092,39 +1169,50 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
+         // memory falls back to checked loads.
+         const std::uint8_t *raw = memory.raw_pointer(index_address_, static_cast<std::size_t>(count) * index_size);
+         call.indices.resize(count);
+-        std::uint32_t lowest = 0xFFFFFFFFu;
+-        std::uint32_t highest = 0u;
+-        for (std::uint32_t i = 0; i < count; ++i) {
+-            std::uint32_t index = 0u;
+-            if (raw != nullptr) {
+-                if (index_type == 1u) {
+-                    index = raw[i];
++        // Games draw a mesh as many indexed prims into one shared vertex
++        // buffer. Decode only the vertices this prim references, not the
++        // whole buffer from vertex 0, and rebase its indices onto them.
++        if (raw != nullptr && index_type == 2u) {
++            // The usual case, 16-bit indices in one run of memory: copied, then the range found and the indices
++            // rebased in loops the compiler vectorises (count is not 0 here).
++            std::uint16_t *indices = call.indices.data();
++            std::memcpy(indices, raw, static_cast<std::size_t>(count) * 2u);
++            std::uint16_t low = 0xFFFFu, high = 0u;
++            for (std::uint32_t i = 0; i < count; ++i) {
++                low = std::min(low, indices[i]);
++                high = std::max(high, indices[i]);
++            }
++            for (std::uint32_t i = 0; i < count; ++i) indices[i] = static_cast<std::uint16_t>(indices[i] - low);
++            first_vertex = low;
++            vertex_count = static_cast<std::uint32_t>(high) - low + 1u;
++        } else {
++            std::uint32_t lowest = 0xFFFFFFFFu;
++            std::uint32_t highest = 0u;
++            for (std::uint32_t i = 0; i < count; ++i) {
++                std::uint32_t index = 0u;
++                if (raw != nullptr) {
++                    if (index_type == 1u) {
++                        index = raw[i];
++                    } else {
++                        std::memcpy(&index, raw + i * 4u, sizeof(index));
++                    }
++                } else if (index_type == 1u) {
++                    index = memory.load8(index_address_ + i);
+                 } else if (index_type == 2u) {
+-                    std::uint16_t value{};
+-                    std::memcpy(&value, raw + i * 2u, sizeof(value));
+-                    index = value;
++                    index = memory.load16(index_address_ + i * 2u);
+                 } else {
+-                    std::memcpy(&index, raw + i * 4u, sizeof(index));
++                    index = memory.load32(index_address_ + i * 4u);
+                 }
+-            } else if (index_type == 1u) {
+-                index = memory.load8(index_address_ + i);
+-            } else if (index_type == 2u) {
+-                index = memory.load16(index_address_ + i * 2u);
+-            } else {
+-                index = memory.load32(index_address_ + i * 4u);
++                lowest = std::min(lowest, index);
++                highest = std::max(highest, index);
++                call.indices[i] = static_cast<std::uint16_t>(index);
+             }
+-            lowest = std::min(lowest, index);
+-            highest = std::max(highest, index);
+-            call.indices[i] = static_cast<std::uint16_t>(index);
+-        }
+-        // Games draw a mesh as many indexed prims into one shared vertex
+-        // buffer. Decode only the vertices this prim references, not the
+-        // whole buffer from vertex 0, and rebase its indices onto them.
+-        if (count != 0u) {
+-            first_vertex = lowest;
+-            for (std::uint16_t &index : call.indices) index = static_cast<std::uint16_t>(index - lowest);
++            if (count != 0u) {
++                first_vertex = lowest;
++                for (std::uint16_t &index : call.indices) index = static_cast<std::uint16_t>(index - lowest);
++            }
++            vertex_count = count != 0u ? highest - lowest + 1u : 0u;
+         }
+-        vertex_count = count != 0u ? highest - lowest + 1u : 0u;
+     }
+ 
+     const std::uint32_t probe = decode_vertices(memory, vertex_address_, vertex_type_, 0u, call.vertices);
+@@ -1335,7 +1423,7 @@ void GeState::draw_patch(const GuestMemory &memory, std::uint32_t command, std::
+     } else {
+         for (std::uint32_t i = 0; i < count; ++i) point_index[i] = i;
+     }
+-    std::vector<Vertex> points;
++    VertexList points;
+     const std::uint32_t probe = decode_vertices(memory, vertex_address_, vertex_type_, 0u, points);
+     if (probe == 0u) return;
+     const std::uint32_t first_address = vertex_address_ + lowest * probe;
+@@ -1478,11 +1566,19 @@ bool GeState::load_state(const std::uint8_t *data, std::size_t size) {
+     loaded.call_stack_.resize(depth);
+     take(loaded.call_stack_.data(), depth * sizeof(std::uint32_t));
+     if (!ok) return false;
++    // The versions name the lighting and material values a renderer has already seen from this state; the loaded
++    // values get new ones, above any version this state has handed out, since they may differ from what an equal
++    // version meant here.
++    const std::uint64_t environment_version = std::max(environment_version_, loaded.environment_version_) + 1u;
++    const std::uint64_t material_version = std::max(material_version_, loaded.material_version_) + 1u;
+     auto destination = state_fields(*this);
+     auto source = state_fields(loaded);
+     [&]<std::size_t... I>(std::index_sequence<I...>) {
+         ((std::get<I>(destination) = std::get<I>(source)), ...);
+     }(std::make_index_sequence<std::tuple_size_v<decltype(destination)>>{});
++    environment_version_ = environment_version;
++    material_version_ = material_version;
++    ++matrix_version_;
+     call_stack_ = std::move(loaded.call_stack_);
+     return true;
+ }
+@@ -1494,9 +1590,11 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
+     if (!trace_flags_read_) {
+         trace_material_ = portablekit::env("TRACE_MATERIAL") != nullptr;
+         trace_lighting_ = portablekit::env("TRACE_LIGHTING") != nullptr;
++        trace_registers_ = trace_material_ || trace_lighting_;
+         trace_flags_read_ = true;
+     }
+     if (world_[15] == 0.0f) {
++        ++matrix_version_;
+         identity(world_);
+         identity(view_);
+         identity(projection_);
+@@ -1523,40 +1621,50 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
+     // word (a list is a few thousand words, and the check was a measurable part of the walk on a
+     // slow CPU). A word outside the window, or a list in memory that is not contiguous, takes the
+     // checked path.
++    //
++    // The loop is kept small (the per-word checks are a subtraction and a comparison each) because it runs for every
++    // command word: on the Vita's CPU its bookkeeping was a third of the walk. Jump, call and return targets are
++    // word-aligned; only a list that starts at an unaligned address is read without the window.
+     constexpr std::uint32_t kWindowBytes = 4096u;
+-    std::uint32_t window_base = 1u;
++    std::uint32_t window_base = 1u;  // the window covers [window_base, window_base + kWindowBytes); 1: no window
+     const std::uint8_t *window = nullptr;
++    std::uint32_t failed_base = 1u;  // a window raw_pointer() could not give (memory that is not one run)
++    const std::uint32_t stop = stall != 0u ? stall : 1u;  // 1: no stall address (an aligned pc never equals it)
+     for (std::uint32_t steps = 0; steps < 2'000'000u; ++steps) {
+-        if (stall != 0u && pc == stall) return pc;
++        if (pc == stop) [[unlikely]] {
++            if (stall != 0u) return pc;
++        }
+         std::uint32_t word = 0u;
+-        if ((pc & 3u) == 0u) {
++        const std::uint32_t offset = pc - window_base;
++        if (offset < kWindowBytes) [[likely]] {
++            std::memcpy(&word, window + offset, sizeof(word));
++        } else {
++            // A new window, a word read without one, or a traced list (which never gets a window, so that every word
++            // comes this way).
+             const std::uint32_t base = pc & ~(kWindowBytes - 1u);
+-            if (base != window_base) {
++            const std::uint8_t *fresh = nullptr;
++            if ((pc & 3u) == 0u && !dump && base != failed_base) {
++                fresh = memory.raw_pointer(base, kWindowBytes);
++                if (fresh == nullptr) failed_base = base;
++            }
++            if (fresh != nullptr) {
++                window = fresh;
+                 window_base = base;
+-                window = memory.raw_pointer(base, kWindowBytes);
++                std::memcpy(&word, window + (pc - base), sizeof(word));
++            } else {
++                if (!memory.contains(pc, 4u)) return pc;
++                word = memory.load32(pc);
++                if (dump && steps < 20000u)
++                    std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
+             }
+-        } else {
+-            window_base = 1u;
+-            window = nullptr;
+         }
+-        if (window != nullptr) {
+-            std::memcpy(&word, window + (pc & (kWindowBytes - 1u)), sizeof(word));
+-        } else {
+-            if (!memory.contains(pc, 4u)) return pc;
+-            word = memory.load32(pc);
+-        }
+-        if (dump && steps < 20000u)
+-            std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;
+         ++command_counts_[command];
+-        // Where the camera came from: the display list the game built holds the
+-        // view matrix as commands, and that address is the one thing about the
+-        // camera the host can always point at.
+-        if (command == kViewMatrixNumber) view_matrix_source_ = pc;
+         pc += 4u;
+ 
+         switch (command) {
++
+         case kJump:
+             pc = relative_address(data) & 0x0FFFFFFCu;
+             continue;
+@@ -1627,10 +1735,48 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
+         case kPrimitive:
+             draw_primitive(memory, data);
+             continue;
++        // The most frequent commands that only set state, handled here rather than through handle_command() (the
++        // call and its frame cost more than they do). handle_command() has the same cases, for anything else that
++        // calls it.
++        case kBoneMatrixData:
++        case kWorldMatrixData:
++        case kViewMatrixData:
++        case kProjMatrixData:
++        case kTexGenMatrixData:
++            registers_[command] = data;
++            store_matrix_value(command, data);
++            continue;
++        case kBase:
++            registers_[command] = data;
++            base_extended_ = (data & 0x000F0000u) << 8u;
++            continue;
++        case kVertexAddress:
++            registers_[command] = data;
++            vertex_address_ = relative_address(data);
++            continue;
++        case kIndexAddress:
++            registers_[command] = data;
++            index_address_ = relative_address(data);
++            continue;
++        case kVertexType:
++            registers_[command] = data;
++            vertex_type_ = data;
++            continue;
++        case kNop:
++        case kTextureFlush:
++            registers_[command] = data;
++            if (trace_registers_) trace_register_write(command, data);  // 0xCB is in <prefix>_TRACE_LIGHTING's range
++            continue;
+         case kBezier:
+         case kSpline:
+             draw_patch(memory, command, data);
+             continue;
++        case kViewMatrixNumber:
++            // Where the camera came from: the display list the game built holds the
++            // view matrix as commands, and that address is the one thing about the
++            // camera the host can always point at.
++            view_matrix_source_ = pc - 4u;
++            [[fallthrough]];
+         default:
+             handle_command(memory, command, data);
+             continue;
+diff --git a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+index c2ebee2..4fcab4d 100644
+--- a/host/gpu/ge_state.hpp
++++ b/host/gpu/ge_state.hpp
+@@ -5,6 +5,8 @@
+ #include <array>
+ #include <cstdint>
+ #include <functional>
++#include <memory>
++#include <utility>
+ #include <vector>
+ 
+ // Graphics Engine state machine: turns a PSP display list into draw calls with
+@@ -45,6 +47,23 @@ struct Vertex {
+     std::uint32_t color{0xFFFFFFFFu};
+ };
+ 
++// An allocator that leaves the elements resize() adds unconstructed: the vertex decoder writes every one of them, and
++// constructing them first (a clear and the defaults above, for each of some 20,000 vertices a frame) was a measurable
++// part of the list walk on the PS Vita. Copies and push_back() construct as usual.
++template <typename T> struct UninitializedAllocator : std::allocator<T> {
++    using value_type = T;
++    UninitializedAllocator() noexcept = default;
++    template <typename U> UninitializedAllocator(const UninitializedAllocator<U> &) noexcept {}
++    template <typename U> struct rebind { using other = UninitializedAllocator<U>; };
++    template <typename U> void construct(U *) noexcept {}
++    template <typename U, typename... Args> void construct(U *at, Args &&...args) {
++        ::new (static_cast<void *>(at)) U(std::forward<Args>(args)...);
++    }
++};
++template <typename T, typename U>
++bool operator==(const UninitializedAllocator<T> &, const UninitializedAllocator<U> &) noexcept { return true; }
++using VertexList = std::vector<Vertex, UninitializedAllocator<Vertex>>;
++
+ struct TextureState {
+     bool enabled{};
+     std::uint32_t address{};
+@@ -170,7 +189,7 @@ struct FogState {
+ // A draw call: decoded vertices plus the state they are drawn with.
+ struct DrawCall {
+     PrimitiveType primitive{};
+-    std::vector<Vertex> vertices;
++    VertexList vertices;
+     std::vector<std::uint16_t> indices;  // empty when the draw is not indexed
+     bool through{};                      // vertices are already in screen space
+     TextureState texture;
+@@ -201,11 +220,14 @@ struct DrawCall {
+     LightingState lighting;
+     FogState fog;
+     // Change counters: environment_version moves whenever a register behind
+-    // the lights, the global ambient colour or the fog parameters is written,
+-    // material_version whenever one behind the material is. Equal versions
+-    // mean equal state, so the renderer can skip rebuilding what it derived.
++    // the lights, the global ambient colour or the fog parameters changes,
++    // material_version whenever one behind the material does, matrix_version
++    // whenever a value of the world, view or projection matrix does. Equal
++    // versions mean equal state, so the renderer can skip rebuilding what it
++    // derived. 0 is "not known" (a draw not made by GeState).
+     std::uint64_t environment_version{};
+     std::uint64_t material_version{};
++    std::uint64_t matrix_version{};
+     std::array<float, 16> world{};
+     std::array<float, 16> view{};
+     std::array<float, 16> projection{};
+@@ -255,7 +277,9 @@ struct BlockTransfer {
+ // installs a sink; with no sink the lists are still parsed (for callbacks).
+ class GeState {
+ public:
+-    using DrawSink = std::function<void(const DrawCall &)>;
++    // The sink may take the call's vertex and index storage (Renderer::submit_taking): GeState refills the call for
++    // the next draw and never reads it after the sink returns.
++    using DrawSink = std::function<void(DrawCall &)>;
+     using SignalSink = std::function<void(std::uint32_t signal, std::uint32_t pc)>;
+     using TransferSink = std::function<void(const BlockTransfer &)>;
+ 
+@@ -308,6 +332,7 @@ private:
+     bool trace_flags_read_{false};
+     bool trace_material_{false};
+     bool trace_lighting_{false};
++    bool trace_registers_{false};  // either of the two above
+     // Resolves a display-list address operand against BASE and OFFSET_ADDR.
+     [[nodiscard]] std::uint32_t relative_address(std::uint32_t data) const noexcept {
+         return (offset_address_ + (base_extended_ | (data & 0x00FFFFFFu))) & 0x0FFFFFFFu;
+@@ -319,6 +344,9 @@ private:
+     static auto state_fields(Self &self);
+ 
+     void handle_command(const GuestMemory &memory, std::uint32_t command, std::uint32_t data);
++    void store_matrix_value(std::uint32_t command, std::uint32_t data);
++    void trace_register_write(std::uint32_t command, std::uint32_t data);
++    void start_transfer(std::uint32_t data);
+     void trace_unhandled(std::uint32_t command, std::uint32_t data);
+     void draw_primitive(const GuestMemory &memory, std::uint32_t data);
+     // Copies the state every draw is made with into call_.
+@@ -344,6 +372,7 @@ private:
+     FogState fog_{};
+     std::uint64_t environment_version_{1u};
+     std::uint64_t material_version_{1u};
++    std::uint64_t matrix_version_{1u};  // not part of a saved state: a loaded state moves it
+     std::uint32_t vertex_type_{};
+     std::uint32_t vertex_address_{};
+     std::uint32_t index_address_{};
+@@ -389,7 +418,7 @@ bool find_vram_copy(std::uint32_t address, std::uint32_t &source, std::uint32_t
+ // `bone_matrices`, when given, points at 8 consecutive 3x4 matrices (96 floats)
+ // and skinned vertices are blended into their bones' space by their weights.
+ std::uint32_t decode_vertices(const GuestMemory &memory, std::uint32_t address, std::uint32_t vertex_type,
+-                              std::uint32_t count, std::vector<Vertex> &out,
++                              std::uint32_t count, VertexList &out,
+                               const float *bone_matrices = nullptr);
+ 
+ } // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index 6ef6300..6c32382 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -101,7 +101,7 @@
+         glVertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, 16, vertices);
+         glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, 16, vertices + 2);
+         if (program.location[glsl::kUTexture] != -1) glUniform1i(program.location[glsl::kUTexture], 0);
+-        if (inv_size != nullptr) uniform(program, glsl::kUInvSize, inv_size);
++        if (inv_size != nullptr) uniform<glsl::kUInvSize>(program, inv_size);
+         if (!settings.null_draw) timed_draw([] { glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); });
+         glEnableVertexAttribArray(1u);
+         glEnableVertexAttribArray(3u);
+@@ -149,7 +149,7 @@
+             bind_texture(target.post);
+             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height),
+                          0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+-            samplers.erase(target.post);
++            forget_sampler(target.post);
+             set_sampler(target.post, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+         }
+         bind_target(target);
+@@ -183,7 +183,7 @@
+         bind_texture(composed.color);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                      GL_UNSIGNED_BYTE, nullptr);
+-        samplers.erase(composed.color);
++        forget_sampler(composed.color);
+         set_sampler(composed.color, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+         glBindFramebuffer(GL_FRAMEBUFFER, composed.fbo);
+         cache.fbo = composed.fbo;
+@@ -306,6 +306,9 @@
+             gt.swap_us += micros_since(start);
+         }
+         scene_fresh = true;   // the window's next picture is a new scene
++        // The frame's scratch memory is the GPU's now: the next batches go into new chunks.
++        batch_vertices.new_frame(settings.scratch_buffers && !settings.null_draw);
++        batch_indices.new_frame(settings.scratch_buffers && !settings.null_draw);
+     }
+ 
+     void show(Target &target) {
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index ad027e6..68e12ee 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -45,6 +45,36 @@
+ namespace portablekit::gpu {
+ namespace {
+ 
++// Whether two runs of 32-bit words are bitwise equal: memcmp() == 0, inlined. The renderer compares draw state, uniform
++// values and texture keys some 13,000 times a frame, and the library call (a byte loop on some C libraries) was the
++// largest single item in its instruction profile on ARM. Four words are compared per step, without an early exit.
++[[gnu::always_inline]] inline bool same_words(const void *a, const void *b, std::size_t words) {
++    const auto *x = static_cast<const unsigned char *>(a);
++    const auto *y = static_cast<const unsigned char *>(b);
++    std::size_t i = 0;
++    for (; i + 4u <= words; i += 4u) {
++        std::uint32_t p[4], q[4];
++        std::memcpy(p, x + i * 4u, sizeof(p));
++        std::memcpy(q, y + i * 4u, sizeof(q));
++        if (((p[0] ^ q[0]) | (p[1] ^ q[1]) | (p[2] ^ q[2]) | (p[3] ^ q[3])) != 0u) return false;
++    }
++    for (; i < words; ++i) {
++        std::uint32_t p, q;
++        std::memcpy(&p, x + i * 4u, sizeof(p));
++        std::memcpy(&q, y + i * 4u, sizeof(q));
++        if (p != q) return false;
++    }
++    return true;
++}
++
++// std::lround() for the screen coordinates of a draw, inlined: the same result (half away from zero) for any value
++// an int holds, without the library call (fifteen of them a draw).
++[[gnu::always_inline]] inline std::int32_t round_away(float value) {
++    const auto whole = static_cast<std::int32_t>(value);  // toward zero
++    const float rest = value - static_cast<float>(whole);  // exact
++    return whole + (rest >= 0.5f ? 1 : 0) - (rest <= -0.5f ? 1 : 0);
++}
++
+ using Clock = std::chrono::steady_clock;
+ using Matrix = std::array<float, 16>;
+ 
+@@ -117,9 +147,11 @@ constexpr std::uint32_t kWhite = 0x00FFFFFFu;
+ 
+ // ---- the state a draw is made with ---------------------------------------------------------
+ 
+-// Everything the GL calls and uniforms of a draw come from, in 32-bit words with
+-// no padding so two states can be compared (and a batch extended) by memcmp.
++// Everything the GL calls and uniforms of a draw come from, in 32-bit words with no padding, so that two states can be
++// compared (and a batch extended) word by word. The comparison covers the words before `transform`: the matrices
++// after it follow from matrix_serial, which names the transform they were made from.
+ struct DrawState {
++    std::uint32_t texture;  // GL texture name; 0 for none. First: most draws that cannot join a batch differ here.
+     std::uint32_t program_flags;
+     std::uint32_t mode;     // GL_TRIANGLES or GL_LINES
+     std::uint32_t target;   // guest address of the render target
+@@ -132,21 +164,23 @@ struct DrawState {
+     std::uint32_t blend_enable, blend_source, blend_destination, blend_equation, blend_constant;
+     float blend_color[4];
+     float shader_blend[4];  // u_blend
+-    std::uint32_t texture;  // GL texture name; 0 for none
+     std::uint32_t min_filter, mag_filter, wrap_s, wrap_t;
+     float uv[4];
+     float texenv[4];
+     float alpha[4];
+     float inv_size[4];  // u_inv_size, for a sharpened picture: one texel in uv units, then the texture's size
+-    float transform[16];
+-    float world[16];
+-    float view_z[4];
+     float flip[2];
+     float screen[2];
+     float fog[4];
+     float flags[4];  // u_flags
+     std::uint32_t environment_low, environment_high, material_low, material_high;
++    std::uint32_t matrix_serial_low, matrix_serial_high;  // GlRenderer::Impl::memo_serial; 0 in through mode
++    // Not compared (see above), and only written when the draw's program uses them.
++    float transform[16];
++    float world[16];
++    float view_z[4];
+ };
++constexpr std::size_t kDrawStateCompared = offsetof(DrawState, transform);
+ static_assert(sizeof(DrawState) % 4u == 0u);
+ 
+ // ---- render targets --------------------------------------------------------------------------
+@@ -186,6 +220,8 @@ struct Program {
+     GLint location[glsl::kUniformCount]{};
+     std::array<std::array<float, 16>, glsl::kUniformCount> cache{};
+     std::array<std::uint8_t, glsl::kUniformCount> valid{};
++    std::uint64_t environment_serial{};  // the renderer's environment_serial when this program's uniforms last had it
++    std::uint64_t matrix_serial{};       // the DrawState::matrix_serial of the matrices this program has (0: none)
+ };
+ 
+ // ---- textures --------------------------------------------------------------------------------
+@@ -209,7 +245,7 @@ struct TextureKeyHash {
+ };
+ struct TextureKeyEqual {
+     bool operator()(const TextureKey &a, const TextureKey &b) const noexcept {
+-        return std::memcmp(&a, &b, sizeof(a)) == 0;
++        return same_words(&a, &b, sizeof(a) / 4u);
+     }
+ };
+ 
+@@ -272,6 +308,85 @@ struct BlendPlan {
+     float shader[4]{};
+ };
+ 
++// The vertices or indices of the batch in flight, appended where the draw will read them.
++//
++// On the Vita (glp::scratch_alloc gives memory) they live in chunks of the frame's GPU scratch memory: append() writes
++// a draw's data once and the batch is drawn from there, with no staging copy at the flush (that copy and the one into
++// the staging buffer were a tenth of the renderer's work on the console). A flushed batch's data stays where it is, as
++// the GPU reads it later in the frame; the next batch starts after it. new_frame() retires the chunk at the swap.
++// Elsewhere (desktop GL: no scratch memory) one heap buffer is reused, as GL copies client arrays when it draws.
++template <typename T> class BatchBuffer {
++public:
++    // align_elements: each batch starts at a multiple of it, so that every batch begins 16-byte aligned in its chunk
++    // (as the separate scratch allocations it replaces did; the GPU reads a batch from its first byte).
++    BatchBuffer(std::size_t chunk_elements, std::size_t align_elements) : chunk_(chunk_elements), align_(align_elements) {}
++
++    [[nodiscard]] std::size_t size() const { return count_; }
++    [[nodiscard]] bool empty() const { return count_ == 0u; }
++    [[nodiscard]] T *data() { return base_ + start_; }
++    [[nodiscard]] const T *data() const { return base_ + start_; }
++    T &operator[](std::size_t i) { return base_[start_ + i]; }
++    // Whether data() is GPU-visible scratch memory (drawn in place) rather than the heap buffer (client arrays).
++    [[nodiscard]] bool in_scratch() const { return scratch_; }
++
++    // The next batch starts after this one, which the GPU may still read.
++    void clear() {
++        start_ = (start_ + count_ + align_ - 1u) / align_ * align_;
++        count_ = 0u;
++    }
++    // n more elements at the end of the batch, uninitialised.
++    T *extend(std::size_t n) {
++        if (start_ + count_ + n > capacity_) [[unlikely]] grow(n);
++        T *at = base_ + start_ + count_;
++        count_ += n;
++        return at;
++    }
++    void push_back(const T &value) { *extend(1u) = value; }
++    void append(const T *values, std::size_t n) {
++        if (n != 0u) std::memcpy(static_cast<void *>(extend(n)), values, n * sizeof(T));
++    }
++    // The chunk belongs to the frame just shown; the next extend() starts a new one. use_scratch: whether to take
++    // chunks from scratch memory at all (settings.scratch_buffers).
++    void new_frame(bool use_scratch) {
++        use_scratch_ = use_scratch;
++        if (scratch_) capacity_ = 0u;  // full, so the next extend() moves on (an open batch is copied along)
++    }
++
++private:
++    void grow(std::size_t n) {
++        const std::size_t needed = count_ + n;
++        if (use_scratch_) {
++            const std::size_t elements = std::max(chunk_, needed * 2u);
++            if (T *fresh = static_cast<T *>(glp::scratch_alloc(elements * sizeof(T)))) {
++                if (count_ != 0u) std::memcpy(static_cast<void *>(fresh), base_ + start_, count_ * sizeof(T));
++                base_ = fresh;
++                start_ = 0u;
++                capacity_ = elements;
++                scratch_ = true;
++                return;
++            }
++            use_scratch_ = false;  // no scratch memory (desktop GL), or none left this frame: the heap buffer
++        }
++        if (scratch_ || start_ != 0u) {  // the open batch to the front of the heap buffer
++            if (heap_.size() < needed) heap_.resize(std::max(needed * 2u, chunk_));
++            if (count_ != 0u) std::memmove(static_cast<void *>(heap_.data()), base_ + start_, count_ * sizeof(T));
++            start_ = 0u;
++            scratch_ = false;
++        }
++        if (heap_.size() < needed) heap_.resize(std::max(needed * 2u, chunk_));
++        base_ = heap_.data();
++        capacity_ = heap_.size();
++    }
++
++    std::size_t chunk_;
++    std::size_t align_;
++    T *base_{};
++    std::size_t start_{}, count_{}, capacity_{};
++    bool scratch_{};
++    bool use_scratch_{true};
++    std::vector<T, UninitializedAllocator<T>> heap_;
++};
++
+ } // namespace
+ 
+ struct GlRenderer::Impl {
+@@ -310,9 +425,26 @@ struct GlRenderer::Impl {
+     GLint blit_texture{-1};
+     std::map<std::uint32_t, std::unique_ptr<Target>> targets;
+     std::unordered_map<TextureKey, std::unique_ptr<TextureEntry>, TextureKeyHash, TextureKeyEqual> textures;
++    // The entries of the textures drawn lately, direct-mapped by key, in front of the map (whose hash of the whole key
++    // and modulo cost more than the rest of a lookup on the Vita's CPU). Emptied when an entry is destroyed.
++    struct TextureFront {
++        TextureKey key{};
++        TextureEntry *entry{};
++    };
++    static constexpr std::uint32_t kTextureFrontSlots = 256u;
++    std::array<TextureFront, kTextureFrontSlots> texture_front{};
+     std::unordered_map<GLuint, Sampler> samplers;
+     std::uint64_t texture_bytes{};
+-    std::unordered_map<std::uint64_t, std::uint64_t> clut_hashes;  // per display list
++    // Palette hashes already taken in this display list, direct-mapped by palette address and range: a game draws with
++    // a handful of palettes a list, and the hash map this replaced spent more time on its own modulo and rehashing
++    // than on the hashing (21,000 integer divisions a frame on a CPU without a divide instruction).
++    struct ClutMemo {
++        std::uint64_t key{};
++        std::uint64_t hash{};
++        std::uint64_t serial{~0ull};  // the list_serial it was taken in; any other value means empty
++    };
++    static constexpr std::uint32_t kClutMemoSlots = 64u;
++    std::array<ClutMemo, kClutMemoSlots> clut_memo{};
+     std::map<std::array<std::uint32_t, 3>, bool> target_verdicts;  // per display list: target, texture, size -> unchanged
+     std::vector<std::uint32_t> decode_buffer;
+     std::vector<std::uint8_t> wrap_scratch;  // a texture that wraps the end of VRAM, gathered into one run
+@@ -329,13 +461,13 @@ struct GlRenderer::Impl {
+     bool has_presented{};
+ 
+     // ---- the batch ---------------------------------------------------------------------------
+-    std::vector<Vertex> batch_vertices;
+-    std::vector<std::uint16_t> batch_indices;
++    BatchBuffer<Vertex> batch_vertices{16384u, 2u};          // 640 KiB chunks; batches at multiples of 80 bytes
++    BatchBuffer<std::uint16_t> batch_indices{65536u, 8u};    // 128 KiB chunks; batches at multiples of 16 bytes
+     DrawState batch_state{};
+     bool batch_open{};
+     std::vector<std::uint16_t> index_scratch;
+     std::vector<std::uint16_t> compact_map;
+-    std::vector<Vertex> compact_vertices;
++    VertexList compact_vertices;
+ 
+     // ---- lighting caches (see submit) -----------------------------------------------------
+     struct Environment {
+@@ -346,9 +478,12 @@ struct GlRenderer::Impl {
+         float emissive[4]{}, material_ambient[4]{}, material_diffuse[4]{}, material_specular[4]{};
+     } environment;
+     bool environment_valid{};
++    std::uint64_t environment_serial{1};  // counts the changes to `environment`; a program records the one it has
+     std::uint64_t environment_version{};
+     std::uint64_t material_version{};
+     Matrix memo_world{}, memo_view{}, memo_projection{}, memo_view_world{}, memo_transform{};
++    std::uint64_t memo_matrix_version{};
++    std::uint64_t memo_serial{};  // moves with every new memo_transform: equal serials, equal matrices
+     bool memo_valid{};
+ 
+     // The shader programs' compile log for tools.
+@@ -429,7 +564,23 @@ struct GlRenderer::Impl {
+         return true;
+     }
+ 
++    // Linked programs by flags, direct-mapped in front of `programs` (a program is never destroyed while the renderer
++    // runs, and a failed one is never put here).
++    struct ProgramFront {
++        std::uint32_t flags{};
++        Program *program{};
++    };
++    std::array<ProgramFront, 64> program_front{};
++
+     Program *program_for(std::uint32_t flags) {
++        ProgramFront &front = program_front[(flags ^ (flags >> 6u) ^ (flags >> 12u) ^ (flags >> 18u)) & 63u];
++        if (front.program != nullptr && front.flags == flags) return front.program;
++        Program *program = find_or_link_program(flags);
++        if (program != nullptr) front = ProgramFront{flags, program};
++        return program;
++    }
++
++    Program *find_or_link_program(std::uint32_t flags) {
+         auto found = programs.find(flags);
+         if (found != programs.end()) return found->second->failed ? nullptr : found->second.get();
+         auto program = std::make_unique<Program>();
+@@ -455,15 +606,21 @@ struct GlRenderer::Impl {
+         ++st().program_switches;
+     }
+ 
+-    void uniform(Program &program, glsl::Uniform which, const float *value) {
+-        const GLint location = program.location[which];
++    // One uniform of the program in use, uploaded only when its value differs from the one the program has. The
++    // uniform is a template argument so that the comparison is unrolled for its size.
++    template <glsl::Uniform Which> void uniform(Program &program, const float *value) {
++        constexpr std::uint32_t count = kUniformFloats[Which];
++        const GLint location = program.location[Which];
+         // -1 is "not there"; vitaGL hands out pointers as locations, so a real one may be negative.
+         if (location == -1) return;
+-        const std::uint32_t count = kUniformFloats[which];
+-        if (program.valid[which] != 0u && std::memcmp(program.cache[which].data(), value, count * sizeof(float)) == 0) {
++        if (program.valid[Which] != 0u && same_words(program.cache[Which].data(), value, count)) {
+             ++st().uniform_skipped;
+             return;
+         }
++        upload_uniform(program, Which, location, count, value);
++    }
++
++    void upload_uniform(Program &program, glsl::Uniform which, GLint location, std::uint32_t count, const float *value) {
+         switch (count) {
+         case 16:
+             if (which == glsl::kUTransform || which == glsl::kUWorld)
+@@ -491,8 +648,29 @@ struct GlRenderer::Impl {
+         height = (width * kPspHeight + kPspWidth - 1u) / kPspWidth;
+     }
+ 
++    // The sampler state of the textures drawn lately, direct-mapped by GL name in front of `samplers` (pointers into
++    // an unordered_map stay valid until their element is erased; forget_sampler() empties the front).
++    struct SamplerFront {
++        GLuint id{};
++        Sampler *sampler{};
++    };
++    std::array<SamplerFront, 64> sampler_front{};
++
++    Sampler &sampler_of(GLuint texture) {
++        SamplerFront &front = sampler_front[texture & 63u];
++        if (front.sampler != nullptr && front.id == texture) return *front.sampler;
++        Sampler &found = samplers[texture];
++        front = SamplerFront{texture, &found};
++        return found;
++    }
++
++    void forget_sampler(GLuint texture) {
++        samplers.erase(texture);
++        sampler_front.fill(SamplerFront{});
++    }
++
+     void set_sampler(GLuint texture, GLenum min_filter, GLenum mag_filter, GLenum wrap_s, GLenum wrap_t) {
+-        Sampler &sampler = samplers[texture];
++        Sampler &sampler = sampler_of(texture);
+         if (sampler.min_filter != min_filter) {
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(min_filter));
+             sampler.min_filter = min_filter;
+@@ -587,7 +765,7 @@ struct GlRenderer::Impl {
+         bind_texture(target.color);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height),
+                      0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+-        samplers.erase(target.color);
++        forget_sampler(target.color);
+         set_sampler(target.color, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+         glBindRenderbuffer(GL_RENDERBUFFER, target.depth);
+         const GLenum depth_format = settings.depth_bits > 16u ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT16;
+@@ -618,12 +796,12 @@ struct GlRenderer::Impl {
+         cache.scissor[0] = -1;
+         if (target.copy != 0u) {
+             glDeleteTextures(1, &target.copy);
+-            samplers.erase(target.copy);
++            forget_sampler(target.copy);
+             target.copy = 0u;
+         }
+         if (target.post != 0u) {
+             glDeleteTextures(1, &target.post);
+-            samplers.erase(target.post);
++            forget_sampler(target.post);
+             target.post = 0u;
+         }
+         target.copy_serial = ~0ull;
+@@ -673,13 +851,13 @@ struct GlRenderer::Impl {
+         target_verdicts.clear();
+         target.guest_words.clear();
+         if (!memory.contains(target.address, bytes)) return;
+-        target.guest_words.reserve(bytes / 256u + 1u);
+-        const std::uint8_t *raw = memory.raw_pointer(target.address, bytes);
+-        for (std::uint32_t offset = 0; offset + 4u <= bytes; offset += 256u) {
+-            std::uint32_t word{};
+-            if (raw != nullptr) std::memcpy(&word, raw + offset, sizeof(word));
+-            else word = memory.load32(target.address + offset);
+-            target.guest_words.push_back(word);
++        const std::uint32_t count = bytes >= 4u ? (bytes - 4u) / 256u + 1u : 0u;
++        target.guest_words.resize(count);
++        std::uint32_t *words = target.guest_words.data();
++        if (const std::uint8_t *raw = memory.raw_pointer(target.address, bytes)) {
++            for (std::uint32_t i = 0; i < count; ++i) std::memcpy(words + i, raw + i * 256u, sizeof(std::uint32_t));
++        } else {
++            for (std::uint32_t i = 0; i < count; ++i) words[i] = memory.load32(target.address + i * 256u);
+         }
+     }
+ 
+@@ -771,8 +949,10 @@ struct GlRenderer::Impl {
+         clut_range(texture, first, last);
+         const std::uint64_t memo_key = (static_cast<std::uint64_t>(texture.clut_address) << 32u) |
+                                        (static_cast<std::uint64_t>(first) << 16u) | last;
+-        const auto found = clut_hashes.find(memo_key);
+-        if (found != clut_hashes.end()) return found->second;
++        const std::uint32_t mix = texture.clut_address ^ (texture.clut_address >> 6u) ^ (texture.clut_address >> 12u) ^
++                                  (first >> 5u) ^ (last >> 3u);
++        ClutMemo &slot = clut_memo[mix & (kClutMemoSlots - 1u)];
++        if (slot.serial == list_serial && slot.key == memo_key) return slot.hash;
+         std::uint64_t hash = 0u;
+         if (const std::uint8_t *data = memory.raw_pointer(texture.clut_address + first, last - first)) {
+             hash = XXH3_64bits(data, last - first);
+@@ -780,7 +960,7 @@ struct GlRenderer::Impl {
+             st().hash_bytes += last - first;
+             ++st().hash_calls;
+         }
+-        clut_hashes.emplace(memo_key, hash);
++        slot = ClutMemo{memo_key, hash, list_serial};
+         return hash;
+     }
+ 
+@@ -890,8 +1070,18 @@ struct GlRenderer::Impl {
+         }
+         if (data == nullptr || state.width == 0u || state.height == 0u) return nullptr;
+ 
+-        const auto found = textures.find(key);
+-        if (found == textures.end()) {
++        const std::uint32_t front_mix = (key.address >> 4u) ^ (key.address >> 13u) ^ key.size ^ (key.size >> 9u) ^
++                                        (key.clut_address >> 4u) ^ static_cast<std::uint32_t>(key.clut_hash);
++        TextureFront &front = texture_front[front_mix & (kTextureFrontSlots - 1u)];
++        TextureEntry *known = front.entry != nullptr && same_words(&front.key, &key, sizeof(key) / 4u) ? front.entry : nullptr;
++        if (known == nullptr) {
++            const auto found = textures.find(key);
++            if (found != textures.end()) {
++                known = found->second.get();
++                front = TextureFront{key, known};
++            }
++        }
++        if (known == nullptr) {
+             auto entry = std::make_unique<TextureEntry>();
+             entry->state = state;
+             entry->width = state.width;
+@@ -911,9 +1101,10 @@ struct GlRenderer::Impl {
+             texture_bytes += entry->gpu_bytes;
+             TextureEntry *raw = entry.get();
+             textures.emplace(key, std::move(entry));
++            front = TextureFront{key, raw};
+             return raw;
+         }
+-        TextureEntry &entry = *found->second;
++        TextureEntry &entry = *known;
+         ++st().texture_hits;
+         entry.last_used = frames;
+         ++entry.uses;
+@@ -978,8 +1169,9 @@ struct GlRenderer::Impl {
+     }
+ 
+     void destroy_texture(TextureEntry &entry) {
++        texture_front.fill(TextureFront{});
+         if (cache.texture == entry.id) cache.texture = ~0u;
+-        samplers.erase(entry.id);
++        forget_sampler(entry.id);
+         glDeleteTextures(1, &entry.id);
+         hd.released(entry.hd);
+         texture_bytes -= entry.gpu_bytes;
+@@ -1190,7 +1382,7 @@ struct GlRenderer::Impl {
+         use_program(*program);
+         bind_target(*target);
+ 
+-        if (std::memcmp(cache.viewport, state.viewport, sizeof(cache.viewport)) != 0) {
++        if (!same_words(cache.viewport, state.viewport, 4u)) {
+             glViewport(state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3]);
+             std::memcpy(cache.viewport, state.viewport, sizeof(cache.viewport));
+             ++st().viewport_changes;
+@@ -1199,7 +1391,7 @@ struct GlRenderer::Impl {
+         // work, the driver and the CPU stay the same (a fill-bound frame gets much faster, a CPU-bound one does not).
+         static constexpr std::int32_t kFillTestScissor[4] = {0, 0, 2, 2};
+         const std::int32_t *scissor = settings.fill_test ? kFillTestScissor : state.scissor;
+-        if (std::memcmp(cache.scissor, scissor, sizeof(cache.scissor)) != 0) {
++        if (!same_words(cache.scissor, scissor, 4u)) {
+             glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+             std::memcpy(cache.scissor, scissor, sizeof(cache.scissor));
+             ++st().scissor_changes;
+@@ -1280,7 +1472,7 @@ struct GlRenderer::Impl {
+             cache.blend_equation = state.blend_equation;
+             ++st().blend_changes;
+         }
+-        if (state.blend_constant != 0u && std::memcmp(cache.blend_color, state.blend_color, sizeof(float) * 3u) != 0) {
++        if (state.blend_constant != 0u && !same_words(cache.blend_color, state.blend_color, 3u)) {
+             glBlendColor(state.blend_color[0], state.blend_color[1], state.blend_color[2], 1.0f);
+             std::memcpy(cache.blend_color, state.blend_color, sizeof(float) * 3u);
+             ++st().blend_changes;
+@@ -1290,53 +1482,63 @@ struct GlRenderer::Impl {
+     void upload_uniforms(Program &program, const DrawState &state) {
+         const std::uint32_t flags = program.flags;
+         const bool through = (flags & glsl::kThrough) != 0u;
+-        uniform(program, glsl::kUUv, state.uv);
+-        uniform(program, glsl::kUBlend, state.shader_blend);
++        uniform<glsl::kUUv>(program, state.uv);
++        uniform<glsl::kUBlend>(program, state.shader_blend);
++        // The matrices (transform, world, view z) are compared only when the draw's transform is not the one this
++        // program last had (matrix_serial: one per transform the renderer made).
++        const std::uint64_t matrix_serial =
++            static_cast<std::uint64_t>(state.matrix_serial_high) << 32u | state.matrix_serial_low;
++        const bool matrices_current = matrix_serial != 0u && program.matrix_serial == matrix_serial;
+         if (through) {
+-            uniform(program, glsl::kUScreen, state.screen);
++            uniform<glsl::kUScreen>(program, state.screen);
+         } else {
+-            uniform(program, glsl::kUTransform, state.transform);
+-            uniform(program, glsl::kUFlip, state.flip);
++            if (!matrices_current) uniform<glsl::kUTransform>(program, state.transform);
++            uniform<glsl::kUFlip>(program, state.flip);
+         }
++        // The lighting environment and the fog colour are compared only when they were refreshed after this program
++        // last had them (twelve 4- and 16-float uniforms, most of the comparisons of a lit draw).
++        const bool environment_current = program.environment_serial == environment_serial;
++        program.environment_serial = environment_serial;
+         if ((flags & glsl::kLight) != 0u) {
+-            uniform(program, glsl::kUWorld, state.world);
+-            uniform(program, glsl::kUFlags, state.flags);
+-            uniform(program, glsl::kUEmissive, environment.emissive);
+-            uniform(program, glsl::kUMaterialAmbient, environment.material_ambient);
+-            uniform(program, glsl::kUMaterialDiffuse, environment.material_diffuse);
+-            uniform(program, glsl::kUMaterialSpecular, environment.material_specular);
+-            uniform(program, glsl::kUAmbient, environment.ambient);
+-            uniform(program, glsl::kULightPosition, environment.light_position);
+-            uniform(program, glsl::kULightDirection, environment.light_direction);
+-            uniform(program, glsl::kULightAttenuation, environment.light_attenuation);
+-            uniform(program, glsl::kULightSpot, environment.light_spot);
+-            uniform(program, glsl::kULightAmbient, environment.light_ambient);
+-            uniform(program, glsl::kULightDiffuse, environment.light_diffuse);
+-            uniform(program, glsl::kULightSpecular, environment.light_specular);
++            if (!matrices_current) uniform<glsl::kUWorld>(program, state.world);
++            uniform<glsl::kUFlags>(program, state.flags);
++        }
++        if ((flags & glsl::kLight) != 0u && !environment_current) {
++            uniform<glsl::kUEmissive>(program, environment.emissive);
++            uniform<glsl::kUMaterialAmbient>(program, environment.material_ambient);
++            uniform<glsl::kUMaterialDiffuse>(program, environment.material_diffuse);
++            uniform<glsl::kUMaterialSpecular>(program, environment.material_specular);
++            uniform<glsl::kUAmbient>(program, environment.ambient);
++            uniform<glsl::kULightPosition>(program, environment.light_position);
++            uniform<glsl::kULightDirection>(program, environment.light_direction);
++            uniform<glsl::kULightAttenuation>(program, environment.light_attenuation);
++            uniform<glsl::kULightSpot>(program, environment.light_spot);
++            uniform<glsl::kULightAmbient>(program, environment.light_ambient);
++            uniform<glsl::kULightDiffuse>(program, environment.light_diffuse);
++            uniform<glsl::kULightSpecular>(program, environment.light_specular);
+         }
+         if ((flags & glsl::kFog) != 0u) {
+-            uniform(program, glsl::kUViewZ, state.view_z);
+-            uniform(program, glsl::kUFog, state.fog);
+-            uniform(program, glsl::kUFogColor, environment.fog_color);
++            if (!matrices_current) uniform<glsl::kUViewZ>(program, state.view_z);
++            uniform<glsl::kUFog>(program, state.fog);
++            if (!environment_current) uniform<glsl::kUFogColor>(program, environment.fog_color);
+         }
+-        if ((flags & glsl::kTexture) != 0u) uniform(program, glsl::kUTexEnv, state.texenv);
+-        if ((flags & glsl::kAlphaTest) != 0u) uniform(program, glsl::kUAlpha, state.alpha);
+-        if ((flags & glsl::kSharpen) != 0u) uniform(program, glsl::kUInvSize, state.inv_size);
++        if ((flags & glsl::kTexture) != 0u) uniform<glsl::kUTexEnv>(program, state.texenv);
++        if ((flags & glsl::kAlphaTest) != 0u) uniform<glsl::kUAlpha>(program, state.alpha);
++        if ((flags & glsl::kSharpen) != 0u) uniform<glsl::kUInvSize>(program, state.inv_size);
++        if (!through) program.matrix_serial = matrix_serial;
+     }
+ 
+     GLuint scratch_vbo{}, scratch_ibo{};   // buffer objects whose data is the batch's scratch copy (settings.scratch_buffers)
+ 
+     void draw_batch(const DrawState &state) {
+-        const std::size_t vertex_bytes = batch_vertices.size() * sizeof(Vertex);
+-        const std::size_t index_bytes = batch_indices.size() * sizeof(std::uint16_t);
+-        void *vertex_copy = settings.scratch_buffers && !settings.null_draw ? glp::scratch_alloc(vertex_bytes) : nullptr;
+-        void *index_copy = vertex_copy != nullptr ? glp::scratch_alloc(index_bytes) : nullptr;
+-        const bool scratch = vertex_copy != nullptr && index_copy != nullptr;
++        // Batches in scratch memory are drawn where they are, as buffer objects (the driver neither copies client
++        // arrays nor scans the indices for the vertex range); others from client arrays.
++        const bool scratch = batch_vertices.in_scratch() && batch_indices.in_scratch() && !settings.null_draw;
+         const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(batch_vertices.data());
+         const void *indices = batch_indices.data();
+         if (scratch) {
+-            std::memcpy(vertex_copy, batch_vertices.data(), vertex_bytes);
+-            std::memcpy(index_copy, batch_indices.data(), index_bytes);
++            const void *vertex_copy = batch_vertices.data();
++            const void *index_copy = batch_indices.data();
+             if (scratch_vbo == 0u) {
+                 glGenBuffers(1, &scratch_vbo);
+                 glGenBuffers(1, &scratch_ibo);
+@@ -1369,7 +1571,7 @@ struct GlRenderer::Impl {
+         st().bytes_uploaded += batch_vertices.size() * sizeof(Vertex) + batch_indices.size() * sizeof(std::uint16_t);
+         st().vertices_uploaded += batch_vertices.size();
+         st().indices_uploaded += batch_indices.size();
+-        st().triangles += batch_indices.size() / (state.mode == GL_LINES ? 2u : 3u);
++        st().triangles += state.mode == GL_LINES ? batch_indices.size() / 2u : batch_indices.size() / 3u;
+         check("draw");
+     }
+ 
+@@ -1403,16 +1605,15 @@ struct GlRenderer::Impl {
+             ++st().clears;
+             return true;
+         }
+-        std::int32_t rect[4] = {static_cast<std::int32_t>(std::lround(left * scale)),
+-                                static_cast<std::int32_t>(std::lround(top * scale)), 0, 0};
+-        rect[2] = static_cast<std::int32_t>(std::lround(right * scale)) - rect[0];
+-        rect[3] = static_cast<std::int32_t>(std::lround(bottom * scale)) - rect[1];
++        std::int32_t rect[4] = {round_away(left * scale), round_away(top * scale), 0, 0};
++        rect[2] = round_away(right * scale) - rect[0];
++        rect[3] = round_away(bottom * scale) - rect[1];
+         if (settings.fill_test) {
+             rect[0] = rect[1] = 0;
+             rect[2] = rect[3] = 2;
+         }
+         bind_target(*target);
+-        if (std::memcmp(cache.scissor, rect, sizeof(rect)) != 0) {
++        if (!same_words(cache.scissor, rect, 4u)) {
+             glScissor(rect[0], rect[1], rect[2], rect[3]);
+             std::memcpy(cache.scissor, rect, sizeof(rect));
+             ++st().scissor_changes;
+@@ -1536,10 +1737,8 @@ struct GlRenderer::Impl {
+                         batch_open = true;
+                         return append(call, use_material_color, rect_clamp, picture_rect);
+                     }
+-                    batch_vertices.insert(batch_vertices.end(), call.vertices.begin(), call.vertices.end());
+-                    const std::size_t at = batch_indices.size();
+-                    batch_indices.resize(at + index_total);
+-                    std::uint16_t *out = batch_indices.data() + at;
++                    batch_vertices.append(call.vertices.data(), call.vertices.size());
++                    std::uint16_t *out = batch_indices.extend(index_total);
+                     const auto base = static_cast<std::uint32_t>(first_vertex);
+                     const auto last = static_cast<std::uint32_t>(vertex_total - 1u);
+                     const std::uint16_t *in = call.indices.empty() ? nullptr : call.indices.data();
+@@ -1548,20 +1747,49 @@ struct GlRenderer::Impl {
+                         return static_cast<std::uint16_t>(base + std::min(mapped, last));
+                     };
+                     if (call.primitive == PrimitiveType::Triangles) {
+-                        for (std::size_t i = 0; i < index_total; ++i) out[i] = map(i);
+-                    } else if (call.primitive == PrimitiveType::TriangleStrip) {
+-                        for (std::size_t t = 0; t + 2u < count; ++t, out += 3) {
+-                            const bool odd = (t & 1u) != 0u;
+-                            out[0] = map(t);
+-                            out[1] = map(odd ? t + 2u : t + 1u);
+-                            out[2] = map(odd ? t + 1u : t + 2u);
++                        // The common case, in 16-bit lanes so that the compiler vectorises it (base + last fits:
++                        // first_vertex + added <= 65535 was checked above).
++                        const auto base16 = static_cast<std::uint16_t>(base);
++                        const auto last16 = static_cast<std::uint16_t>(last);
++                        if (in != nullptr) {
++                            for (std::size_t i = 0; i < index_total; ++i)
++                                out[i] = static_cast<std::uint16_t>(base16 + std::min(in[i], last16));
++                        } else {
++                            for (std::size_t i = 0; i < index_total; ++i)  // i < count == vertex_total: never past last
++                                out[i] = static_cast<std::uint16_t>(base16 + static_cast<std::uint16_t>(i));
+                         }
++                    } else if (call.primitive == PrimitiveType::TriangleStrip) {
++                        // Two triangles per step, (a b c) and (b d c) for the strip a b c d, each index read once and
++                        // the six written as three words (most of a mission frame is strips).
++                        const auto strip = [&](auto index) {
++                            std::uint32_t a = index(0u), b = index(1u);
++                            std::size_t t = 0;
++                            for (; t + 3u < count; t += 2u, out += 6) {
++                                const std::uint32_t c = index(t + 2u), d = index(t + 3u);
++                                const std::uint32_t words[3] = {a | b << 16u, c | b << 16u, d | c << 16u};
++                                std::memcpy(out, words, sizeof(words));
++                                a = c;
++                                b = d;
++                            }
++                            if (t + 2u < count) {  // a last triangle of even parity
++                                out[0] = static_cast<std::uint16_t>(a);
++                                out[1] = static_cast<std::uint16_t>(b);
++                                out[2] = static_cast<std::uint16_t>(index(t + 2u));
++                            }
++                        };
++                        if (in != nullptr)
++                            strip([&](std::size_t i) { return static_cast<std::uint32_t>(map(i)); });
++                        else  // i < count == vertex_total: never past last
++                            strip([&](std::size_t i) { return static_cast<std::uint32_t>(base + i); });
+                     } else {
+                         const std::uint16_t first = map(0);
++                        std::uint16_t previous = map(1u);
+                         for (std::size_t t = 1; t + 1u < count; ++t, out += 3) {
++                            const std::uint16_t next = map(t + 1u);
+                             out[0] = first;
+-                            out[1] = map(t);
+-                            out[2] = map(t + 1u);
++                            out[1] = previous;
++                            out[2] = next;
++                            previous = next;
+                         }
+                     }
+                     break;
+@@ -1583,14 +1811,14 @@ struct GlRenderer::Impl {
+                     index = slot;
+                 }
+             }
+-            const std::vector<Vertex> &source = compact ? compact_vertices : call.vertices;
++            const VertexList &source = compact ? compact_vertices : call.vertices;
+             added = source.size();
+             if (first_vertex + added > 65535u) {
+                 flush();
+                 batch_open = true;
+                 return append(call, use_material_color, rect_clamp, picture_rect);
+             }
+-            batch_vertices.insert(batch_vertices.end(), source.begin(), source.end());
++            batch_vertices.append(source.data(), source.size());
+             const auto base = static_cast<std::uint16_t>(first_vertex);
+             for (const std::uint16_t index : index_scratch) batch_indices.push_back(static_cast<std::uint16_t>(base + index));
+             break;
+@@ -1641,7 +1869,7 @@ struct GlRenderer::Impl {
+                 batch_open = true;
+                 return append(call, use_material_color, rect_clamp, picture_rect);
+             }
+-            batch_vertices.insert(batch_vertices.end(), call.vertices.begin(), call.vertices.end());
++            batch_vertices.append(call.vertices.data(), call.vertices.size());
+             const auto base = static_cast<std::uint16_t>(first_vertex);
+             const auto at = [&](std::size_t index) {
+                 const std::size_t mapped = call.indices.empty() ? index : call.indices[index];
+@@ -1709,23 +1937,27 @@ struct GlRenderer::Impl {
+     }
+ 
+     static bool vertices_opaque(const DrawCall &call) {
+-        for (const Vertex &vertex : call.vertices)
+-            if ((vertex.color >> 24u) != 0xFFu) return false;
+-        return true;
++        std::uint32_t all = 0xFFFFFFFFu;  // every colour ANDed: no early exit, two instructions a vertex
++        for (const Vertex &vertex : call.vertices) all &= vertex.color;
++        return (all >> 24u) == 0xFFu;
+     }
+ 
+     // Every fragment of the draw has alpha 1.0 when it reaches the alpha test: the shader's alpha is the vertex colour's
+     // (the material's without vertex colours; with lighting, the ambient alpha times the vertex's or the material's), times
+     // the texel's when the texture function uses it. Conservative: anything not known to be opaque is not.
+     bool fragment_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured, bool lit) const {
++        // The texel's part first: it decides most draws without a look at the vertices.
++        if (!texel_alpha_is_255(call, binding, textured)) return false;
+         if (lit) {
+             if (call.lighting.ambient_alpha != 0xFFu) return false;
+             const bool from_vertex = call.has_vertex_color && (call.lighting.material_update & 1u) != 0u;
+-            if (from_vertex ? !vertices_opaque(call) : (call.material_color >> 24u) != 0xFFu) return false;
+-        } else {
+-            const bool use_material = !call.has_vertex_color && !call.lighting_enabled;
+-            if (use_material ? (call.material_color >> 24u) != 0xFFu : !vertices_opaque(call)) return false;
++            return from_vertex ? vertices_opaque(call) : (call.material_color >> 24u) == 0xFFu;
+         }
++        const bool use_material = !call.has_vertex_color && !call.lighting_enabled;
++        return use_material ? (call.material_color >> 24u) == 0xFFu : vertices_opaque(call);
++    }
++
++    static bool texel_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured) {
+         if (!textured || !call.texture.alpha_from_texture || call.texture.function == 1u) return true;  // decal keeps the colour's
+         if (binding.opaque) return true;   // the shader sets the texel's alpha to 1
+         if (binding.from_target || binding.hd_movie || binding.entry == nullptr) return false;
+@@ -1760,6 +1992,7 @@ struct GlRenderer::Impl {
+         }
+         environment_version = call.environment_version;
+         environment_valid = true;
++        ++environment_serial;
+     }
+ 
+     void refresh_material(const DrawCall &call) {
+@@ -1773,6 +2006,7 @@ struct GlRenderer::Impl {
+         std::copy(diffuse.begin(), diffuse.end(), environment.material_diffuse);
+         std::copy(specular.begin(), specular.end(), environment.material_specular);
+         material_version = call.material_version;
++        ++environment_serial;
+     }
+ 
+     // gfx.hd_movies: the texture of this draw starts with the marker of the movie player (host/movie/hd_movie.hpp), so what
+@@ -1940,11 +2174,11 @@ struct GlRenderer::Impl {
+     // Which group of state kept `state` from joining the batch in flight, for the cost report.
+     void count_merge_break(const DrawState &state) {
+         const auto differs = [&](std::size_t from, std::size_t to) {
+-            return std::memcmp(reinterpret_cast<const char *>(&state) + from,
+-                               reinterpret_cast<const char *>(&batch_state) + from, to - from) != 0;
++            return !same_words(reinterpret_cast<const char *>(&state) + from,
++                               reinterpret_cast<const char *>(&batch_state) + from, (to - from) / 4u);
+         };
+         std::size_t group = GlStats::kBreakOther;
+-        if (differs(offsetof(DrawState, program_flags), offsetof(DrawState, mode) + sizeof(std::uint32_t)))
++        if (differs(offsetof(DrawState, program_flags), offsetof(DrawState, target)))
+             group = GlStats::kBreakProgram;
+         else if (differs(offsetof(DrawState, target), offsetof(DrawState, depth_range)))
+             group = GlStats::kBreakTarget;
+@@ -1952,15 +2186,17 @@ struct GlRenderer::Impl {
+             group = GlStats::kBreakDepth;
+         else if (differs(offsetof(DrawState, cull), offsetof(DrawState, blend_enable)))
+             group = GlStats::kBreakCull;
+-        else if (differs(offsetof(DrawState, blend_enable), offsetof(DrawState, texture)))
++        else if (differs(offsetof(DrawState, blend_enable), offsetof(DrawState, min_filter)))
+             group = GlStats::kBreakBlend;
+-        else if (differs(offsetof(DrawState, texture), offsetof(DrawState, uv)))
++        else if (differs(offsetof(DrawState, texture), offsetof(DrawState, program_flags)) ||
++                 differs(offsetof(DrawState, min_filter), offsetof(DrawState, uv)))
+             group = GlStats::kBreakTexture;
+-        else if (differs(offsetof(DrawState, uv), offsetof(DrawState, transform)))
++        else if (differs(offsetof(DrawState, uv), offsetof(DrawState, flip)))
+             group = GlStats::kBreakTexEnv;
+-        else if (differs(offsetof(DrawState, transform), offsetof(DrawState, flags)))
++        else if (differs(offsetof(DrawState, flip), offsetof(DrawState, flags)) ||
++                 differs(offsetof(DrawState, matrix_serial_low), kDrawStateCompared))
+             group = GlStats::kBreakTransform;
+-        else if (differs(offsetof(DrawState, flags), sizeof(DrawState)))
++        else if (differs(offsetof(DrawState, flags), offsetof(DrawState, matrix_serial_low)))
+             group = GlStats::kBreakLighting;
+         ++st().merge_breaks[group];
+     }
+@@ -2027,7 +2263,9 @@ struct GlRenderer::Impl {
+         const bool pixel_lit = lit && opt.pixel_light;
+         if (pixel_lit) ++st().pixel_lit_draws;
+ 
+-        DrawState state{};
++        // Only the compared words are cleared: the matrices after them are written when the program uses them.
++        DrawState state;
++        std::memset(&state, 0, kDrawStateCompared);
+         state.program_flags = (through ? glsl::kThrough : 0u) | (lit ? glsl::kLight : 0u) | (fogged ? glsl::kFog : 0u) |
+                               (textured ? glsl::kTexture : 0u) | (alpha_test ? glsl::kAlphaTest : 0u) |
+                               (rect_clamp ? glsl::kRectClamp : 0u) | (pixel_lit ? glsl::kPixelLight : 0u) |
+@@ -2058,10 +2296,10 @@ struct GlRenderer::Impl {
+                 state.depth_range[1] = std::clamp((vp.z_offset + vp.z_scale) / 65535.0f, 0.0f, 1.0f);
+             }
+         }
+-        state.viewport[0] = static_cast<std::int32_t>(std::lround(vx));
+-        state.viewport[1] = static_cast<std::int32_t>(std::lround(vy));
+-        state.viewport[2] = std::max(1, static_cast<std::int32_t>(std::lround(vw)));
+-        state.viewport[3] = std::max(1, static_cast<std::int32_t>(std::lround(vh)));
++        state.viewport[0] = round_away(vx);
++        state.viewport[1] = round_away(vy);
++        state.viewport[2] = std::max(1, round_away(vw));
++        state.viewport[3] = std::max(1, round_away(vh));
+         state.screen[0] = static_cast<float>(target.psp_width);
+         state.screen[1] = static_cast<float>(target.psp_height);
+ 
+@@ -2069,10 +2307,10 @@ struct GlRenderer::Impl {
+         const std::uint32_t sy1 = std::min(call.viewport.scissor_y1, target.psp_height - 1u);
+         const std::uint32_t sx2 = std::min(std::max(call.viewport.scissor_x2, sx1), target.psp_width - 1u);
+         const std::uint32_t sy2 = std::min(std::max(call.viewport.scissor_y2, sy1), target.psp_height - 1u);
+-        state.scissor[0] = static_cast<std::int32_t>(std::lround(static_cast<float>(sx1) * scale));
+-        state.scissor[1] = static_cast<std::int32_t>(std::lround(static_cast<float>(sy1) * scale));
+-        state.scissor[2] = static_cast<std::int32_t>(std::lround(static_cast<float>(sx2 + 1u) * scale)) - state.scissor[0];
+-        state.scissor[3] = static_cast<std::int32_t>(std::lround(static_cast<float>(sy2 + 1u) * scale)) - state.scissor[1];
++        state.scissor[0] = round_away(static_cast<float>(sx1) * scale);
++        state.scissor[1] = round_away(static_cast<float>(sy1) * scale);
++        state.scissor[2] = round_away(static_cast<float>(sx2 + 1u) * scale) - state.scissor[0];
++        state.scissor[3] = round_away(static_cast<float>(sy2 + 1u) * scale) - state.scissor[1];
+ 
+         // Depth.
+         state.depth_test = settings.depth_test && call.depth.test_enabled && (!through || settings.through_depth) ? 1u : 0u;
+@@ -2177,14 +2415,26 @@ struct GlRenderer::Impl {
+         }
+         // Transform.
+         if (!through) {
+-            if (!memo_valid || call.world != memo_world || call.view != memo_view || call.projection != memo_projection) {
++            // Bit for bit (the same matrices are the same bits; the float comparison was a third of this function).
++            // The walker's matrix_version says when the matrices changed; a draw from elsewhere (version 0) is
++            // compared bit for bit.
++            const bool current = memo_valid && (call.matrix_version != 0u
++                                                    ? call.matrix_version == memo_matrix_version
++                                                    : same_words(call.world.data(), memo_world.data(), 16u) &&
++                                                          same_words(call.view.data(), memo_view.data(), 16u) &&
++                                                          same_words(call.projection.data(), memo_projection.data(), 16u));
++            if (!current) {
+                 memo_view_world = multiply(call.view, call.world);
+                 memo_transform = multiply(call.projection, memo_view_world);
+                 memo_world = call.world;
+                 memo_view = call.view;
+                 memo_projection = call.projection;
++                memo_matrix_version = call.matrix_version;
+                 memo_valid = true;
++                ++memo_serial;
+             }
++            state.matrix_serial_low = static_cast<std::uint32_t>(memo_serial);
++            state.matrix_serial_high = static_cast<std::uint32_t>(memo_serial >> 32u);
+             std::memcpy(state.transform, memo_transform.data(), sizeof(state.transform));
+             if (fogged) {
+                 state.view_z[0] = memo_view_world[2];
+@@ -2211,9 +2461,9 @@ struct GlRenderer::Impl {
+         }
+ 
+         const bool merge = settings.merge_draws && batch_open && state.mode == batch_state.mode &&
+-                           std::memcmp(&state, &batch_state, sizeof(DrawState)) == 0;
++                           same_words(&state, &batch_state, kDrawStateCompared / 4u);
+         if (batch_open && !merge) {
+-            count_merge_break(state);
++            if (settings.merge_break_stats) count_merge_break(state);
+             flush();
+         }
+         if (!environment_valid || ((lit || fogged) && environment_version != call.environment_version))
+@@ -2331,7 +2581,7 @@ struct GlRenderer::Impl {
+             bind_texture(clear_texture);
+             static const std::uint8_t zero[4] = {0, 0, 0, 0};
+             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
+-            samplers.erase(clear_texture);
++            forget_sampler(clear_texture);
+         }
+         blit(clear_texture, 0, 0, static_cast<std::int32_t>(target.width), static_cast<std::int32_t>(target.height), false, true);
+     }
+@@ -2581,7 +2831,6 @@ void GlRenderer::begin_display_list() {
+         }
+     }
+     ++impl.list_serial;
+-    impl.clut_hashes.clear();
+     impl.target_verdicts.clear();
+     impl.environment_valid = false;
+     impl.memo_valid = false;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index dbfd52f..5ba2ae4 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -56,6 +56,9 @@ struct GlSettings {
+     bool texture_always_validate{false};
+     // Merge consecutive draws with the same state into one GL draw.
+     bool merge_draws{true};
++    // Count, for each draw that could not join the batch in flight, which group of state kept it out (GlStats::
++    // merge_breaks; ge_replay --stats). Off in a game: it compares the state a second time for each batch.
++    bool merge_break_stats{false};
+     // Skip the glDraw* calls (the replayer's null-draw mode: everything else still runs).
+     bool null_draw{false};
+     // Cut every game draw and clear to a 2x2 scissor: a test of how much of the frame is the GPU's fill (FILL_TEST=1).
+diff --git a/host/gpu/renderer.hpp b/host/gpu/renderer.hpp
+index eb34ee1..ea0d561 100644
+--- a/host/gpu/renderer.hpp
++++ b/host/gpu/renderer.hpp
+@@ -81,6 +81,10 @@ public:
+     [[nodiscard]] virtual bool gpu_decode() const { return false; }
+     [[nodiscard]] virtual bool check_gpu_decode() const { return false; }
+     virtual void submit(const DrawCall &call, const GuestMemory &memory) = 0;
++    // submit() for a caller that does not need `call` afterwards: a renderer that keeps the draw (SplitRenderer queues
++    // it for its GL thread) may take its vertex and index storage instead of copying it, leaving storage of its own
++    // (with capacity) in its place.
++    virtual void submit_taking(DrawCall &call, const GuestMemory &memory) { submit(call, memory); }
+     // Writes the framebuffer shown a frame or two ago back to guest VRAM, in
+     // the guest's pixel format at 480x272, so game code that copies a frame
+     // out of VRAM with the CPU or DMA finds the picture instead of stale
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 7b7cdfc..091aeb2 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -178,14 +178,49 @@ void SplitRenderer::submit(const DrawCall &draw, const GuestMemory &memory) {
+         warn_foreign_thread("submit");
+         return;
+     }
+-    const std::uint64_t sequence = draws_posted_++;
++    DrawSlot &slot = claim_slot(memory);
++    slot.call = draw;   // the vertex vector keeps its capacity: after a few frames this copies, it does not allocate
++    post_draw();
++}
++
++void SplitRenderer::submit_taking(DrawCall &draw, const GuestMemory &memory) {
++    if (!forwarding() || t_gl) {
++        inner_->submit(draw, memory);
++        return;
++    }
++    if (!t_walker) {
++        warn_foreign_thread("submit");
++        return;
++    }
++    // The vertices and indices change hands instead of being copied (most of a draw's bytes; on the Vita the copy was
++    // a measurable part of the walker's frame): the slot takes the draw's, the draw gets the slot's old ones (emptied,
++    // with their capacity) for the walker's next draw. The rest of the call is copied.
++    DrawSlot &slot = claim_slot(memory);
++    VertexList vertices;
++    std::vector<std::uint16_t> indices;
++    vertices.swap(draw.vertices);
++    indices.swap(draw.indices);
++    slot.call = draw;   // empty vectors: the slot's keep their capacity
++    slot.call.vertices.swap(vertices);
++    slot.call.indices.swap(indices);
++    draw.vertices.swap(vertices);   // the slot's former storage, cleared by the assignment above
++    draw.indices.swap(indices);
++    post_draw();
++}
++
++SplitRenderer::DrawSlot &SplitRenderer::claim_slot(const GuestMemory &memory) {
++    const std::uint64_t sequence = draws_posted_;
+     const std::uint64_t count = slots_.size();
+     // The slot is free once the GL thread has drawn the draw that used it `count` draws ago.
+     while (sequence - draws_done_.load(std::memory_order_acquire) >= count)
+         queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
+     DrawSlot &slot = slots_[sequence % count];
+-    slot.call = draw;   // the vertex vector keeps its capacity: after a few frames this copies, it does not allocate
+     slot.memory = &memory;
++    return slot;
++}
++
++void SplitRenderer::post_draw() {
++    const std::uint64_t sequence = draws_posted_++;
+     queue_.post([this, sequence] { run_draw(sequence); });
+ }
+ 
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+index 480ff2c..93162cd 100644
+--- a/host/gpu/split_renderer.hpp
++++ b/host/gpu/split_renderer.hpp
+@@ -64,6 +64,7 @@ public:
+     [[nodiscard]] bool gpu_decode() const override { return inner_->gpu_decode(); }
+     [[nodiscard]] bool check_gpu_decode() const override { return inner_->check_gpu_decode(); }
+     void submit(const DrawCall &call, const GuestMemory &memory) override;
++    void submit_taking(DrawCall &call, const GuestMemory &memory) override;
+     void write_back_frame(GuestMemory &memory) override;
+     void read_back_framebuffer(std::uint32_t source, GuestMemory &memory) override;
+     void upload_frame(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+@@ -97,6 +98,8 @@ private:
+     // Runs `fn` on the GL thread and waits for it (on the calling thread before start()).
+     template <typename Fn> void call(Fn &&fn);
+     void run_draw(std::uint64_t sequence);
++    DrawSlot &claim_slot(const GuestMemory &memory);  // the slot of the next draw, once the GL thread is done with it
++    void post_draw();                                 // queues the draw in that slot
+ 
+     std::unique_ptr<Renderer> inner_;
+     GeWorker queue_;
+diff --git a/host/gpu/vulkan_renderer.cpp b/host/gpu/vulkan_renderer.cpp
+index cd1351b..0bc9cd6 100644
+--- a/host/gpu/vulkan_renderer.cpp
++++ b/host/gpu/vulkan_renderer.cpp
+@@ -1688,7 +1688,7 @@ struct VulkanRenderer::Impl {
+     // An indexed draw that uses a few vertices of a large pool (a shared
+     // vertex array, indexed from far apart) is written with only the vertices
+     // its indices name; these hold that compacted copy and the old-to-new map.
+-    std::vector<Vertex> compact_vertices;
++    VertexList compact_vertices;
+     std::vector<std::uint16_t> compact_map;
+     // Background texture decoding: the pool (made on first use) and the
+     // textures of the frame being recorded whose pixels are still decoding.
+@@ -5918,7 +5918,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
+         }
+         return true;
+     };
+-    const std::vector<Vertex> *draw_vertices = &call.vertices;
++    const VertexList *draw_vertices = &call.vertices;
+     if (direct) {
+         triangle_indices(call.primitive, count, call.indices, vertex_total, impl.direct_indices);
+         if (impl.direct_indices.empty()) return;
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 3727515..772a833 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -258,10 +258,12 @@ void execute_list(Runtime &rt, std::uint32_t id, GeList &list, const GeCallback
+         const bool statistics = bringup::wants_draws();
+         // With the split GE thread the submission is timed where it runs (the GL thread, SplitRenderer::run_draw).
+         const bool split = gpu::split_of(&renderer) != nullptr && gpu::split_of(&renderer)->forwarding();
+-        media().ge.set_draw_sink([&renderer, &memory, statistics, split](const gpu::DrawCall &call) {
++        media().ge.set_draw_sink([&renderer, &memory, statistics, split](gpu::DrawCall &call) {
+             if (split) {
+                 bench::count_draw();
+-                renderer.submit(call, memory);
++                // The statistics read the call after it is submitted; otherwise the split renderer may take it.
++                if (statistics) renderer.submit(call, memory);
++                else renderer.submit_taking(call, memory);
+             } else {
+                 const phase::Scope submit(phase::GlSubmit);
+                 const bench::Scope gl(bench::Gl);
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index dbb57de..2b2b4c5 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -77,6 +77,15 @@ namespace portablekit::gpu {
+ std::string default_window_title() { return "ge_replay"; }
+ } // namespace portablekit::gpu
+ 
++// Mark the parts of a flip that the game itself would run (the list walk with its draws, and the present), for an
++// instruction-counting profiler that watches these two functions (an ARM build under QEMU: tools/armprof/README.md).
++static volatile int g_profile_state;
++extern "C" [[gnu::noinline, gnu::used]] void ge_replay_profile_on() { g_profile_state = 1; }
++extern "C" [[gnu::noinline, gnu::used]] void ge_replay_profile_off() { g_profile_state = 0; }
++// The same around each draw's submit to the renderer, to tell the renderer's share from the list walk's.
++extern "C" [[gnu::noinline, gnu::used]] void ge_replay_profile_submit_on() { g_profile_state = 2; }
++extern "C" [[gnu::noinline, gnu::used]] void ge_replay_profile_submit_off() { g_profile_state = 1; }
++
+ namespace {
+ 
+ using namespace portablekit;
+@@ -662,6 +671,7 @@ int main(int argc, char **argv) {
+         settings.display_scale = options.scale;
+         settings.offscreen_scale = options.offscreen_scale;
+         settings.null_draw = options.null_draw;
++        settings.merge_break_stats = options.stats;
+         settings.use_port_options = !options.port_baseline;
+         settings.apply_frame_cap = false;   // a replay is not paced
+         for (const auto &[key, text] : options.settings) {
+@@ -811,7 +821,9 @@ int main(int argc, char **argv) {
+                                 clipped.texture.height = static_cast<std::uint16_t>(options.clip_rows);
+                                 renderer->submit(clipped, *memory);
+                             } else {
++                                ge_replay_profile_submit_on();
+                                 renderer->submit(call, *memory);
++                                ge_replay_profile_submit_off();
+                             }
+                             submit_ms += (now_ms() - submit_start);
+                         });
+@@ -837,11 +849,13 @@ int main(int argc, char **argv) {
+                     });
+                     const double walk_start = now_ms();
+                     bool finished = false;
++                    ge_replay_profile_on();
+                     try {
+                         ge.execute(*memory, event_b, event_c, finished);
+                     } catch (const std::exception &failure) {
+                         std::cerr << "flip " << flip << ": list aborted: " << failure.what() << "\n";
+                     }
++                    ge_replay_profile_off();
+                     walk_ms += (now_ms() - walk_start);
+                     ge.set_draw_sink(nullptr);
+                     });
+@@ -868,8 +882,10 @@ int main(int argc, char **argv) {
+                             ++memory_flips;
+                         }
+                         const double present_start = now_ms();
++                        ge_replay_profile_on();
+                         renderer->write_back_frame(*memory);
+                         renderer->present(address);
++                        ge_replay_profile_off();
+                         present_ms += (now_ms() - present_start);
+                     });
+                     break;
+@@ -966,6 +982,22 @@ int main(int argc, char **argv) {
+             std::printf("pixel mask rgb 0x%06X alpha 0x%02X : %llu draws\n", value & 0xFFFFFFu, value >> 24u,
+                         static_cast<unsigned long long>(count));
+     }
++    if (options.stats && replayed != 0u) {
++        // The commands the lists are made of, most frequent first, per flip: what the walk spends its time on.
++        const auto &counts = ge.command_counts();
++        std::vector<std::pair<std::uint64_t, std::uint32_t>> order;
++        std::uint64_t all = 0u;
++        for (std::uint32_t command = 0; command < 256u; ++command) {
++            all += counts[command];
++            if (counts[command] != 0u) order.emplace_back(counts[command], command);
++        }
++        std::sort(order.rbegin(), order.rend());
++        const double per = static_cast<double>(replayed) * static_cast<double>(std::max(options.repeat, 1u));
++        std::printf("GE commands per flip: %.0f; most frequent:", static_cast<double>(all) / per);
++        for (std::size_t i = 0; i < order.size() && i < 24u; ++i)
++            std::printf(" %02X:%.0f", order[i].second, static_cast<double>(order[i].first) / per);
++        std::printf("\n");
++    }
+ #if defined(GE_REPLAY_HAS_GL)
+     if (gl != nullptr && options.stats) {
+         const gpu::GlStats &t = gl->total_stats();

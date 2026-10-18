@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 20:06:54 +0000
+Subject: [PATCH] MPEG: hold ring packets until their access units are taken
+
+A movie player that tells "the movie is over" by an entirely free ring
+buffer (end-of-file flag set and sceMpegRingbufferAvailableSize equal to the
+ring size) was told so as soon as the demultiplexer had read the last pack,
+while the last audio frames were still queued here and had never been
+fetched. The game then left its frame loop with its two-deep decoded-frame
+ring full; its audio/video sync held the last picture back because the audio
+clock (the last audio block it had fetched) could not reach the picture's
+time, and its drain loop, which does not present frames, waited for a free
+slot forever. Whether it hung depended on the guest's speed
+(<prefix>_CPU_NS_PER_INSN 0, 1 and 4 hung, 8 did not).
+
+A pack now stays counted as filled until every unit of a registered stream
+that was complete when it was read has been fetched with sceMpegGetAvcAu or
+sceMpegGetAtracAu. <prefix>_MPEG_EAGER_RELEASE=1 restores the old behaviour.
+
+Also: bring-up tooling (switch trace, thread backtraces, per-call return
+values, post-import hook).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/hle/hle_mpeg.cpp b/host/hle/hle_mpeg.cpp
+index b4813f5..f39bbe5 100644
+--- a/host/hle/hle_mpeg.cpp
++++ b/host/hle/hle_mpeg.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <deque>
+ #include <iostream>
+ #include <map>
+ #include <memory>
+@@ -82,12 +83,35 @@ bool trace_mpeg() {
+     return enabled;
+ }
+ 
++// <prefix>_MPEG_EAGER_RELEASE=1: hand a pack back to the feeder as soon as it
++// has been demultiplexed, which is how this library behaved before packs were
++// held until their access units were taken (see MpegState::held).
++bool eager_pack_release() {
++    static const bool enabled = portablekit::env("MPEG_EAGER_RELEASE") != nullptr;
++    return enabled;
++}
++
+ struct MpegState {
+     std::uint32_t mpeg{};        // guest address of the SceMpeg variable
+     std::uint32_t work{};        // the work area sceMpegCreate was given
+     std::uint32_t ringbuffer{};
+     std::uint32_t stream_packets{};  // packets in the movie, from its header
+     std::uint32_t packets_demuxed{};
++    // Packs the demultiplexer has read whose access units the game has not all
++    // taken yet. A pack stays in the ring (it counts as filled, so neither the
++    // feeder's room nor sceMpegRingbufferAvailableSize give it back) until the
++    // game has fetched every unit of a registered stream that was complete
++    // when the pack was read. A game that tests for an entirely free ring to
++    // tell that the movie is over (the only way to know with a read callback
++    // that signals the end of the file early) then never sees it free while
++    // a frame or an audio block it has not fetched is still queued here.
++    struct HeldPack {
++        std::uint64_t video;  // units of the stream that had to be taken before the pack is free
++        std::uint64_t audio;
++    };
++    std::deque<HeldPack> held;
++    std::uint64_t video_taken{};
++    std::uint64_t audio_taken{};
+     std::map<std::uint32_t, StreamType> streams;  // handle -> type
+     std::uint32_t next_stream{};
+     movie::PsmfDemuxer demuxer;
+@@ -153,9 +177,33 @@ void write_unit(psprecomp::GuestMemory &memory, std::uint32_t address, const mov
+     memory.store32(address + au::kSize, static_cast<std::uint32_t>(unit.data.size()));
+ }
+ 
++// Streams the game has registered: units of a stream nobody fetches from must
++// not keep packs in the ring.
++bool stream_registered(const MpegState &state, StreamType type) {
++    return std::any_of(state.streams.begin(), state.streams.end(),
++                       [type](const auto &entry) { return entry.second == type; });
++}
++
++// Gives the feeder back the packs whose access units have all been taken.
++void release_held_packs(psprecomp::GuestMemory &memory, MpegState &state) {
++    if (state.ringbuffer == 0u) {
++        state.held.clear();
++        return;
++    }
++    std::uint32_t freed = 0u;
++    while (!state.held.empty() && state.held.front().video <= state.video_taken &&
++           state.held.front().audio <= state.audio_taken) {
++        state.held.pop_front();
++        ++freed;
++    }
++    if (freed == 0u) return;
++    const std::uint32_t filled = memory.load32(state.ringbuffer + ring::kFilled);
++    memory.store32(state.ringbuffer + ring::kFilled, filled > freed ? filled - freed : 0u);
++}
++
+ // Demultiplexes packs out of the ring until `ready` holds or the ring is
+-// empty. Consumed packets are handed back to the feeder at once: their
+-// contents now live in the demultiplexer's queues.
++// empty. A pack is handed back to the feeder once the game has taken every
++// unit that was complete when it was read (release_held_packs).
+ template <typename Ready>
+ bool demux_until(psprecomp::GuestMemory &memory, MpegState &state, Ready ready) {
+     const std::uint32_t buffer = state.ringbuffer;
+@@ -164,8 +212,9 @@ bool demux_until(psprecomp::GuestMemory &memory, MpegState &state, Ready ready)
+     const std::uint32_t data = memory.load32(buffer + ring::kData);
+     std::vector<std::uint8_t> pack(movie::kPackSize);
+     while (!ready()) {
+-        std::uint32_t filled = memory.load32(buffer + ring::kFilled);
+-        if (filled == 0u || packets == 0u) {
++        const std::uint32_t filled = memory.load32(buffer + ring::kFilled);
++        const std::uint32_t unread = filled > state.held.size() ? filled - static_cast<std::uint32_t>(state.held.size()) : 0u;
++        if (unread == 0u || packets == 0u) {
+             if (state.stream_packets != 0u && state.packets_demuxed >= state.stream_packets) {
+                 state.demuxer.end_of_stream();
+                 return ready();
+@@ -177,8 +226,15 @@ bool demux_until(psprecomp::GuestMemory &memory, MpegState &state, Ready ready)
+         (void)state.demuxer.push_pack(pack);
+         ++state.packets_demuxed;
+         memory.store32(buffer + ring::kRead, (read + 1u) % packets);
+-        memory.store32(buffer + ring::kFilled, filled - 1u);
+         if (state.stream_packets != 0u && state.packets_demuxed >= state.stream_packets) state.demuxer.end_of_stream();
++        if (eager_pack_release()) {
++            memory.store32(buffer + ring::kFilled, filled - 1u);
++            continue;
++        }
++        state.held.push_back(MpegState::HeldPack{
++            stream_registered(state, StreamType::Avc) ? state.video_taken + state.demuxer.video_queued() : 0u,
++            stream_registered(state, StreamType::Atrac) ? state.audio_taken + state.demuxer.audio_queued() : 0u});
++        release_held_packs(memory, state);
+     }
+     return true;
+ }
+@@ -374,9 +430,19 @@ void register_library(HleRegistrar &hle) {
+         finish_traced(ctx, "sceMpegQueryAtracEsSize", 0u, {}, 3u);
+     });
+     // Drops everything demultiplexed so far, for a restart or a stop.
+-    hle.add("sceMpeg", "sceMpegFlushAllStream", [](Runtime &, AllegrexContext &ctx) {
++    hle.add("sceMpeg", "sceMpegFlushAllStream", [](Runtime &rt, AllegrexContext &ctx) {
+         if (MpegState *state = find_mpeg(arg(ctx, 0))) {
+             state->demuxer.reset();
++            state->video_taken = state->audio_taken = 0u;
++            if (state->ringbuffer != 0u) {
++                // What was held is gone with the units; the ring keeps the
++                // packs nobody has read yet.
++                auto &memory = rt.memory();
++                const auto held = static_cast<std::uint32_t>(state->held.size());
++                const std::uint32_t filled = memory.load32(state->ringbuffer + ring::kFilled);
++                memory.store32(state->ringbuffer + ring::kFilled, filled > held ? filled - held : 0u);
++            }
++            state->held.clear();
+             state->video.reset();
+             state->video_unit.reset();
+             state->audio_unit.reset();
+@@ -397,6 +463,8 @@ void register_library(HleRegistrar &hle) {
+             return;
+         }
+         state->video_unit = state->demuxer.pop_video();
++        ++state->video_taken;
++        release_held_packs(memory, *state);
+         write_unit(memory, arg(ctx, 2), *state->video_unit);
+         if (arg(ctx, 3) != 0u) memory.store32(arg(ctx, 3), 1u);
+         finish_traced(ctx, "sceMpegGetAvcAu", 0u,
+@@ -416,6 +484,8 @@ void register_library(HleRegistrar &hle) {
+             return;
+         }
+         state->audio_unit = state->demuxer.pop_audio();
++        ++state->audio_taken;
++        release_held_packs(memory, *state);
+         write_unit(memory, arg(ctx, 2), *state->audio_unit);
+         if (arg(ctx, 3) != 0u) memory.store32(arg(ctx, 3), 0u);
+         finish_traced(ctx, "sceMpegGetAtracAu", 0u, "pts=" + std::to_string(state->audio_unit->pts));
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index 2effe57..65d53b5 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -33,6 +33,14 @@ constexpr std::uint32_t kThreadArgumentHome = 0x40u;
+ constexpr std::uint64_t kStarvationQuantumUs = 1000u;
+ // Idle vblanks with no runnable thread before the scheduler reports a deadlock.
+ constexpr std::uint64_t kIdleVBlankLimit = 60u * 60u * 5u;
++
++// <prefix>_TRACE_SWITCH=<seconds>: one line per switch to a thread and per wake-up, from that
++// moment of emulated time on (1 or 0: from the start).
++bool trace_switch_on(std::uint64_t now_us) {
++    static const char *text = portablekit::env("TRACE_SWITCH");
++    static const std::uint64_t from_us = text != nullptr ? static_cast<std::uint64_t>(std::strtod(text, nullptr) * 1e6) : 0u;
++    return text != nullptr && now_us >= from_us;
++}
+ constexpr std::int32_t kInterruptIdentity = -2;
+ constexpr std::int32_t kIdleIdentity = -3;
+ // Interpreted instructions without a system call before the spin hook fires.
+@@ -419,8 +427,7 @@ void Kernel::thread_body(Thread &thread) {
+ }
+ 
+ void Kernel::run_thread(Thread &thread) {
+-    static const bool trace_switch = portablekit::env("TRACE_SWITCH") != nullptr;
+-    if (trace_switch)
++    if (trace_switch_on(now_us_))
+         std::fprintf(stderr, "[switch] t=%llu -> %s(%d prio %u) pc=0x%08X\n", static_cast<unsigned long long>(now_us_),
+                      thread.name.c_str(), thread.uid, thread.priority, thread.context.pc);
+     thread.status = ThreadStatus::Running;
+@@ -592,8 +599,7 @@ void Kernel::block(AllegrexContext &ctx, const WaitState &wait, std::uint32_t re
+ }
+ 
+ void Kernel::wake(Thread &thread, std::uint32_t result) {
+-    static const bool trace_switch = portablekit::env("TRACE_SWITCH") != nullptr;
+-    if (trace_switch)
++    if (trace_switch_on(now_us_))
+         std::fprintf(stderr, "[wake] t=%llu %s(prio %u) result=0x%X by=%s\n", static_cast<unsigned long long>(now_us_),
+                      thread.name.c_str(), thread.priority, result,
+                      current_thread() != nullptr ? current_thread()->name.c_str() : "idle/irq");
+@@ -900,7 +906,30 @@ void Kernel::remove_waiter(Thread &thread) {
+     }
+ }
+ 
++// <prefix>_THREAD_BACKTRACE=1: with each thread in the dump, the return addresses found on its
++// guest stack (words that follow a jal or jalr), innermost first. A guess, not an unwinder.
++std::string Kernel::guest_backtrace(const Thread &thread) const {
++    std::string text = " sp=" + psprecomp::hex32(thread.context.gpr[29]) + " bt=";
++    const std::uint32_t sp = thread.context.gpr[29];
++    const std::uint32_t top = thread.stack_bottom + thread.stack_size;
++    int found = 0;
++    auto &memory = runtime_->memory();
++    for (std::uint32_t address = sp; address < top && address < sp + 0x1000u && found < 16; address += 4u) {
++        if (!memory.contains(address, 4u)) break;
++        const std::uint32_t value = memory.load32(address);
++        if ((value & 3u) != 0u || value < 0x08804000u || value >= 0x0A000000u || !memory.contains(value - 8u, 4u)) continue;
++        const std::uint32_t call = memory.load32(value - 8u);
++        const bool is_jal = (call >> 26u) == 3u;
++        const bool is_jalr = (call >> 26u) == 0u && (call & 0x3Fu) == 9u;
++        if (!is_jal && !is_jalr) continue;
++        text += " " + psprecomp::hex32(value);
++        ++found;
++    }
++    return text;
++}
++
+ std::string Kernel::describe_threads() const {
++    static const bool backtraces = portablekit::env("THREAD_BACKTRACE") != nullptr;
+     std::string report = "threads (virtual time " + std::to_string(now_us_ / 1000u) + " ms, vblanks " +
+                          std::to_string(vblank_count_) + "):";
+     for (const auto &[uid, thread] : threads_) {
+@@ -922,6 +951,7 @@ std::string Kernel::describe_threads() const {
+             if (thread->wait.deadline_us) report += " deadline=" + std::to_string(*thread->wait.deadline_us / 1000u) + "ms";
+         }
+         if (thread->status != ThreadStatus::Dormant) report += " pc=" + psprecomp::hex32(thread->context.pc);
++        if (thread->status != ThreadStatus::Dormant && backtraces) report += guest_backtrace(*thread);
+     }
+     return report;
+ }
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index dfbdedf..080ded6 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -415,6 +415,7 @@ public:
+ 
+     // One line per thread: state, what it waits for and where it resumes.
+     [[nodiscard]] std::string describe_threads() const;
++    [[nodiscard]] std::string guest_backtrace(const Thread &thread) const;
+ 
+     // A thread has run `pc`'s neighbourhood for a long time without calling the
+     // system (exec_set_spin_hook, PK_YIELD). Time is charged, timers and interrupts
+diff --git a/host/movie/psmf_demuxer.hpp b/host/movie/psmf_demuxer.hpp
+index 09ea56f..03639d3 100644
+--- a/host/movie/psmf_demuxer.hpp
++++ b/host/movie/psmf_demuxer.hpp
+@@ -44,6 +44,11 @@ public:
+     [[nodiscard]] std::optional<AccessUnit> pop_audio();
+     [[nodiscard]] bool video_ready() const;
+     [[nodiscard]] bool audio_ready() const;
++    // Complete units waiting to be taken. A caller that hands the pack buffer
++    // back to a feeder uses these to tell when every unit a pack contributed
++    // to has been taken.
++    [[nodiscard]] std::size_t video_queued() const noexcept { return video_units_.size(); }
++    [[nodiscard]] std::size_t audio_queued() const noexcept { return audio_units_.size(); }
+     // Frame size, including its header, and the ATRAC3plus parameters from
+     // the first frame header; 0 until one has been seen.
+     [[nodiscard]] std::size_t audio_frame_size() const noexcept { return audio_frame_size_; }
+diff --git a/host/perf/bringup_stats.cpp b/host/perf/bringup_stats.cpp
+index d713009..9af3a97 100644
+--- a/host/perf/bringup_stats.cpp
++++ b/host/perf/bringup_stats.cpp
+@@ -117,6 +117,8 @@ struct State {
+     std::string trace_thread;
+     std::uint64_t trace_from_us{};
+     std::unordered_map<std::string, std::uint64_t> trace_seen;
++    // Traced calls whose result has not been printed yet, by thread.
++    std::unordered_map<std::int32_t, std::string> pending_result;
+     std::unordered_map<std::string, std::string> names;
+     psprecomp::Runtime *runtime{};
+     const gpu::GeState *ge{};
+@@ -227,6 +229,7 @@ void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint
+             if (name.find("sceIoOpen") != std::string::npos || name.find("sceIoGetstat") != std::string::npos ||
+                 name.find("sceIoDopen") != std::string::npos)
+                 std::printf("[path] \"%s\"\n", runtime.memory().read_c_string(c.gpr[4], 200u).c_str());
++            s.pending_result[psprecomp::runtime_thread_uid()] = name;
+             std::printf("[call] %10llu us v%-6llu f%-5llu %-14s %s a0=%08X a1=%08X a2=%08X a3=%08X ra=%08X\n",
+                         static_cast<unsigned long long>(kernel().now_us()),
+                         static_cast<unsigned long long>(kernel().vblank_count()),
+@@ -246,6 +249,17 @@ void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint
+     ++s.total_calls;
+ }
+ 
++// Prints the result of a traced call: `[ret]` with the thread, the import and v0 and v1.
++void post_import(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
++    State &s = state();
++    const auto pending = s.pending_result.find(psprecomp::runtime_thread_uid());
++    if (pending == s.pending_result.end()) return;
++    std::printf("[ret]  %10llu us                    %-14s %s v0=%08X v1=%08X\n",
++                static_cast<unsigned long long>(kernel().now_us()), psprecomp::runtime_thread_name(),
++                pending->second.c_str(), ctx.gpr[2], ctx.gpr[3]);
++    s.pending_result.erase(pending);
++}
++
+ // ---------------------------------------------------------------------------
+ // Writing a phase
+ 
+@@ -456,6 +470,7 @@ void install(psprecomp::Runtime &runtime, const gpu::GeState &ge) {
+     }
+     if (s.stats || !s.trace_words.empty() || s.max_frames != 0u || s.max_wall_ms != 0 || s.max_emu_us != 0u) {
+         psprecomp::set_runtime_pre_import_hook(&pre_import);
++        if (!s.trace_words.empty()) psprecomp::set_runtime_post_import_hook(&post_import);
+         s.hooked = true;
+     }
+     if (s.stats)
+diff --git a/include/psprecomp/runtime.hpp b/include/psprecomp/runtime.hpp
+index 9d03848..3276204 100644
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -316,6 +316,10 @@ void set_runtime_post_chained_call_hook(RuntimePostChainedCallHook hook) noexcep
+ // counter is built on. Not called for code that never reaches an import.
+ using RuntimePreImportHook = void (*)(Runtime &, std::string_view library, std::uint32_t nid, AllegrexContext &);
+ void set_runtime_pre_import_hook(RuntimePreImportHook hook) noexcept;
++// Called after the HLE handler returned, on the thread that made the call (a call that
++// waited has been resumed), with the caller's registers: v0 and v1 are the result.
++using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
++void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept;
+ 
+ #undef PSPRECOMP_RUNTIME_FORCEINLINE
+ 
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index c29c227..fbae5e6 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -23,7 +23,6 @@ CorpusProcessState g_corpus_process{};
+ std::uint64_t g_runtime_thread_switch_generation_fast = 0u;
+ 
+ namespace {
+-using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
+ RuntimePostImportHook g_post_import_hook = nullptr;
+ RuntimePreImportHook g_pre_import_hook = nullptr;
+ std::int32_t g_runtime_thread_uid = -1;

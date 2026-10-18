@@ -1,0 +1,1234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 03:35:37 +0000
+Subject: [PATCH] Merge the integration branch (bench mode, movie texture fix,
+ call log, pace log) into vita-app
+
+Brings in:
+* GE recorder: read RAM and VRAM through the arena (merge fix)
+* Bring-up: HLE call log with argument-read mask, PNG capture of chosen presented flips
+* Bench mode: INFECTED_BENCH=flips:N[,from:F] wall-time accounting by category (guest, HLE per library, GE walk, decode, GL, present, idle), exec counters per flip, pad script from file
+* Bench: SAS render, ATRAC decode and movie decode categories; report to stdout, <prefix>_BENCH_OUT and a platform sink
+* GL renderer: textures that wrap the end of VRAM are gathered, not dropped (the movie picture of Infected is a 512-row texture in a 480-wide buffer at 0x04154000; the draw was skipped every flip and the movies never showed)
+* Bring-up: INFECTED_PACE_LOG=N prints real against emulated time every N flips
+* Audio sink: without a device the game clock drains the ring (a dump has the length of the emulated time; two channels chasing each other no longer stretch it), emulated time in the trace line
+* MPEG: INFECTED_PACE_LOG prints per-movie-session real vs emulated duration
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4ce2aaa..541ef32 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -563,6 +563,7 @@ if(PORTABLEKIT_GE_REPLAY)
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_dump.cpp"
+         "${PORTABLEKIT_ROOT}/host/profile.cpp"
+         "${PORTABLEKIT_ROOT}/host/perf/frame_stats.cpp"
++        "${PORTABLEKIT_ROOT}/host/perf/bench.cpp"
+         "${PORTABLEKIT_ROOT}/host/settings/settings.cpp"
+         "${PORTABLEKIT_ROOT}/host/input/bindings.cpp"
+         "${PORTABLEKIT_ROOT}/host/install/user_data.cpp"
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index 3458208..eacf1cd 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -45,6 +45,7 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/gpu/ge_worker.cpp
+     host/gpu/texture_decode.cpp
+     host/perf/frame_stats.cpp
++    host/perf/bench.cpp
+     host/perf/bringup_stats.cpp
+     host/perf/debug_raster.cpp
+     host/overlays.cpp
+diff --git a/host/audio/atrac_decoder.cpp b/host/audio/atrac_decoder.cpp
+index e50ad5d..530e89e 100644
+--- a/host/audio/atrac_decoder.cpp
++++ b/host/audio/atrac_decoder.cpp
+@@ -1,5 +1,6 @@
+ #include "audio/atrac_decoder.hpp"
+ 
++#include "perf/bench.hpp"
+ #include "perf/phase_timers.hpp"
+ 
+ #include <algorithm>
+@@ -88,6 +89,7 @@ bool AtracDecoder::is_open() const noexcept { return impl_->context != nullptr;
+ AtracCodec AtracDecoder::codec() const noexcept { return impl_->codec; }
+ 
+ std::size_t AtracDecoder::decode(std::span<const std::uint8_t> frame, std::int16_t *out) {
++    const bench::Scope bench_scope(bench::AtracDecode);
+     Impl &impl = *impl_;
+     if (impl.context == nullptr || frame.empty()) return 0u;
+     const portablekit::phase::Scope timer(portablekit::phase::Decode);
+diff --git a/host/audio/audio_sink.cpp b/host/audio/audio_sink.cpp
+index 11b3eab..39f9953 100644
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -107,6 +107,7 @@ struct AudioSink::Impl {
+ 
+     WavWriter dump;
+     std::vector<std::int16_t> scratch;
++    AudioSink::TimeSource time_source{};
+ 
+     // Statistics over the current one-second reporting window.
+     std::uint64_t window_frames{};
+@@ -159,13 +160,41 @@ struct AudioSink::Impl {
+         if (window_frames >= kSampleRate) report();
+     }
+ 
++    // No device (dump only, or <prefix>_NO_AUDIO): the game's clock plays the stream. The frames up to the emulated time are
++    // retired, written or not, so a silent stretch is silent in the dump and its length is the emulated time. Draining by what
++    // was written instead (the old rule) made two channels that snap forward in turn push the stream ahead of the clock:
++    // a 190 s stretch of play came out as 400 s of audio.
++    void drain_without_device() {
++        std::uint64_t target;
++        if (time_source != nullptr) {
++            target = time_source() * kSampleRate / 1'000'000u;
++        } else {
++            target = write_end > kPrebufferFrames ? write_end - kPrebufferFrames : 0u;
++        }
++        // Never past the ring's reach of written frames, and in steps the ring can hold.
++        while (target > read_position) {
++            const auto step = static_cast<std::size_t>(std::min<std::uint64_t>(target - read_position, 4096u));
++            scratch.resize(step * kChannels);
++            retire(step, scratch.data(), true);
++            // A platform device takes what was retired; what its queue has no room for is lost, as on a device that falls behind.
++            if (output_open) {
++                const std::size_t taken = g_output.write(scratch.data(), step);
++                if (taken < step) {
++                    window_dropped += step - taken;
++                    total_dropped += step - taken;
++                }
++            }
++        }
++    }
++
+     void report() {
+         const double rms = std::sqrt(window_energy / static_cast<double>(window_frames * kChannels));
+         ++seconds;
+         if (dump.active()) dump.flush();
+         if (trace) {
+-            std::printf("[audio] %llus frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu\n",
++            std::printf("[audio] %llus emu=%.3f frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu\n",
+                         static_cast<unsigned long long>(seconds),
++                        time_source != nullptr ? static_cast<double>(time_source()) / 1e6 : 0.0,
+                         static_cast<unsigned long long>(window_frames), window_peak, rms,
+                         static_cast<unsigned long long>(window_silent),
+                         static_cast<unsigned long long>(window_dropped));
+@@ -273,7 +302,14 @@ void AudioSink::shutdown() {
+     }
+ #endif
+     std::lock_guard<std::mutex> guard(impl.lock);
+-    if (impl.dump.active()) impl.dump.close();
++    if (impl.dump.active()) {
++        // The frames written ahead of the clock still belong to the dump.
++        if (impl.write_end > impl.read_position) {
++            impl.scratch.resize(static_cast<std::size_t>(impl.write_end - impl.read_position) * kChannels);
++            impl.retire(static_cast<std::size_t>(impl.write_end - impl.read_position), impl.scratch.data(), true);
++        }
++        impl.dump.close();
++    }
+     if (impl.trace) {
+         std::printf("[audio] total frames=%llu silent=%llu dropped=%llu\n",
+                     static_cast<unsigned long long>(impl.total_frames),
+@@ -283,6 +319,8 @@ void AudioSink::shutdown() {
+     }
+ }
+ 
++void AudioSink::set_time_source(TimeSource source) { impl_->time_source = source; }
++
+ void AudioSink::set_volume(float gain) {
+     Impl &impl = *impl_;
+     impl.gain = std::clamp(gain, 0.0f, 1.0f);
+@@ -332,6 +370,13 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
+         count = kRingFrames;
+     }
+ 
++#if defined(PORTABLEKIT_HAS_SDL_AUDIO)
++    const bool device_drains = impl.stream != nullptr;
++#else
++    const bool device_drains = false;
++#endif
++    if (!device_drains) impl.drain_without_device();
++
+     // A cursor behind the device belongs to a producer that stalled; restart it
+     // at the write target rather than writing frames that already played.
+     if (cursor < impl.read_position + kPrebufferFrames / 4u) cursor = impl.read_position + kPrebufferFrames;
+@@ -358,25 +403,8 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
+     cursor += count;
+     impl.write_end = std::max(impl.write_end, cursor);
+ 
+-    // Without a device nothing drains the ring, so keep it moving here.
+-#if defined(PORTABLEKIT_HAS_SDL_AUDIO)
+-    const bool draining = impl.stream != nullptr;
+-#else
+-    const bool draining = false;
+-#endif
+-    if (!draining && impl.write_end > impl.read_position + kPrebufferFrames) {
+-        const auto ready = static_cast<std::size_t>(impl.write_end - impl.read_position - kPrebufferFrames);
+-        impl.scratch.resize(ready * kChannels);
+-        impl.retire(ready, impl.scratch.data(), true);
+-        // A platform device takes what was retired; what its queue has no room for is lost, as on a device that falls behind.
+-        if (impl.output_open) {
+-            const std::size_t taken = g_output.write(impl.scratch.data(), ready);
+-            if (taken < ready) {
+-                impl.window_dropped += ready - taken;
+-                impl.total_dropped += ready - taken;
+-            }
+-        }
+-    }
++    // Without a device nothing else drains the ring, so keep it moving here.
++    if (!device_drains) impl.drain_without_device();
+ }
+ 
+ } // namespace portablekit::audio
+diff --git a/host/audio/audio_sink.hpp b/host/audio/audio_sink.hpp
+index 2b68bd8..5f3f6a0 100644
+--- a/host/audio/audio_sink.hpp
++++ b/host/audio/audio_sink.hpp
+@@ -55,6 +55,10 @@ public:
+     // Stops and restarts the device, for the in-game menu's pause. What the
+     // game queued before the pause stays in the ring and plays on resume.
+     void set_paused(bool paused);
++    // Emulated microseconds, for the per-second trace line (<prefix>_TRACE_AUDIO): how much game time one second of audio took.
++    using TimeSource = std::uint64_t (*)();
++    void set_time_source(TimeSource source);
++
+     // Whether a playback device is open (not with <prefix>_NO_AUDIO, or when
+     // none could be opened).
+     [[nodiscard]] bool has_device() const;
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index c810cc8..31ac987 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -1,6 +1,7 @@
+ #include "../profile.hpp"
+ #include "ge_state.hpp"
+ 
++#include "perf/bench.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "psprecomp/common.hpp"
+ 
+@@ -10,6 +11,7 @@
+ #include <cstring>
+ #include <iostream>
+ #include <map>
++#include <optional>
+ #include <tuple>
+ #include <type_traits>
+ #include <utility>
+@@ -1022,6 +1024,8 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
+     // <prefix>_TRACE_RENDER: from here to the decoded vertices is "decode".
+     const bool split = perf::split_enabled();
+     const std::uint64_t split_start = split ? perf::split_ticks() : 0u;
++    std::optional<bench::Scope> decode_scope;  // <prefix>_BENCH: the same stretch, restored on every return
++    decode_scope.emplace(bench::Decode);
+     std::uint32_t vertex_count = count;
+     std::uint32_t first_vertex = 0u;
+     if (index_type != 0u && index_address_ != 0u) {
+@@ -1094,6 +1098,7 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
+         stride = decode_vertices(memory, first_address, vertex_type_, vertex_count, call.vertices,
+                                  bone_matrices_.data());
+     if (split) perf::add_split(perf::Split::Decode, perf::split_ticks() - split_start);
++    decode_scope.reset();
+     if (stride == 0u || (call.vertices.empty() && call.raw_vertices == nullptr)) return;
+     // A prim leaves VADDR/IADDR alone but advances the pointer it consumed, so
+     // a run of prims can share one setup. An indexed prim consumes indices, not
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 5dfa84e..adcc2ec 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -289,6 +289,7 @@ struct GlRenderer::Impl {
+     std::unordered_map<std::uint64_t, std::uint64_t> clut_hashes;  // per display list
+     std::map<std::array<std::uint32_t, 3>, bool> target_verdicts;  // per display list: target, texture, size -> unchanged
+     std::vector<std::uint32_t> decode_buffer;
++    std::vector<std::uint8_t> wrap_scratch;  // a texture that wraps the end of VRAM, gathered into one run
+     GLuint upload_texture{};  // for upload_frame
+     GLuint clear_texture{};   // 1x1 transparent black for quad_clear
+     std::uint32_t upload_width{}, upload_height{};
+@@ -757,6 +758,20 @@ struct GlRenderer::Impl {
+         }
+         const std::uint32_t bytes = texel_bytes(state);
+         const std::uint8_t *data = memory.raw_pointer(state.address, bytes);
++        if (data == nullptr && bytes != 0u && memory.contains(state.address, bytes)) {
++            // Legal in guest space but not one run of host memory: a 512-row texture in a 480-wide buffer at the
++            // end of VRAM (the movie picture of Infected) wraps to the start of VRAM. Gathered page by page.
++            wrap_scratch.resize(bytes);
++            for (std::uint32_t offset = 0; offset < bytes; offset += 4096u) {
++                const std::uint32_t length = std::min<std::uint32_t>(4096u, bytes - offset);
++                if (const std::uint8_t *page = memory.raw_pointer(state.address + offset, length)) {
++                    std::memcpy(wrap_scratch.data() + offset, page, length);
++                } else {
++                    for (std::uint32_t i = 0; i < length; ++i) wrap_scratch[offset + i] = memory.load8(state.address + offset + i);
++                }
++            }
++            data = wrap_scratch.data();
++        }
+         if (data == nullptr || state.width == 0u || state.height == 0u) return nullptr;
+ 
+         const auto found = textures.find(key);
+diff --git a/host/hle/hle_common.cpp b/host/hle/hle_common.cpp
+index 250026a..f720be0 100644
+--- a/host/hle/hle_common.cpp
++++ b/host/hle/hle_common.cpp
+@@ -9,6 +9,9 @@
+ 
+ namespace portablekit {
+ 
++std::uint32_t g_hle_arg_mask = 0u;
++
++
+ std::string read_cstring(const psprecomp::GuestMemory &memory, std::uint32_t address, std::size_t max_length) {
+     std::string text;
+     if (address == 0u) return text;
+diff --git a/host/hle/hle_common.hpp b/host/hle/hle_common.hpp
+index 5316b04..3981420 100644
+--- a/host/hle/hle_common.hpp
++++ b/host/hle/hle_common.hpp
+@@ -17,8 +17,14 @@ namespace portablekit {
+ 
+ using HleFunction = std::function<void(Runtime &, AllegrexContext &)>;
+ 
++// Bit n is set when a handler has read argument n since the bring-up call log last cleared it
++// (<prefix>_CALL_LOG records which arguments of each call the handler looked at: the others hold
++// whatever the caller left in the register, which differs between the interpreter and lean code).
++extern std::uint32_t g_hle_arg_mask;
++
+ // PSP EABI argument registers: a0-a3 then t0-t3.
+ [[nodiscard]] inline std::uint32_t arg(const AllegrexContext &ctx, unsigned index) noexcept {
++    g_hle_arg_mask |= 1u << index;
+     return index < 4u ? ctx.gpr[4u + index] : ctx.gpr[8u + (index - 4u)];
+ }
+ 
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index b514596..fa8b422 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -24,6 +24,7 @@
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_dump.hpp"
+ #include "gpu/ge_worker.hpp"
++#include "perf/bench.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "perf/phase_timers.hpp"
+ #include "perf/bringup_stats.hpp"
+@@ -51,6 +52,8 @@
+ #include <cstdlib>
+ #include <iostream>
+ #include <memory>
++#include <sstream>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -243,6 +246,8 @@ void execute_list(Runtime &rt, std::uint32_t id, GeList &list, const GeCallback
+         media().ge.set_draw_sink([&renderer, &memory, statistics](const gpu::DrawCall &call) {
+             {
+                 const phase::Scope submit(phase::GlSubmit);
++                const bench::Scope gl(bench::Gl);
++                bench::count_draw();
+                 renderer.submit(call, memory);
+             }
+             if (statistics) bringup::on_draw(call);
+@@ -262,6 +267,8 @@ void execute_list(Runtime &rt, std::uint32_t id, GeList &list, const GeCallback
+     try {
+         const perf::SplitScope split(perf::Split::Lists);
+         const phase::Scope walk(phase::GeWalk);
++        const bench::Scope ge(bench::Ge);
++        bench::count_list();
+         list.pc = media().ge.execute(rt.memory(), list.pc, list.stall, finished);
+     } catch (const psprecomp::Error &error) {
+         // A malformed list must not take the whole run down: drop it and carry on.
+@@ -456,6 +463,7 @@ void present_frame(Runtime &rt) {
+                                       ? (media().display.framebuffer | 0x04000000u)
+                                       : media().display.framebuffer;
+     const perf::Clock::time_point present_start = perf::Clock::now();
++    const bench::Scope present_scope(bench::Present);
+     // The GE only draws into VRAM, so a framebuffer in main memory was
+     // written by the CPU (the movie player's sceJpegCsc) and has to be shown
+     // from memory.
+@@ -508,7 +516,43 @@ void present_frame(Runtime &rt) {
+         const char *text = portablekit::env("SCREENSHOT_EVERY");
+         return text != nullptr ? std::strtoull(text, nullptr, 10) : 60ull;
+     }();
+-    if (screenshot_dir != nullptr && screenshot_every != 0u &&
++    // <prefix>_SCREENSHOT_FLIPS=A,B-C,D-E/STEP: capture the presented picture at those flips (the guest's
++    // sceDisplaySetFrameBuf count, 1 for the first; the numbering of <prefix>_SHOT_FLIPS) into
++    // <dir>/flip_NNNNNN.png. With it set, <prefix>_SCREENSHOT_EVERY is not used unless given too.
++    struct FlipRange {
++        std::uint64_t first{}, last{}, step{1};
++    };
++    static const std::vector<FlipRange> screenshot_flips = [] {
++        std::vector<FlipRange> ranges;
++        const char *text = portablekit::env("SCREENSHOT_FLIPS");
++        if (text == nullptr) return ranges;
++        std::stringstream list(text);
++        std::string item;
++        while (std::getline(list, item, ',')) {
++            FlipRange r;
++            char *end = nullptr;
++            r.first = std::strtoull(item.c_str(), &end, 10);
++            r.last = r.first;
++            if (*end == '-') r.last = std::strtoull(end + 1, &end, 10);
++            if (*end == '/') r.step = std::max<std::uint64_t>(1u, std::strtoull(end + 1, nullptr, 10));
++            ranges.push_back(r);
++        }
++        return ranges;
++    }();
++    if (screenshot_dir != nullptr && !screenshot_flips.empty()) {
++        const std::uint64_t flip = bringup::flip_count() + 1u;  // on_flip counts after the present
++        bool wanted = false;
++        for (const FlipRange &r : screenshot_flips)
++            if (flip >= r.first && flip <= r.last && (flip - r.first) % r.step == 0u) wanted = true;
++        if (wanted) {
++            char name[64];
++            std::snprintf(name, sizeof name, "/flip_%06llu.png", static_cast<unsigned long long>(flip));
++            if (!renderer.capture_frame(std::string(screenshot_dir) + name))
++                log_once("capture-failed", "[render] cannot capture the frame to " + std::string(screenshot_dir) + name);
++        }
++    }
++    const bool every_set = portablekit::env("SCREENSHOT_EVERY") != nullptr || screenshot_flips.empty();
++    if (screenshot_dir != nullptr && every_set && screenshot_every != 0u &&
+         renderer.frames_presented() % screenshot_every == 0u) {
+         const std::string path = std::string(screenshot_dir) + "/frame_" +
+                                  std::to_string(renderer.frames_presented()) + ".bmp";
+@@ -1135,7 +1179,10 @@ void sas_render(Runtime &rt, std::uint32_t core, std::uint32_t output, bool mix,
+     const std::size_t frames = sas.grain();
+     static std::vector<std::int16_t> staging;
+     staging.resize(frames * 2u);
+-    sas.render(rt.memory(), staging.data(), frames);
++    {
++        const bench::Scope scope(bench::SasRender);
++        sas.render(rt.memory(), staging.data(), frames);
++    }
+ 
+     std::uint8_t *destination = rt.memory().raw_pointer(output, frames * 4u);
+     if (destination == nullptr) {
+@@ -1167,6 +1214,7 @@ bool trace_sas() {
+ 
+ void register_audio(HleRegistrar &hle) {
+     audio::AudioSink::instance().initialize();
++    audio::AudioSink::instance().set_time_source([]() -> std::uint64_t { return kernel().now_us(); });
+ 
+     hle.add("sceAudio", "sceAudioChReserve", [](Runtime &, AllegrexContext &ctx) {
+         auto channel = static_cast<std::int32_t>(arg(ctx, 0));
+diff --git a/host/hle/hle_mpeg.cpp b/host/hle/hle_mpeg.cpp
+index f39bbe5..677752f 100644
+--- a/host/hle/hle_mpeg.cpp
++++ b/host/hle/hle_mpeg.cpp
+@@ -17,12 +17,14 @@
+ #include "hle_common.hpp"
+ 
+ #include "audio/atrac_decoder.hpp"
++#include "perf/bench.hpp"
+ #include "movie/avc_decoder.hpp"
+ #include "movie/psmf_demuxer.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdlib>
+ #include <deque>
+ #include <iostream>
+@@ -92,6 +94,8 @@ bool eager_pack_release() {
+ }
+ 
+ struct MpegState {
++    std::uint64_t started_us{};                             // <prefix>_PACE_LOG: the session's start, emulated and real
++    std::chrono::steady_clock::time_point started_real{};
+     std::uint32_t mpeg{};        // guest address of the SceMpeg variable
+     std::uint32_t work{};        // the work area sceMpegCreate was given
+     std::uint32_t ringbuffer{};
+@@ -358,10 +362,22 @@ void register_library(HleRegistrar &hle) {
+         if (state->ringbuffer != 0u) memory.store32(state->ringbuffer + ring::kMpeg, mpeg);
+         if (!state->video.open())
+             log_once("mpeg-avc", "[mpeg] the H.264 decoder could not be opened; movies will be black");
++        state->started_us = kernel().now_us();
++        state->started_real = std::chrono::steady_clock::now();
+         module().instances[mpeg] = std::move(state);
+         finish_traced(ctx, "sceMpegCreate", 0u, {}, 7u);
+     });
+     hle.add("sceMpeg", "sceMpegDelete", [](Runtime &, AllegrexContext &ctx) {
++        static const bool pace_log = portablekit::env("PACE_LOG") != nullptr;
++        if (pace_log) {
++            if (const MpegState *state = find_mpeg(arg(ctx, 0))) {
++                static unsigned sessions = 0u;
++                const double real_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - state->started_real).count();
++                const double emu_s = static_cast<double>(kernel().now_us() - state->started_us) / 1e6;
++                bench::out("[pace] movie session %u: %u pictures, %.2f s emulated, %.2f s real\n", ++sessions,
++                           static_cast<unsigned>(state->pictures), emu_s, real_s);
++            }
++        }
+         module().instances.erase(arg(ctx, 0));
+         finish_traced(ctx, "sceMpegDelete", 0u, {}, 1u);
+     });
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index a45c309..7344bdc 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -5,6 +5,7 @@
+ #include "kernel/kernel_platform.hpp"
+ #include "kernel/stall_watchdog.hpp"
+ #include "kernel/load_trace.hpp"
++#include "perf/bench.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "perf/bringup_stats.hpp"
+ #include "perf/phase_timers.hpp"
+@@ -418,6 +419,7 @@ void Kernel::thread_entry(void *thread) { kernel().thread_body(*static_cast<Thre
+ void Kernel::thread_body(Thread &thread) {
+     try {
+         // g_cpu already holds the start context: sp, $k0, gp and the arguments.
++        bench::set(bench::Guest);
+         pk_guest_call(thread.entry);
+         // The entry function returned: that is sceKernelExitThread(v0).
+         exit_current_thread(g_cpu, static_cast<std::int32_t>(g_cpu.gpr[2]), thread.name == "module_start");
+@@ -435,6 +437,7 @@ void Kernel::run_thread(Thread &thread) {
+                      thread.name.c_str(), thread.uid, thread.priority, thread.context.pc);
+     thread.status = ThreadStatus::Running;
+     current_uid_ = thread.uid;
++    ++thread_dispatches_;
+     psprecomp::set_runtime_thread_identity(thread.uid, thread.name);
+     load_trace::run_as(thread.name);
+     idle_vblanks_ = 0u;
+@@ -659,6 +662,7 @@ void Kernel::sleep_until_event(std::uint64_t target_us) {
+     refresh_realtime();
+     if (target_us <= now_us_) return;
+     const std::uint64_t wait_us = target_us - now_us_;
++    const bench::Scope idle(bench::Idle);
+     using Clock = std::chrono::steady_clock;
+     const Clock::time_point start = Clock::now();
+     if (idle_hook_) idle_hook_(start + std::chrono::microseconds(wait_us));
+@@ -787,6 +791,7 @@ bool Kernel::pace_to_real_time() {
+     if (ahead_us >= kMinSleepUs) {
+         const Clock::time_point wake = now + std::chrono::microseconds(std::min(ahead_us, kMaxSleepUs));
+         Clock::time_point sleep_start = now;
++        const bench::Scope idle(bench::Idle);
+         if (idle_hook_) {
+             idle_hook_(wake);
+             sleep_start = Clock::now();
+@@ -1346,7 +1351,10 @@ bool Kernel::deliver_callbacks() {
+         const AllegrexContext saved = g_cpu;
+         load_guest_call_arguments(g_cpu, call.arguments, 4u);
+         g_cpu.set_gpr(29, saved.gpr[29] - kThreadArgumentHome);
+-        pk_guest_call(call.function);
++        {
++            const bench::Scope guest(bench::Guest);
++            pk_guest_call(call.function);
++        }
+         g_cpu = saved;
+     }
+     return !due.empty();
+@@ -1400,7 +1408,10 @@ void Kernel::run_interrupt(InterruptCall call) {
+     g_cpu.pc = call.function;
+     psprecomp::set_runtime_thread_identity(kInterruptIdentity, "interrupt");
+     load_trace::run_as("interrupt");
+-    pk_guest_call(call.function);
++    {
++        const bench::Scope guest(bench::Guest);
++        pk_guest_call(call.function);
++    }
+     const std::uint32_t result = g_cpu.gpr[2];
+     interrupt_active_ = false;
+     g_cpu = saved;
+@@ -1421,7 +1432,10 @@ void Kernel::call_guest(AllegrexContext &ctx, std::uint32_t function, const Gues
+     // address is restored for whatever `on_return` does next.
+     const std::uint32_t return_address = ctx.gpr[31];
+     load_guest_call_arguments(ctx, arguments, argument_count);
+-    pk_guest_call(function);
++    {
++        const bench::Scope guest(bench::Guest);
++        pk_guest_call(function);
++    }
+     ctx.set_gpr(31, return_address);
+     ctx.pc = return_address;
+     on_return(ctx, ctx.gpr[2]);
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index 7700c81..449ac5a 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -280,6 +280,8 @@ public:
+     [[nodiscard]] std::uint64_t vblank_count() const noexcept { return vblank_count_; }
+     // Coroutine switches since the start (every guest thread change, scheduler included): a cost counter for the status line.
+     [[nodiscard]] std::uint64_t switch_count() const noexcept { return switch_count_; }
++    // How many times a guest thread was given the processor (a measure of the scheduler's work).
++    [[nodiscard]] std::uint64_t thread_dispatches() const noexcept { return thread_dispatches_; }
+     // Emulated time of the latest vblank, at or before now_us().
+     [[nodiscard]] std::uint64_t last_vblank_us() const noexcept { return next_vblank_us_ - kVBlankPeriodUs; }
+     // Forgets how far emulated time was ahead of or behind real time. Called
+@@ -522,6 +524,7 @@ private:
+     PollHook poll_hook_;
+     std::uint64_t next_vblank_us_{kVBlankPeriodUs};
+     std::uint64_t vblank_count_{};
++    std::uint64_t thread_dispatches_{};
+     bool dispatch_enabled_{true};
+     bool interrupts_enabled_{true};
+ 
+diff --git a/host/main.cpp b/host/main.cpp
+index 1d1c18d..a326b2a 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -299,6 +299,21 @@ int run_adhoc_server(int argc, char **argv) {
+     return 0;
+ }
+ 
++// <prefix>_BENCH=flips:N[,from:F] measures a fixed stretch of play (host/perf/bench.hpp). A measurement
++// must not depend on the wall clock or on the audio device, so unless the caller said otherwise it runs
++// on the virtual clock at 60 flips per emulated second, with no busy clock, no spin preemption, no
++// audio output, no real-time pacing and the renderer's draw calls skipped (its decoding and uploads still run).
++void apply_bench_defaults() {
++#if !defined(_WIN32)
++    if (portablekit::env("BENCH") == nullptr) return;
++    static const char *const defaults[][2] = {
++        {"CLOCK", "virtual"}, {"NO_BUSY_CLOCK", "1"}, {"SPIN_INSNS", "0"},
++        {"FRAME_LIMIT_US", "16683"}, {"NO_AUDIO", "1"}, {"GL_NULL_DRAW", "1"}, {"UNTHROTTLED", "1"},
++    };
++    for (const auto &entry : defaults) ::setenv(portablekit::env_name(entry[0]).c_str(), entry[1], 0);
++#endif
++}
++
+ } // namespace
+ 
+ // A program that wraps the port (the desktop app in apps/portablekit) compiles
+@@ -314,6 +329,7 @@ int PORTABLEKIT_HOST_MAIN_NAME(int argc, char **argv) {
+ #else
+ int main(int argc, char **argv) {
+ #endif
++    apply_bench_defaults();
+ #if defined(__linux__) && !defined(PORTABLEKIT_ANDROID_APP)
+     ensure_main_stack(argv);
+ #endif
+diff --git a/host/movie/avc_decoder.cpp b/host/movie/avc_decoder.cpp
+index f4d9bd4..625283f 100644
+--- a/host/movie/avc_decoder.cpp
++++ b/host/movie/avc_decoder.cpp
+@@ -1,5 +1,6 @@
+ #include "movie/avc_decoder.hpp"
+ 
++#include "perf/bench.hpp"
+ #include "perf/phase_timers.hpp"
+ 
+ #include <cstring>
+@@ -87,6 +88,7 @@ void AvcDecoder::close() { impl_->close(); }
+ bool AvcDecoder::is_open() const noexcept { return impl_->context != nullptr; }
+ 
+ bool AvcDecoder::decode(std::span<const std::uint8_t> unit, Picture &picture) {
++    const bench::Scope bench_scope(bench::MovieDecode);
+     Impl &impl = *impl_;
+     if (impl.context == nullptr || unit.empty() || impl.draining) return false;
+     const portablekit::phase::Scope timer(portablekit::phase::Decode);
+@@ -98,6 +100,7 @@ bool AvcDecoder::decode(std::span<const std::uint8_t> unit, Picture &picture) {
+ }
+ 
+ bool AvcDecoder::drain(Picture &picture) {
++    const bench::Scope bench_scope(bench::MovieDecode);
+     Impl &impl = *impl_;
+     if (impl.context == nullptr) return false;
+     if (!impl.draining) {
+diff --git a/host/perf/bench.cpp b/host/perf/bench.cpp
+new file mode 100644
+index 0000000..0925c8a
+--- /dev/null
++++ b/host/perf/bench.cpp
+@@ -0,0 +1,144 @@
++#include "perf/bench.hpp"
++
++#include "profile.hpp"
++
++#include <cstdarg>
++#include <cstdio>
++
++#include <chrono>
++#include <deque>
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace portablekit::bench {
++
++bool g_on = false;
++
++namespace {
++
++struct State {
++    std::uint32_t cur{Guest};
++    std::uint64_t last_ns{};
++    std::array<std::uint64_t, kMaxCats> ns{};
++    std::array<std::uint64_t, kMaxCats> calls{};
++    std::uint32_t used{kFixedCats};
++    std::deque<std::string> names;                       // library names, stable storage
++    std::map<std::string_view, std::uint32_t> by_name;
++    std::uint64_t draws{}, lists{};
++};
++
++State &state() noexcept {
++    static State s;
++    return s;
++}
++
++std::uint64_t clock_ns() noexcept {
++    return static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++} // namespace
++
++void enable() noexcept {
++    State &s = state();
++    s.last_ns = clock_ns();
++    s.cur = Guest;
++    g_on = true;
++}
++
++std::uint32_t current() noexcept { return state().cur; }
++
++void set_slow(std::uint32_t cat) noexcept {
++    State &s = state();
++    const std::uint64_t now = clock_ns();
++    s.ns[s.cur] += now - s.last_ns;
++    s.last_ns = now;
++    s.cur = cat;
++}
++
++std::uint32_t library_category(std::string_view library) noexcept {
++    State &s = state();
++    const auto found = s.by_name.find(library);
++    std::uint32_t cat;
++    if (found != s.by_name.end()) {
++        cat = found->second;
++    } else if (s.used < kMaxCats) {
++        s.names.emplace_back(library);
++        cat = s.used++;
++        s.by_name.emplace(std::string_view(s.names.back()), cat);
++    } else {
++        cat = Kernel;  // more libraries than categories: counted with the kernel
++    }
++    ++s.calls[cat];
++    return cat;
++}
++
++namespace {
++std::vector<std::pair<WindowBegin, WindowEnd>> &window_hooks() {
++    static std::vector<std::pair<WindowBegin, WindowEnd>> hooks;
++    return hooks;
++}
++} // namespace
++
++void add_window_hooks(WindowBegin begin, WindowEnd end) { window_hooks().emplace_back(begin, end); }
++void window_begin() {
++    for (const auto &hook : window_hooks())
++        if (hook.first != nullptr) hook.first();
++}
++void window_end(std::uint64_t flips) {
++    for (const auto &hook : window_hooks())
++        if (hook.second != nullptr) hook.second(flips);
++}
++
++namespace {
++ReportSink g_sink = nullptr;
++}
++void set_report_sink(ReportSink sink) noexcept { g_sink = sink; }
++ReportSink report_sink() noexcept { return g_sink; }
++
++void out(const char *format, ...) {
++    char text[512];
++    va_list args;
++    va_start(args, format);
++    std::vsnprintf(text, sizeof text, format, args);
++    va_end(args);
++    std::fputs(text, stdout);
++    if (const char *path = portablekit::env("BENCH_OUT"); path != nullptr && *path != '\0') {
++        if (std::FILE *file = std::fopen(path, "a")) {
++            std::fputs(text, file);
++            std::fclose(file);
++        }
++    }
++    if (g_sink != nullptr) g_sink(text);
++}
++
++void count_draw() noexcept { ++state().draws; }
++void count_list() noexcept { ++state().lists; }
++
++Totals totals() noexcept {
++    State &s = state();
++    Totals t;
++    if (g_on) set_slow(s.cur);  // close the open interval
++    t.ns = s.ns;
++    t.calls = s.calls;
++    t.used = s.used;
++    t.draws = s.draws;
++    t.lists = s.lists;
++    t.now_ns = s.last_ns;
++    return t;
++}
++
++const char *category_name(std::uint32_t cat) noexcept {
++    static const char *const fixed[] = {"guest code", "GE list walk", "vertex decode", "GL submission", "present/upload",
++                                        "idle", "kernel scheduler", "SAS render", "ATRAC decode",
++                                        "movie decode"};
++    if (cat < kFixedCats) return fixed[cat];
++    State &s = state();
++    const std::uint32_t index = cat - kFixedCats;
++    if (index < s.names.size()) return s.names[index].c_str();
++    return "?";
++}
++
++} // namespace portablekit::bench
+diff --git a/host/perf/bench.hpp b/host/perf/bench.hpp
+new file mode 100644
+index 0000000..8198619
+--- /dev/null
++++ b/host/perf/bench.hpp
+@@ -0,0 +1,100 @@
++#pragma once
++
++#include <array>
++#include <cstdarg>
++#include <cstdint>
++#include <string_view>
++
++// Where the wall time of a run goes, by category: the guest's own code (recompiled or interpreted),
++// each HLE library, the GE list walk, vertex decoding, the renderer's draw submission, presenting, and
++// time spent idle. One category is current at any moment; switching adds the time since the last switch
++// to the category that was current, so nested scopes (a draw inside the GE walk inside an HLE call)
++// are exclusive of each other and the categories add up to the run's wall time.
++//
++// It is for measurement: <prefix>_BENCH=flips:N[,from:F] switches it on (see bringup_stats.hpp). Off, a
++// scope costs one test of a flag.
++namespace portablekit::bench {
++
++enum Cat : std::uint32_t {
++    Guest = 0,    // guest code, lean or interpreted, and the glue around it
++    Ge,           // walking display lists (GeState::execute), draws and decode excluded
++    Decode,       // reading a draw's indices and decoding its vertices
++    Gl,           // the renderer's handling of a draw (Renderer::submit)
++    Present,      // upload, write-back and present at the flip
++    Idle,         // the kernel waiting: realtime sleeps and frame pacing
++    Kernel,       // the scheduler between threads (timers, interrupts' bookkeeping)
++    SasRender,    // SAS voice mixing (sceSasCore core render), taken out of the HLE library it runs in
++    AtracDecode,  // ATRAC3/ATRAC3plus frame decoding (libavcodec), taken out of the HLE library it runs in
++    MovieDecode,  // H.264 picture decoding of the movie player, taken out of the HLE library it runs in
++    kFixedCats,   // HLE libraries follow
++    kMaxCats = 48,
++};
++
++extern bool g_on;
++void set_slow(std::uint32_t cat) noexcept;
++[[nodiscard]] std::uint32_t current() noexcept;
++
++[[nodiscard]] inline bool on() noexcept { return g_on; }
++inline void set(std::uint32_t cat) noexcept {
++    if (g_on) set_slow(cat);
++}
++
++class Scope {
++public:
++    explicit Scope(std::uint32_t cat) noexcept : on_(g_on) {
++        if (on_) {
++            previous_ = current();
++            set_slow(cat);
++        }
++    }
++    ~Scope() {
++        if (on_) set_slow(previous_);
++    }
++    Scope(const Scope &) = delete;
++    Scope &operator=(const Scope &) = delete;
++
++private:
++    std::uint32_t previous_{};
++    bool on_;
++};
++
++// The category of an HLE library, made on first use.
++[[nodiscard]] std::uint32_t library_category(std::string_view library) noexcept;
++// An HLE call began: the library's time starts.
++inline void enter_library(std::string_view library) noexcept {
++    if (g_on) set_slow(library_category(library));
++}
++
++// Extra counters of the game's port for the bench window (the lean call counter of the Infected port
++// prints its own lines): `begin` runs when the window opens, `end` when it closes, with the flips in it.
++using WindowBegin = void (*)();
++using WindowEnd = void (*)(std::uint64_t flips);
++void add_window_hooks(WindowBegin begin, WindowEnd end);
++void window_begin();
++void window_end(std::uint64_t flips);
++
++// Where the report lines also go (one call per line, newline included), besides stdout and <prefix>_BENCH_OUT.
++using ReportSink = void (*)(const char *line);
++void set_report_sink(ReportSink sink) noexcept;
++[[nodiscard]] ReportSink report_sink() noexcept;
++
++// printf-style report line: stdout, the file named by <prefix>_BENCH_OUT (appended), and the sink.
++void out(const char *format, ...) __attribute__((format(printf, 1, 2)));
++
++void enable() noexcept;
++void count_draw() noexcept;
++void count_list() noexcept;
++
++struct Totals {
++    std::array<std::uint64_t, kMaxCats> ns{};     // wall time per category
++    std::array<std::uint64_t, kMaxCats> calls{};  // HLE calls per library category
++    std::uint32_t used{};                         // categories in use
++    std::uint64_t draws{};
++    std::uint64_t lists{};
++    std::uint64_t now_ns{};                       // the clock these were read at
++};
++// Closes the open interval and copies the totals.
++[[nodiscard]] Totals totals() noexcept;
++[[nodiscard]] const char *category_name(std::uint32_t cat) noexcept;
++
++} // namespace portablekit::bench
+diff --git a/host/perf/bringup_stats.cpp b/host/perf/bringup_stats.cpp
+index 5b9fbd7..1333911 100644
+--- a/host/perf/bringup_stats.cpp
++++ b/host/perf/bringup_stats.cpp
+@@ -1,15 +1,19 @@
+ #include "perf/bringup_stats.hpp"
+ 
++#include "perf/bench.hpp"
+ #include "perf/debug_raster.hpp"
+ #include "profile.hpp"
+ #include "kernel/kernel.hpp"
++#include "hle/hle_common.hpp"
+ 
+ #include "psprecomp/common.hpp"
++#include "psprecomp/exec.hpp"
+ #include "psprecomp/interpreter.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
++#include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -118,6 +122,20 @@ struct State {
+     std::uint64_t trace_from_flip{};
+     std::string trace_thread;
+     std::uint64_t trace_from_us{};
++    // <prefix>_CALL_LOG=file: one line per import call (sequence, thread, stub address, a0..a3, emulated us, flip),
++    // in the order the guest makes them; <prefix>_CALL_LOG_LIMIT=N stops after N lines. Two runs of the same
++    // game state (virtual clock, no busy clock, no CPU time per instruction) have equal logs unless the
++    // guest code computed something differently: the first line that differs names the call.
++    std::FILE *call_log{};
++    // The line of the call in progress; written when the next call begins, with the arguments its
++    // handler read (g_hle_arg_mask), so that arguments it never looked at are not compared.
++    char call_pending[160]{};
++    std::uint32_t call_pending_args[4]{};
++    bool call_has_pending{};
++    std::uint64_t call_log_seq{};
++    std::uint64_t call_pending_time{};
++    std::uint64_t call_log_limit{};
++    bool call_log_args{true};
+     std::unordered_map<std::string, std::uint64_t> trace_seen;
+     // Traced calls whose result has not been printed yet, by thread.
+     std::unordered_map<std::int32_t, std::string> pending_result;
+@@ -144,6 +162,31 @@ struct State {
+     std::uint64_t all_lists{};
+     std::uint64_t all_draws{};
+     std::uint64_t all_vertices{};
++
++    // <prefix>_BENCH=flips:N[,from:F]: N flips from flip F, timed by category (perf/bench.hpp).
++    bool bench{};
++    bool bench_open{};
++    bool bench_done{};
++    std::uint64_t bench_from{};
++    std::uint64_t bench_flips{};
++    bench::Totals bench_t0;
++    psprecomp::ExecStats bench_x0{};
++    std::uint64_t bench_dispatch0{};
++    std::uint64_t bench_emu0{};
++    std::uint64_t bench_last_flip_ns{};
++    std::vector<double> bench_flip_ms;
++
++    // <prefix>_PACE_LOG=N: a line every N flips with the real and emulated time they took (is the game paced?).
++    std::uint64_t pace_every{};
++    std::uint64_t pace_flip0{};
++    Clock::time_point pace_wall0{};
++    Clock::time_point pace_wall_prev{};
++    std::uint64_t pace_emu0{};
++    double pace_max_gap_ms{};
++    double pace_min_gap_ms{1e9};
++    std::uint64_t pace_late{};  // flips more than 25 ms after the one before
++    double pace_prev_wall_ms{};
++    std::uint64_t pace_prev_emu_us{};
+ };
+ 
+ State &state() {
+@@ -217,9 +260,34 @@ std::string hex(std::uint32_t value) {
+ // ---------------------------------------------------------------------------
+ // Import calls
+ 
++// Writes the pending call: its arguments are printed only if its handler read them ('-' otherwise).
++void call_log_flush(State &s) {
++    if (!s.call_has_pending) return;
++    s.call_has_pending = false;
++    std::fputs(s.call_pending, s.call_log);
++    for (int i = 0; i < 4; ++i) {
++        if ((portablekit::g_hle_arg_mask >> i) & 1u) std::fprintf(s.call_log, "%08X ", s.call_pending_args[i]);
++        else std::fputs("-------- ", s.call_log);
++    }
++    std::fprintf(s.call_log, "%llu %llu %X\n", static_cast<unsigned long long>(s.call_pending_time),
++                 static_cast<unsigned long long>(s.flip), portablekit::g_hle_arg_mask);
++}
++
+ void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint32_t nid, psprecomp::AllegrexContext &ctx) {
+     State &s = state();
++    bench::enter_library(library);
+     if ((++s.hook_calls & 0x3FFu) == 0u) check_limits(runtime);
++    if (s.call_log != nullptr) {
++        call_log_flush(s);
++        if (s.call_log_limit == 0u || s.call_log_seq < s.call_log_limit) {
++            std::snprintf(s.call_pending, sizeof s.call_pending, "%llu %s %08X ",
++                          static_cast<unsigned long long>(s.call_log_seq++), psprecomp::runtime_thread_name(), ctx.pc);
++            for (int i = 0; i < 4; ++i) s.call_pending_args[i] = ctx.gpr[4 + i];
++            s.call_has_pending = true;
++            s.call_pending_time = kernel().now_us();
++            portablekit::g_hle_arg_mask = 0u;
++        }
++    }
+     if (!s.trace_words.empty()) {
+         std::string id(library);
+         id += '|';
+@@ -263,6 +331,8 @@ void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint
+ // Prints the result of a traced call: `[ret]` with the thread, the import and v0 and v1.
+ void post_import(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+     State &s = state();
++    bench::set(bench::Guest);
++    if (s.pending_result.empty()) return;
+     const auto pending = s.pending_result.find(psprecomp::runtime_thread_uid());
+     if (pending == s.pending_result.end()) return;
+     std::printf("[ret]  %10llu us                    %-14s %s v0=%08X v1=%08X\n",
+@@ -438,6 +508,115 @@ void flush_phase(const std::string &phase) {
+     if (s.ge != nullptr) s.ge_total.commands_at_start = s.ge->command_counts();
+ }
+ 
++// ---------------------------------------------------------------------------
++// <prefix>_BENCH
++
++double percentile(std::vector<double> values, double fraction) {
++    if (values.empty()) return 0.0;
++    std::sort(values.begin(), values.end());
++    const std::size_t index = std::min(values.size() - 1u, static_cast<std::size_t>(fraction * static_cast<double>(values.size())));
++    return values[index];
++}
++
++void bench_report(State &s, const char *why) {
++    const bench::Totals t = bench::totals();
++    const std::uint64_t flips = s.bench_flip_ms.size();
++    if (flips == 0u) {
++        bench::out("[bench] no flips measured (%s)\n", why);
++        return;
++    }
++    const double n = static_cast<double>(flips);
++    const double window_ms = static_cast<double>(t.now_ns - s.bench_t0.now_ns) / 1e6;
++    const std::uint64_t emu_us = kernel().now_us() - s.bench_emu0;
++    std::vector<double> frame_ms = s.bench_flip_ms;
++    double total_flip_ms = 0.0;
++    for (double v : frame_ms) total_flip_ms += v;
++    bench::out("[bench] %s: %llu flips from flip %llu, %.1f ms wall, %.3f ms per flip (median %.3f, p95 %.3f, max %.3f), "
++                "%.2f s of emulated time (%.2fx real time)\n",
++                why, static_cast<unsigned long long>(flips), static_cast<unsigned long long>(s.bench_from), window_ms,
++                window_ms / n, percentile(frame_ms, 0.5), percentile(frame_ms, 0.95), percentile(frame_ms, 1.0),
++                static_cast<double>(emu_us) / 1e6, window_ms > 0.0 ? static_cast<double>(emu_us) / 1e3 / window_ms : 0.0);
++    // Time per category over the window.
++    struct Row { std::string name; double ms; std::uint64_t calls; };
++    std::vector<Row> libraries;
++    double hle_ms = 0.0;
++    std::uint64_t hle_calls = 0u;
++    double fixed_ms[bench::kFixedCats] = {};
++    for (std::uint32_t c = 0; c < t.used; ++c) {
++        const double ms = static_cast<double>(t.ns[c] - s.bench_t0.ns[c]) / 1e6;
++        const std::uint64_t calls = t.calls[c] - s.bench_t0.calls[c];
++        if (c < bench::kFixedCats) {
++            fixed_ms[c] = ms;
++        } else {
++            hle_ms += ms;
++            hle_calls += calls;
++            libraries.push_back({bench::category_name(c), ms, calls});
++        }
++    }
++    std::sort(libraries.begin(), libraries.end(), [](const Row &a, const Row &b) { return a.ms > b.ms; });
++    const double total = window_ms > 0.0 ? window_ms : 1.0;
++    bench::out("[bench] wall time per flip by category (ms, share of the window):\n");
++    const auto line = [&](const char *name, double ms) {
++        bench::out("[bench]   %-34s %8.3f  %5.1f%%\n", name, ms / n, 100.0 * ms / total);
++    };
++    line("guest code (lean + glue)", fixed_ms[bench::Guest]);
++    line("HLE, all libraries (excl. decode rows below)", hle_ms);
++    line("GE list walk", fixed_ms[bench::Ge]);
++    line("vertex decode", fixed_ms[bench::Decode]);
++    line("GL submission", fixed_ms[bench::Gl]);
++    line("present / upload / write-back", fixed_ms[bench::Present]);
++    line("idle (waiting, pacing)", fixed_ms[bench::Idle]);
++    line("kernel scheduler", fixed_ms[bench::Kernel]);
++    line("audio: SAS render", fixed_ms[bench::SasRender]);
++    line("audio: ATRAC decode", fixed_ms[bench::AtracDecode]);
++    line("movie: H.264 decode", fixed_ms[bench::MovieDecode]);
++    bench::out("[bench] HLE by library (ms per flip, calls per flip, microseconds per call):\n");
++    for (const Row &row : libraries) {
++        if (row.calls == 0u && row.ms < 0.0005) continue;
++        bench::out("[bench]   %-34s %8.3f  %8.1f  %8.2f\n", row.name.c_str(), row.ms / n,
++                    static_cast<double>(row.calls) / n, row.calls != 0u ? row.ms * 1e3 / static_cast<double>(row.calls) : 0.0);
++    }
++    const psprecomp::ExecStats x = psprecomp::exec_stats();
++    const double lean = static_cast<double>(x.lean_calls - s.bench_x0.lean_calls);
++    const double interp = static_cast<double>(x.interpreted_calls - s.bench_x0.interpreted_calls);
++    const double native = static_cast<double>(x.native_calls - s.bench_x0.native_calls);
++    const double hle = static_cast<double>(x.hle_calls - s.bench_x0.hle_calls);
++    const double dispatch = static_cast<double>(kernel().thread_dispatches() - s.bench_dispatch0);
++    bench::out("[bench] per flip: pk_hle_call %.1f, pk_guest_call lean %.1f, interpreted entries %.1f, native entries %.1f, "
++                "guest thread dispatches %.1f, display lists %.1f, draws %.1f\n",
++                hle / n, lean / n, interp / n, native / n, dispatch / n,
++                static_cast<double>(t.lists - s.bench_t0.lists) / n, static_cast<double>(t.draws - s.bench_t0.draws) / n);
++    (void)hle_calls;
++    bench::window_end(flips);
++    std::fflush(stdout);
++}
++
++void bench_on_flip(State &s, psprecomp::Runtime &runtime) {
++    if (s.bench_done) return;
++    const bench::Totals t = bench::totals();
++    if (!s.bench_open) {
++        if (s.flip < s.bench_from) return;
++        // The window starts at the end of flip `from`.
++        s.bench_open = true;
++        s.bench_t0 = t;
++        s.bench_x0 = psprecomp::exec_stats();
++        s.bench_dispatch0 = kernel().thread_dispatches();
++        s.bench_emu0 = kernel().now_us();
++        s.bench_last_flip_ns = t.now_ns;
++        s.bench_flip_ms.clear();
++        s.bench_flip_ms.reserve(s.bench_flips);
++        bench::window_begin();
++        return;
++    }
++    s.bench_flip_ms.push_back(static_cast<double>(t.now_ns - s.bench_last_flip_ns) / 1e6);
++    s.bench_last_flip_ns = t.now_ns;
++    if (s.bench_flip_ms.size() >= s.bench_flips) {
++        bench_report(s, "bench window");
++        s.bench_done = true;
++        runtime.stop("bench complete");
++    }
++}
++
+ } // namespace
+ 
+ bool enabled() { return state().stats; }
+@@ -467,7 +646,36 @@ void install(psprecomp::Runtime &runtime, const gpu::GeState &ge) {
+     s.max_frames = env_number("MAX_FRAMES");
+     s.max_wall_ms = static_cast<std::int64_t>(env_number("MAX_WALL")) * 1000;
+     s.max_emu_us = env_number("MAX_EMU") * 1'000'000u;
+-    if (const char *script = portablekit::env("PAD_SCRIPT"); script != nullptr) parse_pad_script(s, script);
++    if (const char *script = portablekit::env("PAD_SCRIPT"); script != nullptr) {
++        // <prefix>_PAD_SCRIPT=@file reads the script from a file (newlines count as commas).
++        if (script[0] == '@') {
++            std::ifstream in(script + 1);
++            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++            for (char &c : text)
++                if (c == '\n' || c == '\r') c = ',';
++            if (!in && text.empty()) std::cerr << "cannot read the pad script " << (script + 1) << "\n";
++            parse_pad_script(s, text.c_str());
++        } else {
++            parse_pad_script(s, script);
++        }
++    }
++    s.pace_every = env_number("PACE_LOG");
++    if (const char *bench_spec = portablekit::env("BENCH"); bench_spec != nullptr && *bench_spec != '\0') {
++        // flips:N[,from:F]
++        s.bench_from = 0u;
++        s.bench_flips = 0u;
++        for (const std::string &item : split(bench_spec, ',')) {
++            if (item.rfind("flips:", 0) == 0) s.bench_flips = std::strtoull(item.c_str() + 6, nullptr, 10);
++            else if (item.rfind("from:", 0) == 0) s.bench_from = std::strtoull(item.c_str() + 5, nullptr, 10);
++        }
++        if (s.bench_flips == 0u) {
++            std::cerr << portablekit::env_name("BENCH") << " needs flips:N (and optionally from:F)\n";
++        } else {
++            s.bench = true;
++            bench::enable();
++            std::cout << "Bench: " << s.bench_flips << " flips from flip " << s.bench_from << "\n";
++        }
++    }
+     if (const char *calls = portablekit::env("TRACE_CALLS"); calls != nullptr && *calls != '\0') {
+         std::string list = calls;
+         if (const std::size_t colon = list.find(':'); colon != std::string::npos) {
+@@ -479,9 +687,15 @@ void install(psprecomp::Runtime &runtime, const gpu::GeState &ge) {
+         s.trace_from_us = env_number("TRACE_FROM_EMU") * 1'000'000u;
+         if (const char *thread = portablekit::env("TRACE_THREAD"); thread != nullptr) s.trace_thread = thread;
+     }
+-    if (s.stats || !s.trace_words.empty() || s.max_frames != 0u || s.max_wall_ms != 0 || s.max_emu_us != 0u) {
++    if (const char *log = portablekit::env("CALL_LOG"); log != nullptr && *log != '\0') {
++        s.call_log = std::fopen(log, "w");
++        if (s.call_log == nullptr) std::cerr << "cannot open " << log << " for the call log\n";
++        s.call_log_limit = env_number("CALL_LOG_LIMIT");
++        if (s.call_log != nullptr) std::setvbuf(s.call_log, nullptr, _IOFBF, 1u << 20);
++    }
++    if (s.call_log != nullptr || s.stats || s.bench || s.pace_every != 0u || !s.trace_words.empty() || s.max_frames != 0u || s.max_wall_ms != 0 || s.max_emu_us != 0u) {
+         psprecomp::set_runtime_pre_import_hook(&pre_import);
+-        if (!s.trace_words.empty()) psprecomp::set_runtime_post_import_hook(&post_import);
++        if (!s.trace_words.empty() || s.bench) psprecomp::set_runtime_post_import_hook(&post_import);
+         s.hooked = true;
+     }
+     if (s.stats)
+@@ -503,9 +717,47 @@ void check_limits(psprecomp::Runtime &runtime) {
+         runtime.stop("emulated-time limit (" + portablekit::env_name("MAX_EMU") + ")");
+ }
+ 
++void pace_on_flip(State &s) {
++    const Clock::time_point now = Clock::now();
++    if (s.pace_flip0 == 0u && s.flip == 1u) {
++        s.pace_wall0 = s.pace_wall_prev = now;
++        s.pace_emu0 = kernel().now_us();
++        s.pace_flip0 = 1u;
++        return;
++    }
++    const double gap_ms = std::chrono::duration<double, std::milli>(now - s.pace_wall_prev).count();
++    s.pace_wall_prev = now;
++    s.pace_max_gap_ms = std::max(s.pace_max_gap_ms, gap_ms);
++    s.pace_min_gap_ms = std::min(s.pace_min_gap_ms, gap_ms);
++    if (gap_ms > 25.0) ++s.pace_late;
++    if (s.flip % s.pace_every != 0u) return;
++    const double wall_ms = std::chrono::duration<double, std::milli>(now - s.pace_wall0).count();
++    const std::uint64_t emu_us = kernel().now_us();
++    const std::uint64_t flips = s.flip - s.pace_flip0;
++    bench::out("[pace] flip %llu: %.2f s real, %.2f s emulated; last %llu flips %.1f ms real %.1f ms emulated = %.2f flips/s; "
++               "flip gap min %.1f max %.1f ms, %llu gaps over 25 ms\n",
++               static_cast<unsigned long long>(s.flip), wall_ms / 1e3, static_cast<double>(emu_us) / 1e6,
++               static_cast<unsigned long long>(s.pace_every), wall_ms - s.pace_prev_wall_ms,
++               static_cast<double>(emu_us - s.pace_prev_emu_us) / 1e3,
++               static_cast<double>(s.pace_every) * 1e3 / std::max(1e-3, wall_ms - s.pace_prev_wall_ms), s.pace_min_gap_ms,
++               s.pace_max_gap_ms, static_cast<unsigned long long>(s.pace_late));
++    (void)flips;
++    s.pace_prev_wall_ms = wall_ms;
++    s.pace_prev_emu_us = emu_us;
++    s.pace_max_gap_ms = 0.0;
++    s.pace_min_gap_ms = 1e9;
++    s.pace_late = 0u;
++}
++
+ void on_flip(psprecomp::Runtime &runtime, std::uint32_t framebuffer, std::uint32_t pixel_format) {
+     State &s = state();
+     ++s.flip;
++    if (s.pace_every != 0u) pace_on_flip(s);
++    if (s.bench) bench_on_flip(s, runtime);
++    if (s.call_log != nullptr) {
++        call_log_flush(s);
++        std::fflush(s.call_log);
++    }
+     raster::flip(s.flip, framebuffer, pixel_format);
+     if (!s.hooked) return;
+     if (s.stats) {
+@@ -660,6 +912,12 @@ void finish() {
+     State &s = state();
+     if (s.finished) return;
+     s.finished = true;
++    if (s.bench && !s.bench_done && s.bench_open) bench_report(s, "bench window cut short");
++    if (s.call_log != nullptr) {
++        call_log_flush(s);
++        std::fclose(s.call_log);
++        s.call_log = nullptr;
++    }
+     if (!s.stats) return;
+     flush_phase(s.final_name);
+     std::cerr << "[stats] " << s.flip << " flips, " << s.total_calls << " import calls in all\n";

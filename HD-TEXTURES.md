@@ -12,12 +12,21 @@ model**, not Vita software. Do not copy its `.pth` file to the console.
    as the model.
 3. Claude's recovered texture builder uses
    `texpack-work/models/4xHDCube4Compact.pth` by default. Supply your own
-   supported ISO to `proj/tools/texpack/build_packs.sh`; its model-fetching
+   supported ISO to `tools/texpack/build_packs.sh`; its model-fetching
    step obtains the required models directly from their authors.
 
-The builder and its guide have been recovered from the October 10 source
-bundle. They are being checked against the current runtime before inclusion
-here; this draft does not yet supply a verified one-click HD builder.
+The current builder is included. From the repository root, first prepare
+PortableKit using [Building](BUILDING.md), then run:
+
+```sh
+tools/texpack/build_packs.sh /path/to/Infected.iso
+```
+
+It creates a local Python environment, fetches the models directly from their
+authors with checksum checks, and writes packs under `texpack-work/packs/`.
+It can take hours. See [Texture Tools](tools/texpack/README.md) for dependencies
+and resumable processing. The complete HD build has not been rerun as part
+of this source import; Apple Silicon remains unverified.
 
 Permission to bundle the model has been
 [requested](https://github.com/Venomalia/HDcube/issues/5), not granted. Once
@@ -29,7 +38,8 @@ from the author and follow the [model license](https://github.com/Venomalia/HDcu
 
 1. Exit Infected and back up any existing pack/settings.
 2. Copy your compatible generated pack into **`ux0:data/infected/`**, keeping
-   its exact name: `texpack_2x.bin`, or `texpack_4x.bin` for the mixed Vita pack.
+   its exact name: use generated `texpack_2x.bin` as-is. For the mixed Vita
+   pack, copy `texpack_4x_mixed.bin` and name the copy `texpack_4x.bin`.
 3. Reopen Infected and check its HD texture setting. The recovered console
    uses `gfx.hd_textures=auto`; its log confirms a 2x pack loads. Selection of
    the mixed pack and the current preparation workflow still need testing.

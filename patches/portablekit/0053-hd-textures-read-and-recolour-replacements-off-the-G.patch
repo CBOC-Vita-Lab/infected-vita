@@ -1,0 +1,832 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 23:08:17 +0000
+Subject: [PATCH] hd textures: read and recolour replacements off the GL thread
+
+Each new HD texture on screen was a hitch on the Vita's GL thread: 5-60 ms
+reading its blob from the memory card, 10-15 ms waiting for the GPU between
+mip levels, and 50 ms for a recoloured character (one per enemy that came
+into view). The 1 % low frame rate of a mission was 6-9 fps.
+
+- A loader thread per pack (HdConfig::async_load, <PREFIX>_HD_ASYNC=0 to
+  turn it off) reads blobs through its own handle and builds recolours
+  (decode, the palette the texture had when asked, the mip chain). The
+  texture is drawn with its original meanwhile and the GL thread uploads
+  the result at its next draw (GlHdTextures::ready). Results nobody claims
+  are dropped past 8 MiB. The replayer keeps the old behaviour, so a replay
+  still has every replacement from its first frame.
+- The pack's index stays in RAM whole (32 bytes a texture): a lookup reads
+  no file. The file is unbuffered: a blob is one seek and one read, where a
+  buffered stream read it in BUFSIZ pieces.
+- glp::reserve_compressed_mips (vitaGL patch 0004 in the Vita port): level 0
+  of a compressed chain reserves the chain, so the levels go in place and
+  the uploader no longer calls sceGxmTransferFinish between them.
+- gl_timing logs a texture upload over 3 ms ([gl-time] slow texture upload:
+  address, size, format, HD or not, and for a replacement the read and GPU
+  wait), each texture at its 1st, 2nd, 4th... slow upload.
+
+On the console: GPU waits of an HD upload 10-15 ms -> 0, a recolour on the
+GL thread 50 ms -> 4-11 ms (the upload), 1 % low 6-9 -> 13-15 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 13b379f..83046a0 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -104,6 +104,14 @@ to 3.0 million instructions a frame and the walk from 6.0 to 3.5 million. Every
+ What is left per GL draw is vitaGL's `glDrawElements` (about 15 µs on the console before this work, measured with
+ `gl_timing`), which no change here touches.
+ 
++On the console the split renderer then showed what the instruction counts cannot: system calls. An event signal
++is a `sceKernelSetEventFlag` (3.9 µs, measured at start-up: the `costs:` line) and a clock read 0.7 µs, and the
++ring between the walker and the GL thread signalled twice a draw and read the clock twice a job. `GeWorker` now
++signals only a thread that may be asleep (a flag set before its last look at the ring), and a thread's busy time
++is the frame less its sleeps (`WalkIdle`, `GlIdle`), not the sum of timed jobs. Mission 1 went from 25 to about
++30 fps with no other change. With `gl_null_draw=1` (no draw calls, no GPU work) it runs at 36 fps with the GL
++thread 60 % busy: vitaGL's draw calls, with the state they flush, are about 13 ms of the GL thread's frame.
++
+ ## Settings that matter on a Vita
+ 
+ `display_scale` (2 = 960x544), `offscreen_scale` (1), `no_blend_color` (on), `depth_bits` (16), `writeback` (0),
+@@ -210,6 +218,16 @@ every use:
+ 
+ `texture_always_validate=1` is the old behaviour (hash and compare on every use) for comparison.
+ 
++**HD replacements are read off the GL thread** (`HdConfig::async_load`, `<PREFIX>_HD_ASYNC=0` turns it off; the
++replayer always turns it off, so a replay has every replacement from its first frame). The first time a texture
++with a replacement is drawn, its original is uploaded and the pack's loader thread is asked for the replacement:
++it reads the blob through its own handle of the pack and, for a recolour record, also decodes the image, applies
++the palette the texture had when it was asked for and builds the mip chain. At the texture's next draw after
++that (`GlHdTextures::ready`), the GL thread uploads the result. On the Vita a blob read from the memory card cost
++5-60 ms and a recolour 50 ms (one hitch per enemy that came on screen); the upload left on the GL thread is
++3-5 ms. The pack's whole index stays in RAM (32 bytes a texture) and the file is unbuffered, so a read is one
++seek and one read, and the index costs no file access at all.
++
+ Numbers are in "Cost report" below.
+ 
+ ## Recording and replaying frames
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 51078e1..8e4e551 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -5,10 +5,17 @@
+ #include "gl_platform.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstring>
++#include <deque>
+ #include <iostream>
++#include <mutex>
+ #include <sstream>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
+ 
+ #ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+ #define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
+@@ -102,9 +109,95 @@ void decode_dxt_level(HdFormat format, const std::uint8_t *data, std::uint32_t w
+ 
+ } // namespace
+ 
++// ---- the loader thread (HdConfig::async_load) ---------------------------------------------------------------------
++// The GL thread asks for a record's blob and goes on drawing the original; the loader reads it through a handle of its
++// own and leaves it for the GL thread, which uploads it at the texture's next draw (GlHdTextures::ready, upload). Only
++// the reading moves: the upload stays on the GL thread, which owns the GL context.
++struct GlHdTextures::Loader {
++    // What the GL thread asks for: a record's blob, or a recoloured picture (the record of the image, rebuilt for the
++    // palette the texture had when it was asked for).
++    struct Job {
++        HdRecord record;
++        std::uint64_t key{};               // the record's key, or for a recolour the texture's full key (one per palette)
++        bool recolour{};
++        TextureState state;                // a recolour: the palette's format, shift, mask and offset
++        std::vector<std::uint8_t> clut;    // a recolour: the palette's bytes
++    };
++    struct Read {
++        std::vector<std::uint8_t> blob;        // a record's blob
++        std::vector<std::uint32_t> levels;     // a recolour: every mip level, level 0 first
++        std::uint32_t width{}, height{};
++        bool ok{};
++        [[nodiscard]] std::size_t bytes() const noexcept { return blob.size() + levels.size() * 4u; }
++    };
++    // Results not claimed yet are dropped past this (a texture that left the screen before its replacement came).
++    static constexpr std::size_t kKeptBytes = 8u * 1024u * 1024u;
++
++    const HdPackFile &pack;
++    std::FILE *file{};
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::deque<Job> queue;                            // asked, not done yet
++    std::unordered_set<std::uint64_t> asked;          // keys queued, being done, or done and not claimed
++    std::unordered_map<std::uint64_t, Read> done;     // done, not claimed
++    std::deque<std::uint64_t> done_order;             // oldest first, for the cap
++    std::size_t done_bytes{};
++    std::atomic<std::uint32_t> done_count{0u};        // done.size(), read without the lock
++    bool stopping{};
++    std::thread thread;
++
++    explicit Loader(const HdPackFile &source) : pack(source), file(source.open_reader()) {
++        if (file != nullptr) thread = std::thread([this] { run(); });
++    }
++    ~Loader() {
++        {
++            const std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++        }
++        wake.notify_all();
++        if (thread.joinable()) thread.join();
++        if (file != nullptr) std::fclose(file);
++    }
++    [[nodiscard]] bool running() const noexcept { return file != nullptr; }
++
++    void request(Job job) {
++        {
++            const std::lock_guard<std::mutex> lock(mutex);
++            if (!asked.insert(job.key).second) return;
++            queue.push_back(std::move(job));
++        }
++        wake.notify_one();
++    }
++    [[nodiscard]] bool has(std::uint64_t key) {
++        if (done_count.load(std::memory_order_acquire) == 0u) return false;
++        const std::lock_guard<std::mutex> lock(mutex);
++        return done.count(key) != 0u;
++    }
++    // The result for `key` if it is done (it leaves the loader).
++    bool take(std::uint64_t key, Read &out) {
++        if (done_count.load(std::memory_order_acquire) == 0u) return false;
++        const std::lock_guard<std::mutex> lock(mutex);
++        const auto found = done.find(key);
++        if (found == done.end()) return false;
++        out = std::move(found->second);
++        done_bytes -= std::min(done_bytes, out.bytes());
++        done.erase(found);
++        asked.erase(key);
++        done_count.store(static_cast<std::uint32_t>(done.size()), std::memory_order_release);
++        return true;
++    }
++
++    void run();   // below, after the picture helpers
++    static void build_recolour(const Job &job, Read &read);
++};
++
+ GlHdTextures::GlHdTextures() = default;
+ GlHdTextures::~GlHdTextures() = default;
+ 
++bool GlHdTextures::ready(const HdTextureInfo &info) {
++    return info.pending && loader_ != nullptr && loader_->has(info.key);
++}
++
+ void GlHdTextures::configure(const HdConfig &config) {
+     config_ = config;
+     settings_generation_ = port::settings().generation();
+@@ -119,6 +212,7 @@ void GlHdTextures::configure(const HdConfig &config) {
+ }
+ 
+ void GlHdTextures::open_pack() {
++    loader_.reset();   // before the pack it reads from
+     pack_.close();
+     missing_logged_ = false;
+     if (config_.mode == HdMode::Off) return;
+@@ -128,6 +222,12 @@ void GlHdTextures::open_pack() {
+     if (!pack_.open(path, error)) {
+         if (config_.log) std::cerr << "[hdtex] " << error << "; the original textures are used\n";
+         missing_logged_ = true;
++    } else if (config_.async_load) {
++        loader_ = std::make_unique<Loader>(pack_);
++        if (!loader_->running()) {
++            if (config_.log) std::cerr << "[hdtex] cannot open a second handle of " << path.string() << ": replacements are read on the GL thread\n";
++            loader_.reset();
++        }
+     }
+ #if defined(__vita__)
+     // The Vita's 4x pack is the MIXED one (4x world and effects, 2x characters and UI, about 98 MB), installed as texpack_4x.bin. The full
+@@ -172,6 +272,7 @@ bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, co
+                                std::uint64_t &gpu_bytes, std::uint8_t &levels) {
+     if (!s3tc_known_) {
+         s3tc_known_ = true;
++        levels_in_place_ = glp::reserve_compressed_mips();
+ #if defined(__vita__)
+         s3tc_ = true;
+ #else
+@@ -223,8 +324,16 @@ bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, co
+         }
+ #if defined(__vita__)
+         // vitaGL swizzles a compressed level with an asynchronous sceGxmTransferCopy and grows the buffer for the next level with a
+-        // realloc that may move (and free) it: wait for the transfer first, or it lands in freed memory.
+-        if (record.format != HdFormat::Rgba8) (void)sceGxmTransferFinish();
++        // realloc that may move (and free) it: wait for the transfer first, or it lands in freed memory. The wait is for whatever
++        // the GPU is doing (10 to 15 ms an HD texture in play); with the chain reserved (vitaGL patch 0004) the levels go in
++        // place, and vitaGL waits itself in the one case left where it must move the buffer.
++        if (record.format != HdFormat::Rgba8 && !levels_in_place_) {
++            const Clock::time_point wait_start = Clock::now();
++            (void)sceGxmTransferFinish();
++            const std::uint64_t waited = nanoseconds_since(wait_start);
++            stats_.gpu_wait_ns += waited;
++            stats_.last_gpu_wait_ns += waited;
++        }
+ #endif
+         offset += bytes;
+         ++uploaded;
+@@ -323,8 +432,122 @@ std::uint64_t palette_slot_key(const TextureState &state) {
+ 
+ } // namespace
+ 
++void GlHdTextures::Loader::build_recolour(const Job &job, Read &read) {
++    HdRecolour recolour;
++    if (!hd_parse_recolour(job.record, read.blob, recolour) || job.clut.empty()) return;
++    std::uint32_t palette[256];
++    read_palette(job.state, job.clut.data(), recolour.palette_entries, palette);
++    const std::uint32_t width = job.record.width, height = job.record.height;
++    const std::uint8_t *base_data = read.blob.data() + recolour.base_offset;
++    std::vector<std::uint32_t> base;
++    if (job.record.format == HdFormat::Rgba8) {
++        base.resize(static_cast<std::size_t>(width) * height);
++        std::memcpy(base.data(), base_data, base.size() * 4u);
++    } else {
++        decode_dxt_level(job.record.format, base_data, width, height, base);
++    }
++    std::vector<std::uint32_t> level(static_cast<std::size_t>(width) * height), next;
++    hd_apply_recolour(recolour, base.data(), palette, level.data());
++    // The chain the GL thread's recolour builds (GlHdTextures::try_recolour), level by level down to 1x1.
++    read.levels.clear();
++    std::uint32_t w = width, h = height;
++    for (;;) {
++        read.levels.insert(read.levels.end(), level.begin(), level.end());
++        if (w == 1u && h == 1u) break;
++        halve(level, w, h, next);
++        level.swap(next);
++        w = std::max(w / 2u, 1u);
++        h = std::max(h / 2u, 1u);
++    }
++    read.width = width;
++    read.height = height;
++    read.blob.clear();
++    read.ok = true;
++}
++
++void GlHdTextures::Loader::run() {
++    for (;;) {
++        Job job;
++        {
++            std::unique_lock<std::mutex> lock(mutex);
++            wake.wait(lock, [this] { return stopping || !queue.empty(); });
++            if (stopping) return;
++            job = std::move(queue.front());
++            queue.pop_front();
++        }
++        Read read;
++        read.ok = pack.read_blob_with(file, job.record, read.blob);
++        if (read.ok && job.recolour) {
++            read.ok = false;
++            build_recolour(job, read);
++        }
++        const std::lock_guard<std::mutex> lock(mutex);
++        done_bytes += read.bytes();
++        done[job.key] = std::move(read);
++        done_order.push_back(job.key);
++        while (done_bytes > kKeptBytes && !done_order.empty()) {
++            const std::uint64_t oldest = done_order.front();
++            done_order.pop_front();
++            const auto found = done.find(oldest);
++            if (found == done.end() || oldest == job.key) continue;
++            done_bytes -= std::min(done_bytes, found->second.bytes());
++            done.erase(found);
++            asked.erase(oldest);
++        }
++        if (done_order.size() > done.size() * 2u + 64u)   // keys claimed long ago
++            std::erase_if(done_order, [this](std::uint64_t key) { return done.count(key) == 0u; });
++        done_count.store(static_cast<std::uint32_t>(done.size()), std::memory_order_release);
++    }
++}
++
++bool GlHdTextures::upload_recoloured(std::uint32_t texture, const std::vector<std::uint32_t> &chain, std::uint32_t width,
++                                     std::uint32_t height, HdTextureInfo &info) {
++    if (bind_) bind_(texture);
++    else glBindTexture(GL_TEXTURE_2D, texture);
++    std::uint64_t gpu_bytes = 0u;
++    std::uint32_t levels = 0u, w = width, h = height;
++    std::size_t offset = 0u;
++    for (;;) {
++        const std::size_t texels = static_cast<std::size_t>(w) * h;
++        if (offset + texels > chain.size()) break;
++        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(levels), GL_RGBA, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, chain.data() + offset);
++        gpu_bytes += texels * 4u;
++        offset += texels;
++        ++levels;
++        if (w == 1u && h == 1u) break;
++        w = std::max(w / 2u, 1u);
++        h = std::max(h / 2u, 1u);
++    }
++    if (levels == 0u) return false;
++    ++stats_.recolour_hits;
++    ++stats_.hits;
++    info.replaced = true;
++    info.recoloured = true;
++    info.gpu_bytes = gpu_bytes;
++    info.width = static_cast<std::uint16_t>(width);
++    info.height = static_cast<std::uint16_t>(height);
++    info.mips = static_cast<std::uint8_t>(levels);
++    ++stats_.resident_textures;
++    stats_.resident_bytes += gpu_bytes;
++    stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
++    return true;
++}
++
+ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state,
+-                                HdTextureInfo &info) {
++                                HdTextureInfo &info, bool completing) {
++    // A recolour the loader thread has built (asked for when the texture was first drawn, see below): only the upload is
++    // left. It was counted by the animation guard when it was asked for.
++    if (completing && loader_ != nullptr) {
++        Loader::Read read;
++        if (loader_->take(info.key, read)) {
++            const Clock::time_point start = Clock::now();
++            const bool uploaded = read.ok && upload_recoloured(texture, read.levels, read.width, read.height, info);
++            if (!uploaded) ++stats_.upload_failed;
++            stats_.recolour_ns += nanoseconds_since(start);
++            return uploaded;
++        }
++    }
+     // The animation guard comes first: a slot that is held costs neither the image hash nor a read of the pack.
+     if (palette_slots_.size() >= kMaxPaletteSlots) palette_slots_.clear();
+     PaletteSlot guard_off;
+@@ -355,6 +578,25 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+     const std::uint64_t needed = static_cast<std::uint64_t>(record.width) * record.height * 4u * 4u / 3u;
+     if (!admit(needed)) return false;
+ 
++    const std::uint32_t clut_size = texture_clut_bytes_needed(state);
++    if (loader_ != nullptr) {
++        // The rebuild (read the image, decode it, recolour it, build its levels: 50 ms of the GL thread for a 512x256
++        // character on the console, a hitch at every enemy that came on screen) goes to the loader thread, with the
++        // palette as it is now. The original is drawn meanwhile; ready() says when to come back.
++        const std::uint8_t *clut = memory.raw_pointer(state.clut_address, clut_size);
++        if (clut == nullptr) return false;
++        Loader::Job job;
++        job.record = record;
++        job.key = info.key;
++        job.recolour = true;
++        job.state = state;
++        job.clut.assign(clut, clut + clut_size);
++        loader_->request(std::move(job));
++        info.pending = true;
++        ++stats_.async_reads;
++        return false;
++    }
++
+     const Clock::time_point start = Clock::now();
+     if (!pack_.read_blob(record, blob_)) {
+         ++stats_.upload_failed;
+@@ -365,8 +607,7 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+         ++stats_.upload_failed;
+         return false;
+     }
+-    const std::uint32_t clut_bytes = texture_clut_bytes_needed(state);
+-    const std::uint8_t *clut = memory.raw_pointer(state.clut_address, clut_bytes);
++    const std::uint8_t *clut = memory.raw_pointer(state.clut_address, clut_size);
+     if (clut == nullptr) return false;
+     std::uint32_t palette[256];
+     read_palette(state, clut, recolour.palette_entries, palette);
+@@ -426,6 +667,7 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+ 
+ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info) {
+     const bool was_replaced = info.replaced;
++    const bool completing = info.pending;   // the loader thread was working on this texture's replacement
+     if (was_replaced) {
+         stats_.resident_bytes -= std::min(stats_.resident_bytes, info.gpu_bytes);
+         if (stats_.resident_textures != 0u) --stats_.resident_textures;
+@@ -435,6 +677,7 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+     }
+     info.opaque = false;
+     info.key = 0u;
++    info.pending = false;
+     if (!active()) {
+         info.respecify = was_replaced;
+         return false;
+@@ -478,19 +721,40 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+         if (!found || (record.flags & kHdFlagRecolour) != 0u) {
+             // The full key is not in the pack. A recolourable image (a character whose clothes the game recolours)
+             // is found by its image key and rebuilt for the palette in use.
+-            if (pack_.recolour_count() != 0u && texture_is_indexed(state.format) && try_recolour(texture, memory, state, info))
++            if (pack_.recolour_count() != 0u && texture_is_indexed(state.format) && try_recolour(texture, memory, state, info, completing))
+                 replaced = true;
+             else
+                 ++stats_.misses;
+         } else {
+             const std::uint64_t needed = hd_chain_bytes(record.format, record.width, record.height, record.mip_count);
++            bool have_blob = false, read = false;
++            Loader::Read done;
+             if (!admit(needed)) {
+                 // refused by the budget: the original is used
++            } else if (loader_ != nullptr && !loader_->take(key, done)) {
++                // Not read yet: the loader reads it, the original goes up now, and ready() says when to come back.
++                Loader::Job job;
++                job.record = record;
++                job.key = key;
++                loader_->request(std::move(job));
++                info.pending = true;
++                ++stats_.async_reads;
+             } else {
++                have_blob = true;
++                if (loader_ != nullptr) {
++                    blob_.swap(done.blob);
++                    read = done.ok;
++                }
++            }
++            if (have_blob) {
+                 const Clock::time_point upload_start = Clock::now();
+                 std::uint64_t gpu_bytes = 0u;
+                 std::uint8_t levels = 0u;
+-                if (pack_.read_blob(record, blob_) && upload_blob(texture, record, blob_, gpu_bytes, levels)) {
++                stats_.last_gpu_wait_ns = 0u;
++                if (loader_ == nullptr) read = pack_.read_blob(record, blob_);
++                stats_.last_read_ns = nanoseconds_since(upload_start);
++                stats_.read_ns += stats_.last_read_ns;
++                if (read && upload_blob(texture, record, blob_, gpu_bytes, levels)) {
+                     stats_.blob_bytes += record.size;
+                     ++stats_.hits;
+                     info.replaced = replaced = true;
+@@ -505,7 +769,8 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+                 } else {
+                     ++stats_.upload_failed;
+                 }
+-                stats_.upload_ns += nanoseconds_since(upload_start);
++                stats_.last_total_ns = nanoseconds_since(upload_start);
++                stats_.upload_ns += stats_.last_total_ns;
+             }
+         }
+     }
+@@ -540,17 +805,19 @@ std::string GlHdTextures::summary() const {
+     std::ostringstream out;
+     const HdStats &s = stats_;
+     const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+-    char text[512];
++    char text[768];
+     std::snprintf(text, sizeof text,
+                   "hd textures %s: keyed %llu (%.2f us each), hits %llu (recoloured %llu, %.2f ms), misses %llu, no key %llu, "
+                   "render-target copies skipped %llu, budget refusals %llu, recolour refusals %llu, failed %llu; "
+-                  "resident %llu textures %.2f MB (peak %.2f MB), read %.2f MB, lookup %.2f ms, upload %.2f ms, flushes %llu",
++                  "resident %llu textures %.2f MB (peak %.2f MB), read %.2f MB, lookup %.2f ms, upload %.2f ms (reading %.2f ms, "
++                  "waiting for the GPU %.2f ms), read by the loader %llu, flushes %llu",
+                   hd_mode_name(config_.mode), n(s.keyed), s.keyed != 0u ? static_cast<double>(s.key_ns) / 1000.0 / static_cast<double>(s.keyed) : 0.0,
+                   n(s.hits), n(s.recolour_hits), static_cast<double>(s.recolour_ns) / 1.0e6, n(s.misses), n(s.key_failed),
+                   n(s.not_replaceable), n(s.skipped_budget), n(s.recolour_refused), n(s.upload_failed), n(s.resident_textures),
+                   static_cast<double>(s.resident_bytes) / 1048576.0, static_cast<double>(s.peak_bytes) / 1048576.0,
+                   static_cast<double>(s.blob_bytes) / 1048576.0, static_cast<double>(s.lookup_ns) / 1.0e6,
+-                  static_cast<double>(s.upload_ns) / 1.0e6, n(s.flushes));
++                  static_cast<double>(s.upload_ns) / 1.0e6, static_cast<double>(s.read_ns) / 1.0e6,
++                  static_cast<double>(s.gpu_wait_ns) / 1.0e6, n(s.async_reads), n(s.flushes));
+     return text;
+ }
+ 
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index 1f8dbf0..0519c61 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -25,6 +25,7 @@ struct HdTextureInfo {
+     bool opaque{};              // the replacement has no alpha (a DXT1 record, uploaded as RGB): every texel's alpha is 1
+     bool recoloured{};          // the replacement was rebuilt for the palette in use (a recolour record)
+     bool respecify{};           // the texture was a replacement and is the original again: specify it anew
++    bool pending{};             // its replacement is being read from the pack (async): the original is on the GPU meanwhile
+ };
+ 
+ // The GL side of the HD texture pack: finds the replacement for a texture the renderer is about to upload,
+@@ -61,6 +62,9 @@ public:
+     // A texture is about to be uploaded: finds its replacement. True when `texture` now holds the replacement
+     // (with its mip chain); false when the caller uploads the original. `info` is the entry's.
+     bool upload(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info);
++    // A texture drawn with its original while its replacement is read (info.pending): true once the read is done, and
++    // upload() will then put the replacement in. Cheap enough for every draw of such a texture.
++    [[nodiscard]] bool ready(const HdTextureInfo &info);
+     // The entry is gone from the GPU.
+     void released(HdTextureInfo &info);
+     // A draw used the texture (texture dump metadata only).
+@@ -74,21 +78,29 @@ public:
+     [[nodiscard]] std::uint64_t resident_bytes() const noexcept { return stats_.resident_bytes; }
+ 
+ private:
++    struct Loader;   // the thread that reads replacements from the pack (HdConfig::async_load)
+     void open_pack();
+     bool upload_blob(std::uint32_t texture, const HdRecord &record, const std::vector<std::uint8_t> &blob,
+                      std::uint64_t &gpu_bytes, std::uint8_t &levels);
+     // The texture's full key is not in the pack: looks for its image under the image key and rebuilds the
+     // replacement for the palette in use. True when `texture` holds it.
+-    bool try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info);
++    // `completing`: the loader thread was asked for this texture's recolour (info.pending when upload() was called).
++    bool try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info,
++                      bool completing);
++    // Uploads a recoloured chain the loader built (`levels`: every level, level 0 first, RGBA).
++    bool upload_recoloured(std::uint32_t texture, const std::vector<std::uint32_t> &levels, std::uint32_t width,
++                           std::uint32_t height, HdTextureInfo &info);
+     bool admit(std::uint64_t needed_bytes);   // budget check with hysteresis; logs the first refusal
+ 
+     HdConfig config_;
+     HdPackFile pack_;
++    std::unique_ptr<Loader> loader_;
+     HdTextureDump dump_;
+     HdStats stats_;
+     std::function<void(std::uint32_t)> bind_;
+     bool s3tc_{true};
+     bool s3tc_known_{};
++    bool levels_in_place_{};    // vitaGL reserves a compressed texture's chain (patch 0004): no wait between its levels
+     bool exhausted_{};          // the budget was spent: no replacements until memory is freed
+     bool logged_exhausted_{};
+     bool missing_logged_{};
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index 607a81d..0f2fc23 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -91,6 +91,17 @@ inline void skip_redundant_state(bool on) {
+ #endif
+ }
+ 
++// vitaGL (the port's patch 0004): level 0 of a compressed texture reserves its whole mip chain, so its levels are
++// written in place and need no wait for the GPU between them. True when the hint is in effect.
++inline bool reserve_compressed_mips() {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_RESERVE_MIPS)
++    vglReserveCompressedMips(GL_TRUE);
++    return true;
++#else
++    return false;
++#endif
++}
++
+ inline void disable_dither() {
+ #if !defined(__vita__)
+     glDisable(GL_DITHER);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 92f509b..bce3b33 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1009,13 +1009,43 @@ struct GlRenderer::Impl {
+     bool decode_into(TextureEntry &entry, const GuestMemory &memory, bool create) {
+         struct Scope {
+             Impl &impl;
++            const TextureEntry &entry;
++            bool create;
+             Clock::time_point start{Clock::now()};
+             ~Scope() {
+                 if (impl.settings.timing == 0u) return;
+-                impl.gt.texture_us += micros_since(start);
++                const std::uint64_t us = micros_since(start);
++                impl.gt.texture_us += us;
+                 ++impl.gt.textures;
++                // An upload that costs a frame's share is a hitch: say which texture. The same texture again only
++                // at its 2nd, 4th, 8th... slow upload, and 400 lines at most.
++                static unsigned logged = 0u;
++                static std::unordered_map<std::uint32_t, std::uint32_t> slow_by_address;
++                std::uint32_t times = 0u;
++                if (us >= 3000u && logged < 400u) times = ++slow_by_address[entry.state.address];
++                if (times != 0u && (times & (times - 1u)) == 0u) {
++                    ++logged;
++                    const TextureState &t = entry.state;
++                    char hd_parts[96] = "";
++                    if (entry.hd.replaced && !entry.hd.recoloured) {
++                        const HdStats &hs = impl.hd.stats();
++                        std::snprintf(hd_parts, sizeof(hd_parts), " | pack read %.1f ms, GPU waits %.1f ms",
++                                      static_cast<double>(hs.last_read_ns) / 1.0e6, static_cast<double>(hs.last_gpu_wait_ns) / 1.0e6);
++                    }
++                    char line[352];
++                    std::snprintf(line, sizeof(line),
++                                  "[gl-time] slow texture upload %.1f ms: 0x%08x %ux%u format %u%s clut 0x%08x | %s%s%s, "
++                                  "%ux%u on the GPU, %u content checks, frame %llu, slow upload #%u of it%s",
++                                  static_cast<double>(us) / 1000.0, t.address, t.width, t.height,
++                                  static_cast<unsigned>(t.format), t.swizzled ? " swizzled" : "", t.clut_address,
++                                  entry.hd.replaced ? "HD replacement" : "original", entry.hd.recoloured ? " (recoloured)" : "",
++                                  create ? ", new" : ", update", entry.hd.replaced ? entry.hd.width : entry.width,
++                                  entry.hd.replaced ? entry.hd.height : entry.height, entry.checks,
++                                  static_cast<unsigned long long>(impl.frames), times, hd_parts);
++                    std::cout << line << std::endl;
++                }
+             }
+-        } timing_scope{*this};
++        } timing_scope{*this, entry, create};
+         // The one place the HD texture pack takes part: a texture about to be uploaded is replaced by its
+         // pack entry (with mips) when the pack has one for its replacement key.
+         const bool counted = !create;  // an entry being created is added to texture_bytes by the caller
+@@ -1112,6 +1142,13 @@ struct GlRenderer::Impl {
+         ++st().texture_hits;
+         entry.last_used = frames;
+         ++entry.uses;
++        // Its HD replacement was being read by the pack's loader thread, the original drawn meanwhile: it has come.
++        if (entry.hd.pending && hd.ready(entry.hd)) {
++            flush();   // the batch may be drawing with the original
++            if (!decode_into(entry, memory, false)) return nullptr;
++            entry.traits_known = false;
++            if (decoded_owner == &entry) decoded_owner = nullptr;
++        }
+         bool full = false;
+         bool sample = false;
+         if (settings.texture_always_validate) {
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index a22222c..12b5e09 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -111,8 +111,8 @@ HdPackFile::~HdPackFile() { close(); }
+ void HdPackFile::close() {
+     if (file_ != nullptr) std::fclose(file_);
+     file_ = nullptr;
+-    keys_.clear();
+-    keys_.shrink_to_fit();
++    records_.clear();
++    records_.shrink_to_fit();
+     scale_ = 0u;
+     recolour_records_ = 0u;
+ }
+@@ -124,6 +124,8 @@ bool HdPackFile::open(const std::filesystem::path &path, std::string &error) {
+         error = "cannot open " + path.string();
+         return false;
+     }
++    std::setvbuf(file_, nullptr, _IONBF, 0);   // every read is one large read (see read_blob)
++    path_ = path;
+     std::fseek(file_, 0, SEEK_END);
+     file_size_ = static_cast<std::uint64_t>(std::ftell(file_));
+     std::fseek(file_, 0, SEEK_SET);
+@@ -142,8 +144,8 @@ bool HdPackFile::open(const std::filesystem::path &path, std::string &error) {
+         close();
+         return false;
+     }
+-    // Only the keys stay in RAM: read the index in blocks.
+-    keys_.reserve(count);
++    // The index stays in RAM: read it in blocks.
++    records_.reserve(count);
+     std::vector<std::uint8_t> block(kRecordBytes * 2048u);
+     std::uint32_t done = 0u;
+     bool sorted = true;
+@@ -155,10 +157,19 @@ bool HdPackFile::open(const std::filesystem::path &path, std::string &error) {
+             return false;
+         }
+         for (std::uint32_t i = 0; i < n; ++i) {
+-            const std::uint64_t key = read64(block.data() + i * kRecordBytes);
+-            if (!keys_.empty() && key <= keys_.back()) sorted = false;
+-            keys_.push_back(key);
+-            if ((read16(block.data() + i * kRecordBytes + 26u) & kHdFlagRecolour) != 0u) ++recolour_records_;
++            const std::uint8_t *raw = block.data() + i * kRecordBytes;
++            HdRecord record;
++            record.key = read64(raw);
++            record.offset = read64(raw + 8);
++            record.size = read32(raw + 16);
++            record.width = read16(raw + 20);
++            record.height = read16(raw + 22);
++            record.format = static_cast<HdFormat>(raw[24]);
++            record.mip_count = raw[25];
++            record.flags = read16(raw + 26);
++            if (!records_.empty() && record.key <= records_.back().key) sorted = false;
++            if ((record.flags & kHdFlagRecolour) != 0u) ++recolour_records_;
++            records_.push_back(record);
+         }
+         done += n;
+     }
+@@ -171,37 +182,35 @@ bool HdPackFile::open(const std::filesystem::path &path, std::string &error) {
+     return true;
+ }
+ 
+-bool HdPackFile::find(std::uint64_t key, HdRecord &record) {
++bool HdPackFile::find(std::uint64_t key, HdRecord &record) const {
+     if (file_ == nullptr) return false;
+-    const auto at = std::lower_bound(keys_.begin(), keys_.end(), key);
+-    if (at == keys_.end() || *at != key) return false;
+-    const std::uint64_t position = static_cast<std::uint64_t>(at - keys_.begin());
+-    std::uint8_t raw[kRecordBytes];
+-    if (std::fseek(file_, static_cast<long>(index_offset_ + position * kRecordBytes), SEEK_SET) != 0 ||
+-        std::fread(raw, 1, sizeof raw, file_) != sizeof raw)
+-        return false;
+-    bytes_read_ += sizeof raw;
+-    record.key = read64(raw);
+-    record.offset = read64(raw + 8);
+-    record.size = read32(raw + 16);
+-    record.width = read16(raw + 20);
+-    record.height = read16(raw + 22);
+-    record.format = static_cast<HdFormat>(raw[24]);
+-    record.mip_count = raw[25];
+-    record.flags = read16(raw + 26);
+-    return record.key == key && record.offset + record.size <= file_size_ && record.mip_count != 0u;
++    const auto at = std::lower_bound(records_.begin(), records_.end(), key,
++                                     [](const HdRecord &entry, std::uint64_t wanted) { return entry.key < wanted; });
++    if (at == records_.end() || at->key != key) return false;
++    record = *at;
++    return record.offset + record.size <= file_size_ && record.mip_count != 0u;
+ }
+ 
+ bool HdPackFile::read_blob(const HdRecord &record, std::vector<std::uint8_t> &out) {
+-    if (file_ == nullptr) return false;
+-    out.resize(record.size);
+-    if (std::fseek(file_, static_cast<long>(record.offset), SEEK_SET) != 0 ||
+-        std::fread(out.data(), 1, record.size, file_) != record.size)
+-        return false;
++    if (file_ == nullptr || !read_blob_with(file_, record, out)) return false;
+     bytes_read_ += record.size;
+     return true;
+ }
+ 
++std::FILE *HdPackFile::open_reader() const {
++    if (file_ == nullptr) return nullptr;
++    std::FILE *reader = std::fopen(path_.string().c_str(), "rb");
++    if (reader != nullptr) std::setvbuf(reader, nullptr, _IONBF, 0);
++    return reader;
++}
++
++bool HdPackFile::read_blob_with(std::FILE *file, const HdRecord &record, std::vector<std::uint8_t> &out) const {
++    if (file == nullptr) return false;
++    out.resize(record.size);
++    return std::fseek(file, static_cast<long>(record.offset), SEEK_SET) == 0 &&
++           std::fread(out.data(), 1, record.size, file) == record.size;
++}
++
+ // ---- recolour records ----------------------------------------------------------------------------
+ 
+ bool hd_unpackbits(const std::uint8_t *in, std::size_t in_size, std::uint8_t *out, std::size_t out_size) {
+@@ -351,6 +360,7 @@ HdConfig hd_config_from_environment() {
+     if (const char *text = env_any("HD_BUDGET_2X_MB")) config.budget_2x_bytes = megabytes(text);
+     if (const char *text = env_any("HD_BUDGET_4X_MB")) config.budget_4x_bytes = megabytes(text);
+     if (const char *text = env_any("HD_STALE_FRAMES")) config.stale_frames = std::strtoull(text, nullptr, 10);
++    if (const char *text = env_any("HD_ASYNC")) config.async_load = !(std::strcmp(text, "off") == 0 || std::strcmp(text, "0") == 0);
+     if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
+     config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
+     return config;
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index d232b6c..f000dfb 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -70,26 +70,33 @@ public:
+     void close();
+     [[nodiscard]] bool is_open() const noexcept { return file_ != nullptr; }
+     [[nodiscard]] std::uint32_t scale() const noexcept { return scale_; }
+-    [[nodiscard]] std::uint32_t count() const noexcept { return static_cast<std::uint32_t>(keys_.size()); }
++    [[nodiscard]] std::uint32_t count() const noexcept { return static_cast<std::uint32_t>(records_.size()); }
+     // Bytes the index occupies in RAM.
+-    [[nodiscard]] std::size_t index_ram_bytes() const noexcept { return keys_.capacity() * sizeof(std::uint64_t); }
++    [[nodiscard]] std::size_t index_ram_bytes() const noexcept { return records_.capacity() * sizeof(HdRecord); }
+     [[nodiscard]] std::uint64_t file_bytes() const noexcept { return file_size_; }
+     // Whether the pack has recolour records (looked up by image key after a miss of the full key).
+     [[nodiscard]] std::uint32_t recolour_count() const noexcept { return recolour_records_; }
+-    // Binary search over the keys in RAM; on a hit the record is read from the file.
+-    [[nodiscard]] bool find(std::uint64_t key, HdRecord &record);
+-    // The blob of a record.
++    // Binary search over the index in RAM: no file access.
++    [[nodiscard]] bool find(std::uint64_t key, HdRecord &record) const;
++    // The blob of a record: one seek and one read (the file is unbuffered: a buffered stream read a blob in BUFSIZ
++    // pieces, a system call each, which on the Vita's memory card made a 512 KiB blob take some 40 ms).
+     bool read_blob(const HdRecord &record, std::vector<std::uint8_t> &out);
++    // The same through another handle of the pack (open_reader), for a thread that reads blobs beside this one.
++    [[nodiscard]] std::FILE *open_reader() const;
++    bool read_blob_with(std::FILE *file, const HdRecord &record, std::vector<std::uint8_t> &out) const;
+     [[nodiscard]] std::uint64_t bytes_read() const noexcept { return bytes_read_; }
+ 
+ private:
+     std::FILE *file_{};
++    std::filesystem::path path_;
+     std::uint32_t scale_{};
+     std::uint64_t index_offset_{};
+     std::uint64_t file_size_{};
+     std::uint64_t bytes_read_{};
+     std::uint32_t recolour_records_{};
+-    std::vector<std::uint64_t> keys_;
++    // The whole index, sorted by key: 32 bytes a texture (80 KiB for a pack of 2,500). A lookup that read its record
++    // from the file was a memory-card access (milliseconds on the Vita) on the GL thread for every replacement.
++    std::vector<HdRecord> records_;
+ };
+ 
+ // ---- recolour records -------------------------------------------------------------------------
+@@ -142,6 +149,11 @@ struct HdConfig {
+     // <prefix>_HD_TRACE=1: every upload (key, size, format, level) is logged before the driver sees it; a crash in the driver
+     // (an emulator, a console) then names the texture.
+     bool trace{false};
++    // Replacements are read from the pack by a thread of their own: a texture is drawn with its original until its
++    // replacement has been read, then swapped (a read from the Vita's memory card took 5 to 60 ms of the GL thread, a
++    // visible hitch each time something new came on screen). <PREFIX>_HD_ASYNC=0 (config.txt hd_async=0) reads them on
++    // the spot, as before, so that every frame shows the replacement from its first draw (the replayer's choice).
++    bool async_load{true};
+ };
+ 
+ // THE place gfx.hd_textures is read from: the port settings (host/settings/port_settings.hpp). `auto` (the setting's
+@@ -185,6 +197,11 @@ struct HdStats {
+     std::uint64_t recolour_hits{};     // textures rebuilt from a recolour record (image key found, palette differs)
+     std::uint64_t recolour_refused{};  // recolours not done because the texture's palette kept changing
+     std::uint64_t recolour_ns{};       // time rebuilding recoloured pictures (decode, palette transfer, mips)
++    std::uint64_t read_ns{};           // of upload_ns: reading blobs from the pack (on the GL thread: without async_load)
++    std::uint64_t async_reads{};       // replacements read by the loader thread, the original drawn meanwhile
++    std::uint64_t gpu_wait_ns{};       // of upload_ns: waiting for the GPU's transfers between mip levels (the Vita)
++    // The last upload's parts, for the renderer's slow-upload log.
++    std::uint64_t last_read_ns{}, last_gpu_wait_ns{}, last_total_ns{};
+ };
+ 
+ // ---- the texture dump --------------------------------------------------------------------------
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 9038289..8227796 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -690,6 +690,8 @@ int main(int argc, char **argv) {
+             gpu::HdConfig hd = gpu::hd_config_from_environment();
+             if (!options.pack_dir.empty()) hd.data_root = options.pack_dir;
+             hd.follow_settings = false;
++            // A replay is compared frame for frame: every replacement is in from its first draw, as without the loader thread.
++            hd.async_load = false;
+             if (options.hd == "follow") {
+                 hd.follow_settings = true;
+                 if (gpu::hd_pack_present(hd.data_root)) port::settings().set_unavailable(port::Key::GfxHdTextures, nullptr);

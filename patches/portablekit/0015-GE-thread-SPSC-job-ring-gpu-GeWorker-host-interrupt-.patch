@@ -1,0 +1,1046 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 03:34:41 +0000
+Subject: [PATCH] GE thread: SPSC job ring (gpu::GeWorker), host interrupt
+ mailbox in the kernel, threaded lists/flips/DrawSync/ListSync in hle_media,
+ ge_replay --threaded
+
+The list walk, the GL submission and the flips run on a thread of their own, the guest on another; perf.threaded_renderer (settings.txt) or <PREFIX>_THREADED_RENDERER switches it. Not yet built for the Vita or run.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index e80e90c..3458208 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -42,6 +42,7 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/audio/sas_core.cpp
+     host/gpu/ge_state.cpp
+     host/gpu/ge_dump.cpp
++    host/gpu/ge_worker.cpp
+     host/gpu/texture_decode.cpp
+     host/perf/frame_stats.cpp
+     host/perf/bringup_stats.cpp
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+new file mode 100644
+index 0000000..acbf008
+--- /dev/null
++++ b/host/gpu/ge_worker.cpp
+@@ -0,0 +1,235 @@
++#include "gpu/ge_worker.hpp"
++
++#include "kernel/kernel_platform.hpp"
++#include "profile.hpp"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#if !defined(PORTABLEKIT_PLATFORM_CUSTOM)
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#endif
++
++namespace portablekit::gpu {
++namespace {
++
++GeWorkerPlatform g_platform{};
++
++#if !defined(PORTABLEKIT_PLATFORM_CUSTOM)
++struct DefaultEvent {
++    std::mutex mutex;
++    std::condition_variable wake;
++    bool signalled = false;
++};
++
++void *default_event_create() { return new DefaultEvent(); }
++void default_event_destroy(void *event) { delete static_cast<DefaultEvent *>(event); }
++
++void default_event_wait(void *event, std::uint64_t timeout_us) {
++    auto *e = static_cast<DefaultEvent *>(event);
++    std::unique_lock<std::mutex> lock(e->mutex);
++    if (!e->signalled) e->wake.wait_for(lock, std::chrono::microseconds(timeout_us));
++    e->signalled = false;
++}
++
++void default_event_signal(void *event) {
++    auto *e = static_cast<DefaultEvent *>(event);
++    {
++        std::lock_guard<std::mutex> lock(e->mutex);
++        e->signalled = true;
++    }
++    e->wake.notify_all();
++}
++
++struct DefaultThread {
++    std::thread thread;
++};
++
++void *default_thread_start(void (*fn)(void *), void *arg, const char *, int, std::size_t) {
++    auto *t = new DefaultThread();
++    t->thread = std::thread([fn, arg] { fn(arg); });
++    return t;
++}
++
++void default_thread_join(void *handle) {
++    auto *t = static_cast<DefaultThread *>(handle);
++    if (t->thread.joinable()) t->thread.join();
++    delete t;
++}
++
++std::uint64_t default_monotonic_us() {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                          std::chrono::steady_clock::now().time_since_epoch())
++                                          .count());
++}
++
++const bool g_default_installed = [] {
++    g_platform.event_create = &default_event_create;
++    g_platform.event_destroy = &default_event_destroy;
++    g_platform.event_wait = &default_event_wait;
++    g_platform.event_signal = &default_event_signal;
++    g_platform.thread_start = &default_thread_start;
++    g_platform.thread_join = &default_thread_join;
++    g_platform.monotonic_us = &default_monotonic_us;
++    return true;
++}();
++#endif
++
++// How long a sleeping side waits before it looks again even if nobody signalled: the signals are only an
++// optimisation, never the correctness of the ring.
++constexpr std::uint64_t kSleepUs = 2'000u;
++
++std::string lower(std::string text) {
++    for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    return text;
++}
++
++bool parse_flag(const std::string &text, bool fallback) {
++    const std::string value = lower(text);
++    if (value == "1" || value == "on" || value == "true" || value == "yes") return true;
++    if (value == "0" || value == "off" || value == "false" || value == "no") return false;
++    return fallback;
++}
++
++} // namespace
++
++void set_ge_worker_platform(const GeWorkerPlatform &platform) noexcept { g_platform = platform; }
++const GeWorkerPlatform &ge_worker_platform() noexcept { return g_platform; }
++
++bool ge_worker_setting_enabled() {
++    if (const char *value = portablekit::env("THREADED_RENDERER")) return parse_flag(value, true);
++    const char *dir = portablekit::env("DATA_DIR");
++    if (dir == nullptr || *dir == '\0') return true;
++    std::string path = dir;
++    if (path.back() != '/') path += '/';
++    path += "settings.txt";
++    std::FILE *file = std::fopen(path.c_str(), "rb");
++    if (file == nullptr) return true;
++    bool enabled = true;
++    char line[256];
++    while (std::fgets(line, sizeof(line), file) != nullptr) {
++        std::string text = line;
++        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
++        const std::size_t equals = text.find('=');
++        if (equals == std::string::npos) continue;
++        std::string key = text.substr(0, equals);
++        while (!key.empty() && key.back() == ' ') key.pop_back();
++        if (key != "perf.threaded_renderer") continue;
++        std::size_t begin = equals + 1u;
++        while (begin < text.size() && text[begin] == ' ') ++begin;
++        enabled = parse_flag(text.substr(begin), true);
++    }
++    std::fclose(file);
++    return enabled;
++}
++
++GeWorker::GeWorker(std::uint32_t capacity)
++    : capacity_(std::max(capacity, 16u)), slots_(std::make_unique<Slot[]>(std::max(capacity, 16u))) {
++    if (g_platform.event_create != nullptr) {
++        work_event_ = g_platform.event_create();
++        space_event_ = g_platform.event_create();
++    }
++}
++
++GeWorker::~GeWorker() {
++    if (g_platform.event_destroy != nullptr) {
++        if (work_event_ != nullptr) g_platform.event_destroy(work_event_);
++        if (space_event_ != nullptr) g_platform.event_destroy(space_event_);
++    }
++}
++
++void GeWorker::post(Job job) {
++    const std::uint64_t tail = tail_.load(std::memory_order_relaxed);
++    while (tail - head_.load(std::memory_order_acquire) >= capacity_) {
++        // Full: the GE thread is behind by a whole ring. Wait for it in host time.
++        if (g_platform.event_wait != nullptr && space_event_ != nullptr) g_platform.event_wait(space_event_, kSleepUs);
++    }
++    slots_[tail % capacity_].job = std::move(job);
++    tail_.store(tail + 1u, std::memory_order_release);
++    posted_.store(tail + 1u, std::memory_order_release);
++    if (g_platform.event_signal != nullptr && work_event_ != nullptr) g_platform.event_signal(work_event_);
++}
++
++void GeWorker::wait_completed(std::uint64_t target) {
++    while (completed() < target) {
++        if (g_platform.event_wait != nullptr && space_event_ != nullptr)
++            g_platform.event_wait(space_event_, kSleepUs);
++    }
++}
++
++void GeWorker::nap_on_ge_thread(std::uint64_t us) {
++    if (g_platform.event_wait != nullptr && work_event_ != nullptr) g_platform.event_wait(work_event_, us);
++}
++
++void GeWorker::request_stop() noexcept {
++    stop_.store(true, std::memory_order_release);
++    if (g_platform.event_signal != nullptr && work_event_ != nullptr) g_platform.event_signal(work_event_);
++}
++
++void GeWorker::run_loop() {
++    for (;;) {
++        const std::uint64_t head = head_.load(std::memory_order_relaxed);
++        if (head == tail_.load(std::memory_order_acquire)) {
++            if (stop_.load(std::memory_order_acquire) && head == tail_.load(std::memory_order_acquire)) return;
++            if (g_platform.event_wait != nullptr && work_event_ != nullptr) g_platform.event_wait(work_event_, kSleepUs);
++            continue;
++        }
++        Slot &slot = slots_[head % capacity_];
++        const std::uint64_t start = g_platform.monotonic_us != nullptr ? g_platform.monotonic_us() : 0u;
++        if (slot.job) slot.job();
++        slot.job = nullptr;
++        if (g_platform.monotonic_us != nullptr)
++            busy_us_.fetch_add(g_platform.monotonic_us() - start, std::memory_order_relaxed);
++        head_.store(head + 1u, std::memory_order_release);
++        completed_.store(head + 1u, std::memory_order_release);
++        // The guest may be waiting for this job (sceGeDrawSync, a full ring, a frame in flight): wake it.
++        if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++        if (wake_hook_ != nullptr) wake_hook_();
++    }
++}
++
++namespace {
++struct GuestThreadArgs {
++    void (*fn)(void *);
++    void *arg;
++    GeWorker *worker;
++};
++
++void guest_thread_main(void *pointer) {
++    auto *args = static_cast<GuestThreadArgs *>(pointer);
++    args->fn(args->arg);
++    args->worker->request_stop();
++}
++} // namespace
++
++bool GeWorker::run_with_guest_thread(void (*guest)(void *), void *arg, int guest_core, std::size_t guest_stack_bytes,
++                                     int ge_core) {
++    if (g_platform.thread_start == nullptr || g_platform.thread_join == nullptr || work_event_ == nullptr) return false;
++    stop_.store(false, std::memory_order_release);
++    GuestThreadArgs args{guest, arg, this};
++    if (g_platform.pin_current_thread != nullptr) g_platform.pin_current_thread(ge_core);
++    active_.store(true, std::memory_order_release);
++    void *thread = g_platform.thread_start(&guest_thread_main, &args, "infected-guest", guest_core, guest_stack_bytes);
++    if (thread == nullptr) {
++        active_.store(false, std::memory_order_release);
++        return false;
++    }
++    run_loop();
++    g_platform.thread_join(thread);
++    active_.store(false, std::memory_order_release);
++    return true;
++}
++
++GeWorker &ge_worker() {
++    static GeWorker worker;
++    return worker;
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+new file mode 100644
+index 0000000..ce4a51a
+--- /dev/null
++++ b/host/gpu/ge_worker.hpp
+@@ -0,0 +1,119 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++
++// The GE thread: display lists are walked and drawn on a thread of their own, fed by a single-producer ring, while the
++// guest runs on another one. The guest side posts closures (a list run, a present, a CPU-written picture); the GE thread
++// runs them in order, so it is the only thread that ever touches the GeState and the renderer (and so the GL context).
++//
++//   guest executor (core 0)                         GE thread (core 1, the thread that created the GL context)
++//   post(job) -----------------------------------> run job, job, job ...
++//   kernel waits (sceGeDrawSync, a full queue)  <-- completed() counter, kernel_signal_event(), host interrupts
++//
++// Ordering is the whole contract: jobs run in the order they were posted, one at a time. What the guest may rely on is the
++// counters: completed() reaches the value posted() had when the guest asked. The guest must not change what a posted job
++// reads (display lists, vertex data, textures) before it has synchronised, exactly as on the PSP; sceGeDrawSync / ListSync
++// and the finish callback are the synchronisation points.
++//
++// Nothing here uses a mutex: the ring is wait-free for the one producer and the one consumer, the sleeping is on a host
++// event the platform provides (a condition variable by default, a SceKernelEventFlag on the Vita), and the guest thread is
++// started through the same seam.
++namespace portablekit::gpu {
++
++// What the worker needs from the machine. A platform layer that has its own primitives (the Vita's) defines
++// PORTABLEKIT_PLATFORM_CUSTOM when it compiles pk_runtime, so the default (std::thread, a condition variable) is left
++// out, and calls set_ge_worker_platform() before the first use.
++struct GeWorkerPlatform {
++    void *(*event_create)() = nullptr;                         // auto-reset event
++    void (*event_destroy)(void *event) = nullptr;
++    // Sleeps for at most timeout_us; returns early once signalled since the last return (a signal that came before the
++    // sleep is not lost).
++    void (*event_wait)(void *event, std::uint64_t timeout_us) = nullptr;
++    void (*event_signal)(void *event) = nullptr;               // any thread
++    // Runs fn(arg) on a new thread pinned to `core` (-1: any) with a stack of `stack_bytes`; returns a handle or nullptr.
++    void *(*thread_start)(void (*fn)(void *), void *arg, const char *name, int core, std::size_t stack_bytes) = nullptr;
++    void (*thread_join)(void *handle) = nullptr;
++    // Pins the calling thread to `core` (the GE thread: core 1 on the Vita). Optional.
++    void (*pin_current_thread)(int core) = nullptr;
++    // Microseconds on a monotonic clock, for the statistics. Optional.
++    std::uint64_t (*monotonic_us)() = nullptr;
++};
++
++void set_ge_worker_platform(const GeWorkerPlatform &platform) noexcept;
++[[nodiscard]] const GeWorkerPlatform &ge_worker_platform() noexcept;
++
++// The setting: <PREFIX>_THREADED_RENDERER (0/1/on/off) if set, else `perf.threaded_renderer` in settings.txt in the data
++// root (<PREFIX>_DATA_DIR; the file's `key=value` lines, unknown keys ignored), else on.
++[[nodiscard]] bool ge_worker_setting_enabled();
++
++class GeWorker {
++public:
++    using Job = std::function<void()>;
++
++    explicit GeWorker(std::uint32_t capacity = 1024u);
++    ~GeWorker();
++    GeWorker(const GeWorker &) = delete;
++    GeWorker &operator=(const GeWorker &) = delete;
++
++    // Runs `guest(arg)` on a new thread (guest_core, guest_stack_bytes) and this worker's loop on the calling thread
++    // (pinned to ge_core), which has to be the thread that owns the GL context. Returns when `guest` has returned and the
++    // jobs it posted have run. False if the thread could not be started (nothing ran, active() stays false).
++    bool run_with_guest_thread(void (*guest)(void *), void *arg, int guest_core, std::size_t guest_stack_bytes,
++                               int ge_core);
++
++    // True while run_with_guest_thread() is running: the HLE posts jobs instead of running them where it stands.
++    [[nodiscard]] bool active() const noexcept { return active_.load(std::memory_order_acquire); }
++
++    // ---- producer: the guest thread ------------------------------------------------------------------------------
++    // Queues a job. Sleeps (host time) while the ring is full.
++    void post(Job job);
++    [[nodiscard]] std::uint64_t posted() const noexcept { return posted_.load(std::memory_order_acquire); }
++    [[nodiscard]] std::uint64_t completed() const noexcept { return completed_.load(std::memory_order_acquire); }
++    // Blocks the calling (guest) thread in host time until completed() >= target. For shutdown and tests; the kernel's
++    // waits poll completed() instead (Kernel::wait_host).
++    void wait_completed(std::uint64_t target);
++
++    // ---- statistics ----------------------------------------------------------------------------------------------
++    // Microseconds the GE thread spent running jobs (with set_clock, else 0).
++    [[nodiscard]] std::uint64_t busy_us() const noexcept { return busy_us_.load(std::memory_order_relaxed); }
++    // Called by the GE thread after a job posted with `wake` set has run: wakes an idle kernel (kernel_signal_event).
++    void set_wake_hook(void (*hook)()) noexcept { wake_hook_ = hook; }
++
++    // ---- consumer: the GE thread ---------------------------------------------------------------------------------
++    // The loop of run_with_guest_thread(), for a caller that starts the guest thread itself (the replay test): runs
++    // jobs until request_stop() was called and the ring is empty.
++    void run_loop();
++    void request_stop() noexcept;
++    // The GE thread sleeps for up to `us` (a post wakes it early): for a wait that is not on the ring, such as a host
++    // mailbox that is full.
++    void nap_on_ge_thread(std::uint64_t us);
++    // Marks the worker active for a caller that runs run_loop() itself.
++    void set_active(bool active) noexcept { active_.store(active, std::memory_order_release); }
++
++private:
++    struct Slot {
++        Job job;
++    };
++
++    std::uint32_t capacity_;
++    std::unique_ptr<Slot[]> slots_;
++    std::atomic<std::uint64_t> head_{0u};      // consumer: next to run
++    std::atomic<std::uint64_t> tail_{0u};      // producer: next to fill
++    std::atomic<std::uint64_t> posted_{0u};
++    std::atomic<std::uint64_t> completed_{0u};
++    std::atomic<bool> active_{false};
++    std::atomic<bool> stop_{false};
++    std::atomic<std::uint64_t> busy_us_{0u};
++    void *work_event_ = nullptr;      // the consumer sleeps here when the ring is empty
++    void *space_event_ = nullptr;     // the producer sleeps here when the ring is full
++    void (*wake_hook_)() = nullptr;
++};
++
++// The one worker of the process.
++[[nodiscard]] GeWorker &ge_worker();
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index eb0991e..5dfa84e 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -401,8 +401,7 @@ struct GlRenderer::Impl {
+         const std::string name = glsl::describe(flags);
+         program->failed = !link(*program, glsl::vertex_source(flags), glsl::fragment_source(flags), name.c_str(), false);
+         variant_names.push_back(name + (program->failed ? " (failed)" : ""));
+-        if (settings.trace)
+-            std::cerr << "[gl] program " << name << " flags 0x" << std::hex << flags << std::dec
++        std::cerr << "[gl] program " << name << " flags 0x" << std::hex << flags << std::dec
+                       << (program->failed ? " FAILED" : " linked") << " (" << variant_names.size() << " variants)\n";
+         if (!program->failed) {
+             use_program(*program);
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index a92e481..b514596 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -23,6 +23,7 @@
+ #include "settings/settings.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_dump.hpp"
++#include "gpu/ge_worker.hpp"
+ #include "perf/frame_stats.hpp"
+ #include "perf/phase_timers.hpp"
+ #include "perf/bringup_stats.hpp"
+@@ -45,6 +46,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <array>
++#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <iostream>
+@@ -132,6 +134,20 @@ struct MediaState {
+     std::int32_t next_ge_callback{};
+     std::map<std::uint32_t, GeList> ge_lists;
+     std::uint32_t next_ge_list{1u};
++    // With the GE thread (gpu::ge_worker().active()): ge_lists is the guest's view of the lists (they exist, which
++    // callback), the GE thread keeps the ones it is running in ge_thread_lists (it alone touches that map and the GeState),
++    // and tells the guest which it has finished through ge_finished, a slot per id modulo its size.
++    struct WorkerList {
++        GeList list;
++        GeCallback callback;
++        bool has_callback{};
++    };
++    std::map<std::uint32_t, WorkerList> ge_thread_lists;
++    std::array<std::atomic<std::uint32_t>, 64> ge_finished{};
++    std::atomic<std::uint64_t> presents_done{0u};   // presents the GE thread has run
++    std::uint64_t presents_posted{0u};              // and the guest has posted
++    std::uint64_t last_list_job{0u};                // gpu::ge_worker().posted() after the last list job
++    std::atomic<bool> window_closed{false};         // the GE thread's pump saw the window close
+     std::array<AudioChannel, 8> audio{};
+     // The Output2 channel, reserved through sceAudioOutput2Reserve rather than
+     // chosen by the guest. -1 when it has not been reserved.
+@@ -185,24 +201,37 @@ void block_transfer(Runtime &rt, const gpu::BlockTransfer &transfer) {
+ #endif
+ }
+ 
+-void run_ge_list(Runtime &rt, std::uint32_t id) {
+-    auto found = media().ge_lists.find(id);
+-    if (found == media().ge_lists.end()) return;
++// True while the GE thread runs the lists and the flips (the build has the GLES2 renderer alone and the setting is on).
++bool ge_threaded() noexcept { return gpu::ge_worker().active(); }
++
++// A signal or finish callback of the GE. In the synchronous path it is queued on the kernel from inside the HLE call that
++// ran the list; with the GE thread it comes from that thread, through the kernel's host mailbox, which the kernel drains at
++// its next HLE boundary or idle pass.
++void raise_ge_interrupt(InterruptCall call) {
++    if (!ge_threaded()) {
++        kernel().queue_interrupt(std::move(call));
++        return;
++    }
++    while (!kernel().post_interrupt_from_host(call.function, call.arguments, call.argument_count))
++        gpu::ge_worker().nap_on_ge_thread(500u);   // the kernel has not drained for a while
++}
++
++// Runs one display list as far as its stall address. The GeState walks it, the renderer draws what it produces and the
++// guest's callbacks are raised. `list` is the list's record (pc and done are updated); `callback` may be null.
++void execute_list(Runtime &rt, std::uint32_t id, GeList &list, const GeCallback *callback) {
+     const perf::Clock::time_point start = perf::Clock::now();
+-    GeList &list = found->second;
+-    const GeCallback *callback = nullptr;
+-    if (const auto cb = media().ge_callbacks.find(list.callback); cb != media().ge_callbacks.end())
+-        callback = &cb->second;
++    const GeCallback callback_copy = callback != nullptr ? *callback : GeCallback{};
++    const bool has_callback = callback != nullptr;
+ 
+-    media().ge.set_signal_sink([callback](std::uint32_t signal, std::uint32_t pc) {
+-        if (callback == nullptr) return;
++    media().ge.set_signal_sink([callback_copy, has_callback](std::uint32_t signal, std::uint32_t pc) {
++        if (!has_callback) return;
+         const bool finish = (signal & 0x10000u) != 0u;
+-        const std::uint32_t function = finish ? callback->finish_function : callback->signal_function;
++        const std::uint32_t function = finish ? callback_copy.finish_function : callback_copy.signal_function;
+         if (function == 0u) return;
+         InterruptCall call{};
+         call.function = function;
+-        call.arguments = {signal & 0xFFFFu, finish ? callback->finish_argument : callback->signal_argument, pc, 0u};
+-        kernel().queue_interrupt(std::move(call));
++        call.arguments = {signal & 0xFFFFu, finish ? callback_copy.finish_argument : callback_copy.signal_argument, pc, 0u};
++        raise_ge_interrupt(std::move(call));
+     });
+ #if defined(PORTABLEKIT_GPU_RENDERER)
+     if (media().renderer && media().renderer->available()) {
+@@ -245,6 +274,52 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
+     perf::add_render_time(perf::Clock::now() - start);
+ }
+ 
++// The synchronous path: the list runs where the guest asked for it.
++void run_ge_list(Runtime &rt, std::uint32_t id) {
++    auto found = media().ge_lists.find(id);
++    if (found == media().ge_lists.end()) return;
++    GeList &list = found->second;
++    const GeCallback *callback = nullptr;
++    if (const auto cb = media().ge_callbacks.find(list.callback); cb != media().ge_callbacks.end())
++        callback = &cb->second;
++    execute_list(rt, id, list, callback);
++}
++
++// The threaded path: what the guest knows now (the list, its callback) goes to the GE thread, which runs it in order with
++// everything else it was given. `stall_only` is an update of the stall address of a list it already has.
++void post_ge_list(Runtime &rt, std::uint32_t id, const GeList &list, bool stall_only) {
++    GeCallback callback{};
++    bool has_callback = false;
++    if (const auto cb = media().ge_callbacks.find(list.callback); cb != media().ge_callbacks.end()) {
++        callback = cb->second;
++        has_callback = true;
++    }
++    const std::uint32_t pc = list.pc;
++    const std::uint32_t stall = list.stall;
++    const std::int32_t callback_id = list.callback;
++    gpu::GeWorker &worker = gpu::ge_worker();
++    worker.post([&rt, id, pc, stall, callback_id, callback, has_callback, stall_only] {
++        MediaState::WorkerList *mine;
++        if (stall_only) {
++            const auto found = media().ge_thread_lists.find(id);
++            if (found == media().ge_thread_lists.end()) return;     // it finished (or never was): nothing to update
++            mine = &found->second;
++            mine->list.stall = stall;
++        } else {
++            mine = &media().ge_thread_lists[id];
++            mine->list = GeList{pc, stall, callback_id, false};
++            mine->callback = callback;
++            mine->has_callback = has_callback;
++        }
++        execute_list(rt, id, mine->list, mine->has_callback ? &mine->callback : nullptr);
++        if (mine->list.done) {
++            media().ge_finished[id & 63u].store(id, std::memory_order_release);
++            media().ge_thread_lists.erase(id);
++        }
++    });
++    media().last_list_job = worker.posted();
++}
++
+ #if defined(PORTABLEKIT_HAS_RENDERER)
+ // The mouse's motion since the previous pump, as degrees for the camera
+ // layer. Added after the flip, so whoever drives the camera takes it in the
+@@ -295,6 +370,66 @@ std::uint64_t frame_start_us(std::uint64_t latest_vblank_us) {
+     return start;
+ }
+ 
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++// The flip with the GE thread: the guest side captures what only it knows now (the display registers, the emulated time,
++// the picture of a framebuffer the CPU wrote), and the renderer's part runs on the GE thread in order with the lists the
++// game gave it before. The guest does not wait for it; sceDisplaySetFrameBuf bounds how many flips are in flight.
++void present_frame_threaded(Runtime &rt) {
++    load_trace::note_flip();
++    revalidate_overlays(rt);
++    if (!media().renderer || !media().renderer->available()) {
++        perf::end_frame(kernel().now_us());
++        return;
++    }
++    if (media().window_closed.load(std::memory_order_acquire)) rt.stop("window closed");
++    gpu::Renderer *renderer = media().renderer.get();
++    const std::uint32_t address = (media().display.framebuffer & 0xFF000000u) == 0u
++                                      ? (media().display.framebuffer | 0x04000000u)
++                                      : media().display.framebuffer;
++    constexpr std::uint32_t kPixelFormat8888 = 3u;
++    const DisplayState display = media().display;
++    std::vector<std::uint8_t> picture;
++    bool from_memory = false;
++    if ((address & 0x1F000000u) != kEdramBase && display.pixel_format == kPixelFormat8888) {
++        const std::size_t bytes = static_cast<std::size_t>(display.buffer_width) * display.height * 4u;
++        if (const std::uint8_t *source = rt.memory().raw_pointer(address, bytes)) {
++            picture.assign(source, source + bytes);
++            from_memory = true;
++        }
++    }
++    const bool fast = fast_loading::active();
++    const auto real_time = kernel().real_time_of(frame_start_us(kernel().last_vblank_us()));
++    static const char *screenshot_dir = portablekit::env("SCREENSHOT_DIR");
++    static const std::uint64_t screenshot_every = [] {
++        const char *text = portablekit::env("SCREENSHOT_EVERY");
++        return text != nullptr ? std::strtoull(text, nullptr, 10) : 60ull;
++    }();
++    ++media().presents_posted;
++    gpu::ge_worker().post([&rt, renderer, address, display, picture = std::move(picture), from_memory, fast, real_time] {
++        const perf::Clock::time_point present_start = perf::Clock::now();
++        if (from_memory)
++            renderer->upload_frame(address, picture.data(), display.width, display.height, display.buffer_width);
++        {
++            const phase::Scope present_scope(phase::Present);
++            renderer->write_back_frame(rt.memory());
++            renderer->set_fast_forward(fast);
++            (void)renderer->present(address, real_time);
++        }
++        perf::add_render_time(perf::Clock::now() - present_start);
++        if (screenshot_dir != nullptr && screenshot_every != 0u && renderer->frames_presented() % screenshot_every == 0u) {
++            const std::string path = std::string(screenshot_dir) + "/frame_" +
++                                     std::to_string(renderer->frames_presented()) + ".bmp";
++            if (!renderer->capture_frame(path))
++                log_once("capture-failed", "[render] cannot capture the frame to " + path +
++                                               "; no further capture is reported");
++        }
++        if (!renderer->pump_events()) media().window_closed.store(true, std::memory_order_release);
++        media().presents_done.fetch_add(1u, std::memory_order_release);
++    });
++    perf::end_frame(kernel().now_us(), true);
++}
++#endif
++
+ void present_frame(Runtime &rt) {
+     load_trace::note_flip();
+     // Overlays are swapped between frames; re-check before drawing the next one.
+@@ -635,8 +770,27 @@ void register_display_ctrl(HleRegistrar &hle) {
+             const DisplayState &d = media().display;
+             gpu::gedump::on_flip(rt.memory(), {d.framebuffer, d.buffer_width, d.pixel_format, d.width, d.height});
+         }
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++        const bool threaded = ge_threaded();
++        if (threaded) present_frame_threaded(rt);
++        else present_frame(rt);
++#else
+         present_frame(rt);
++#endif
+         bringup::on_flip(rt, media().display.framebuffer, media().display.pixel_format);
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++        // At most kFramesInFlight flips are ahead of the GE thread: the guest waits (in host time, the kernel keeps
++        // running) for the oldest one, which paces the game by the renderer when the renderer is the slower side.
++        constexpr std::uint64_t kFramesInFlight = 2u;
++        if (threaded && media().presents_posted > media().presents_done.load(std::memory_order_acquire) + kFramesInFlight) {
++            const std::uint64_t wanted = media().presents_posted - kFramesInFlight;
++            kernel().wait_host(ctx, std::nullopt, [wanted](bool) -> std::optional<std::uint32_t> {
++                if (media().presents_done.load(std::memory_order_acquire) >= wanted) return 0u;
++                return std::nullopt;
++            });
++            return;
++        }
++#endif
+         // <prefix>_FRAME_LIMIT_US=N: a flip comes at least N microseconds of
+         // emulated time after the one before, as with a frame limiter. A game
+         // that does not wait for the vblank then runs at the pace a display
+@@ -821,15 +975,22 @@ void register_ge(HleRegistrar &hle) {
+         media().ge_callbacks.erase(static_cast<std::int32_t>(arg(ctx, 0)));
+         kernel().finish(ctx, 0u);
+     });
++    // The GE thread tells an idle kernel that a job it may be waiting for has run.
++    gpu::ge_worker().set_wake_hook([] { kernel_signal_event(); });
+     const auto enqueue = [](Runtime &rt, AllegrexContext &ctx) {
+         const std::uint32_t id = media().next_ge_list++;
+         GeList list{};
+         list.pc = arg(ctx, 0) & 0x0FFFFFFFu;
+         list.stall = arg(ctx, 1) & 0x0FFFFFFFu;
+         list.callback = static_cast<std::int32_t>(arg(ctx, 2));
+-        media().ge_lists[id] = std::move(list);
+         perf::count_display_list();
+-        run_ge_list(rt, id);
++        if (ge_threaded()) {
++            media().ge_lists[id] = list;
++            post_ge_list(rt, id, list, false);
++        } else {
++            media().ge_lists[id] = std::move(list);
++            run_ge_list(rt, id);
++        }
+         kernel().finish(ctx, id);
+     };
+     hle.add("sceGe_user", "sceGeListEnQueue", enqueue);
+@@ -841,18 +1002,65 @@ void register_ge(HleRegistrar &hle) {
+             return;
+         }
+         found->second.stall = arg(ctx, 1) & 0x0FFFFFFFu;
+-        run_ge_list(rt, arg(ctx, 0));
++        if (ge_threaded()) post_ge_list(rt, arg(ctx, 0), found->second, true);
++        else run_ge_list(rt, arg(ctx, 0));
+         kernel().finish(ctx, 0u);
+     });
+-    hle.add("sceGe_user", "sceGeListSync", [](Runtime &, AllegrexContext &ctx) {
+-        auto found = media().ge_lists.find(arg(ctx, 0));
++    // With the GE thread, the two syncs wait for the jobs the guest has posted so far (mode 0) or say that the GE is
++    // still drawing (mode 1, 2); once they have run, the answer is the synchronous one.
++    const auto wait_for_jobs = [](AllegrexContext &ctx, std::uint32_t mode, std::uint64_t target,
++                                  std::function<std::uint32_t()> answer) {
++        gpu::GeWorker &worker = gpu::ge_worker();
++        if (worker.completed() >= target) {
++            kernel().finish(ctx, answer());
++            return;
++        }
++        if (mode != 0u) {
++            kernel().finish(ctx, 2u);   // peek: still drawing
++            return;
++        }
++        kernel().wait_host(ctx, std::nullopt, [target, answer = std::move(answer)](bool) -> std::optional<std::uint32_t> {
++            if (gpu::ge_worker().completed() >= target) return answer();
++            return std::nullopt;
++        });
++    };
++    hle.add("sceGe_user", "sceGeListSync", [wait_for_jobs](Runtime &, AllegrexContext &ctx) {
++        const std::uint32_t id = arg(ctx, 0);
+         // 0 = completed, 2 = still stalled (drawing).
+-        const std::uint32_t state = found == media().ge_lists.end() || found->second.done ? 0u : 2u;
+-        kernel().finish(ctx, state);
++        const auto answer = [id]() -> std::uint32_t {
++            if (ge_threaded()) {
++                const auto found = media().ge_lists.find(id);
++                return found == media().ge_lists.end() || media().ge_finished[id & 63u].load(std::memory_order_acquire) == id
++                           ? 0u
++                           : 2u;
++            }
++            const auto found = media().ge_lists.find(id);
++            return found == media().ge_lists.end() || found->second.done ? 0u : 2u;
++        };
++        if (!ge_threaded()) {
++            kernel().finish(ctx, answer());
++            return;
++        }
++        wait_for_jobs(ctx, arg(ctx, 1), media().last_list_job, answer);
+     });
+-    hle.add("sceGe_user", "sceGeDrawSync", [](Runtime &, AllegrexContext &ctx) {
+-        std::erase_if(media().ge_lists, [](const auto &item) { return item.second.done; });
+-        kernel().finish(ctx, 0u);
++    hle.add("sceGe_user", "sceGeDrawSync", [wait_for_jobs](Runtime &, AllegrexContext &ctx) {
++        const auto erase_done = [] {
++            if (ge_threaded())
++                std::erase_if(media().ge_lists, [](const auto &item) {
++                    return media().ge_finished[item.first & 63u].load(std::memory_order_acquire) == item.first;
++                });
++            else
++                std::erase_if(media().ge_lists, [](const auto &item) { return item.second.done; });
++        };
++        if (!ge_threaded()) {
++            erase_done();
++            kernel().finish(ctx, 0u);
++            return;
++        }
++        wait_for_jobs(ctx, arg(ctx, 0), media().last_list_job, [erase_done]() -> std::uint32_t {
++            erase_done();
++            return 0u;
++        });
+     });
+     hle.add("sceGe_user", "sceGeBreak", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
+     hle.add("sceGe_user", "sceGeContinue", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, 0u); });
+@@ -1268,7 +1476,19 @@ void show_cpu_picture_in_vram(Runtime &rt, std::uint32_t address, std::uint32_t
+         return;
+     }
+     const std::size_t bytes = static_cast<std::size_t>(stride) * height * 4u;
+-    media().renderer->upload_frame(address | kEdramBase, rt.memory().raw_pointer(address, bytes), width, height, stride);
++    const std::uint8_t *pixels = rt.memory().raw_pointer(address, bytes);
++#if defined(PORTABLEKIT_HAS_GL_RENDERER) && !defined(PORTABLEKIT_HAS_RENDERER)
++    if (ge_threaded()) {
++        // The picture is copied now: the decoder reuses its buffer for the next one while the GE thread is still on this.
++        if (pixels == nullptr) return;
++        gpu::Renderer *renderer = media().renderer.get();
++        gpu::ge_worker().post([renderer, address, width, height, stride, copy = std::vector<std::uint8_t>(pixels, pixels + bytes)] {
++            renderer->upload_frame(address | kEdramBase, copy.data(), width, height, stride);
++        });
++        return;
++    }
++#endif
++    media().renderer->upload_frame(address | kEdramBase, pixels, width, height, stride);
+ #else
+     (void)rt, (void)address, (void)width, (void)height, (void)stride, (void)pixel_mode;
+ #endif
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index f1f4d74..a45c309 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -516,6 +516,7 @@ void Kernel::scheduler_loop() {
+             if (runtime_->stopped()) return;
+             if (clock_mode_ == ClockMode::Realtime) refresh_realtime();
+             process_timers();
++            drain_host_interrupts();
+             if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+                 // Interrupts that come while nothing runs: on a coroutine of their own, so
+                 // that a stop inside a handler can leave it.
+@@ -580,6 +581,7 @@ void Kernel::finish(AllegrexContext &ctx, std::uint32_t result) {
+         charge_instruction_time();
+         charge_busy_time();
+     }
++    drain_host_interrupts();
+     if (interrupts_enabled_ && !pending_interrupts_.empty()) run_interrupts_nested();
+     if (dispatch_enabled_ && better_thread_ready(false)) yield_running(true);
+ }
+@@ -1027,6 +1029,7 @@ void Kernel::on_starvation(std::uint32_t pc) {
+     }
+     process_timers();
+     g_cpu.pc = pc;
++    drain_host_interrupts();
+     if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+         ++spin_interrupts_;
+         run_interrupts_nested();
+@@ -1280,6 +1283,34 @@ std::uint32_t Kernel::free_memory() const noexcept {
+ 
+ void Kernel::queue_interrupt(InterruptCall call) { pending_interrupts_.push_back(std::move(call)); }
+ 
++bool Kernel::post_interrupt_from_host(std::uint32_t function, const GuestCallArguments &arguments,
++                                      std::uint32_t argument_count) noexcept {
++    const std::uint32_t tail = host_interrupt_tail_.load(std::memory_order_relaxed);
++    if (tail - host_interrupt_head_.load(std::memory_order_acquire) >= kHostInterruptSlots) return false;
++    HostInterrupt &slot = host_interrupts_[tail % kHostInterruptSlots];
++    slot.function = function;
++    slot.arguments = arguments;
++    slot.argument_count = argument_count;
++    host_interrupt_tail_.store(tail + 1u, std::memory_order_release);
++    kernel_signal_event();   // an idle kernel wakes at once
++    return true;
++}
++
++void Kernel::drain_host_interrupts() {
++    std::uint32_t head = host_interrupt_head_.load(std::memory_order_relaxed);
++    const std::uint32_t tail = host_interrupt_tail_.load(std::memory_order_acquire);
++    if (head == tail) return;
++    for (; head != tail; ++head) {
++        const HostInterrupt &slot = host_interrupts_[head % kHostInterruptSlots];
++        InterruptCall call{};
++        call.function = slot.function;
++        call.arguments = slot.arguments;
++        call.argument_count = slot.argument_count;
++        pending_interrupts_.push_back(std::move(call));
++    }
++    host_interrupt_head_.store(head, std::memory_order_release);
++}
++
+ void Kernel::notify_callback(SceUID callback, std::uint32_t argument) {
+     const auto found = callbacks.find(callback);
+     if (found == callbacks.end()) return;
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index 5b0ab2f..7700c81 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -7,6 +7,7 @@
+ #include "psprecomp/runtime.hpp"
+ 
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cstdint>
+ #include <deque>
+@@ -399,6 +400,11 @@ public:
+     // Interrupts ----------------------------------------------------------
+     std::map<std::uint32_t, std::map<std::uint32_t, SubInterruptHandler>> sub_interrupts;
+     void queue_interrupt(InterruptCall call);
++    // The same from another host thread (the GE thread's signal and finish callbacks): ONE producer thread, a wait-free
++    // ring the kernel drains at its next HLE boundary or idle pass, in order, ahead of nothing it already queued itself.
++    // Returns false when the ring is full (the kernel has not run for a while): the caller retries.
++    bool post_interrupt_from_host(std::uint32_t function, const GuestCallArguments &arguments,
++                                  std::uint32_t argument_count = 4u) noexcept;
+     // Marks a callback as notified; it runs the next time its owner thread
+     // performs a callback-aware wait, as on hardware.
+     void notify_callback(SceUID callback, std::uint32_t argument);
+@@ -524,6 +530,17 @@ private:
+ 
+     std::vector<std::function<void()>> vblank_hooks_;
+     std::deque<InterruptCall> pending_interrupts_;
++    // post_interrupt_from_host(): single producer, the kernel's thread is the single consumer.
++    struct HostInterrupt {
++        std::uint32_t function{};
++        GuestCallArguments arguments{};
++        std::uint32_t argument_count{};
++    };
++    static constexpr std::uint32_t kHostInterruptSlots = 256u;
++    std::array<HostInterrupt, kHostInterruptSlots> host_interrupts_{};
++    std::atomic<std::uint32_t> host_interrupt_head_{0u};   // consumer: next slot to read
++    std::atomic<std::uint32_t> host_interrupt_tail_{0u};   // producer: next slot to write
++    void drain_host_interrupts();
+     bool interrupt_active_{};
+     bool in_timers_{};
+ 
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index f1652ca..619e521 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -20,8 +20,12 @@
+ //     --no-submit         walk the lists and decode vertices, give the renderer nothing
+ //     --repeat N          replay the flip list N times (for timing)
+ //     --set KEY=VALUE     a renderer setting (see apply_setting)
++//     --threaded          run the lists, uploads and presents on the GE thread (gpu::GeWorker), fed from a driver thread
++//                         as the guest would; the picture has to be identical (the driver drains the queue before it
++//                         changes memory, as a game does through sceGeDrawSync)
+ #include "gpu/ge_dump.hpp"
+ #include "gpu/ge_state.hpp"
++#include "gpu/ge_worker.hpp"
+ #include "gpu/renderer.hpp"
+ #include "gpu/texture_decode.hpp"
+ #if defined(GE_REPLAY_HAS_GL)
+@@ -34,6 +38,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <iostream>
+ #include <map>
+ #include <memory>
+@@ -65,6 +70,7 @@ struct Options {
+     std::set<std::uint64_t> detail;
+     bool null_draw{};
+     bool no_submit{};
++    bool threaded{};
+     std::uint32_t repeat{1};
+     std::vector<std::pair<std::string, std::string>> settings;
+ };
+@@ -332,6 +338,7 @@ int main(int argc, char **argv) {
+             options.detail.insert(list.begin(), list.end());
+         } else if (arg == "--null-draw") options.null_draw = true;
+         else if (arg == "--no-submit") options.no_submit = true;
++        else if (arg == "--threaded") options.threaded = true;
+         else if (arg == "--repeat") options.repeat = static_cast<std::uint32_t>(std::max(1, std::atoi(value().c_str())));
+         else if (arg == "--set") {
+             const std::string pair = value();
+@@ -422,6 +429,15 @@ int main(int argc, char **argv) {
+     std::uint64_t replayed = 0;
+     std::uint64_t transfers = 0;
+     std::uint64_t picture_uploads = 0, memory_flips = 0;  // movie frames: CPU-written pictures and flips shown from main memory
++    // With --threaded the renderer's side of every event runs on the GE thread; this (driver) thread plays the guest.
++    const auto run_job = [&](std::function<void()> job) {
++        if (options.threaded) gpu::ge_worker().post(std::move(job));
++        else job();
++    };
++    const auto drain = [&] {
++        if (options.threaded) gpu::ge_worker().wait_completed(gpu::ge_worker().posted());
++    };
++    const auto replay = [&]() -> int {
+     for (std::uint32_t pass = 0; pass < options.repeat; ++pass) {
+         for (const std::uint64_t flip : flips) {
+             gpu::gedump::FlipDump dump;
+@@ -443,6 +459,7 @@ int main(int argc, char **argv) {
+             double walk_ms = 0, submit_ms = 0, present_ms = 0;
+             bool first_event = true;
+             for (const gpu::gedump::Event &event : dump.events) {
++                if (!first_event) drain();   // a game synchronises (sceGeDrawSync) before it changes what the GE reads
+                 if (!first_event && !gpu::gedump::apply_event_memory(pack, event, dump, *memory)) {
+                     std::cerr << "cannot apply memory changes in flip " << flip << "\n";
+                     return 1;
+@@ -450,6 +467,7 @@ int main(int argc, char **argv) {
+                 first_event = false;
+                 switch (event.kind) {
+                 case gpu::gedump::EventKind::ListRun: {
++                    run_job([&, event_b = event.b, event_c = event.c] {
+                     renderer->begin_display_list();
+                     if (options.no_submit) ge.set_draw_sink([](const gpu::DrawCall &) {});
+                     else
+@@ -492,40 +510,45 @@ int main(int argc, char **argv) {
+                     const Clock::time_point walk_start = Clock::now();
+                     bool finished = false;
+                     try {
+-                        ge.execute(*memory, event.b, event.c, finished);
++                        ge.execute(*memory, event_b, event_c, finished);
+                     } catch (const std::exception &failure) {
+                         std::cerr << "flip " << flip << ": list aborted: " << failure.what() << "\n";
+                     }
+                     walk_ms += std::chrono::duration<double, std::milli>(Clock::now() - walk_start).count();
+                     ge.set_draw_sink(nullptr);
++                    });
+                     break;
+                 }
+                 case gpu::gedump::EventKind::Picture: {
+                     if (event.e != 3u || (event.a & 0x1F000000u) != kEdramBase) break;
+-                    const std::size_t bytes = static_cast<std::size_t>(event.d) * event.c * 4u;
+-                    renderer->upload_frame(event.a | kEdramBase, memory->raw_pointer(event.a, bytes), event.b, event.c,
+-                                           event.d);
+-                    ++picture_uploads;
++                    run_job([&, a = event.a, b = event.b, c = event.c, d = event.d] {
++                        const std::size_t bytes = static_cast<std::size_t>(d) * c * 4u;
++                        renderer->upload_frame(a | kEdramBase, memory->raw_pointer(a, bytes), b, c, d);
++                        ++picture_uploads;
++                    });
+                     break;
+                 }
+                 case gpu::gedump::EventKind::Flip: {
+-                    const gpu::gedump::DisplayInfo &d = dump.display;
++                    const gpu::gedump::DisplayInfo d = dump.display;
+                     const std::uint32_t address =
+                         (d.framebuffer & 0xFF000000u) == 0u ? (d.framebuffer | 0x04000000u) : d.framebuffer;
+-                    if ((address & 0x1F000000u) != kEdramBase && d.pixel_format == 3u) {
+-                        const std::size_t bytes = static_cast<std::size_t>(d.buffer_width) * d.height * 4u;
+-                        renderer->upload_frame(address, memory->raw_pointer(address, bytes), d.width, d.height,
+-                                               d.buffer_width);
+-                        ++memory_flips;
+-                    }
+-                    const Clock::time_point present_start = Clock::now();
+-                    renderer->write_back_frame(*memory);
+-                    renderer->present(address);
+-                    present_ms += std::chrono::duration<double, std::milli>(Clock::now() - present_start).count();
++                    run_job([&, d, address] {
++                        if ((address & 0x1F000000u) != kEdramBase && d.pixel_format == 3u) {
++                            const std::size_t bytes = static_cast<std::size_t>(d.buffer_width) * d.height * 4u;
++                            renderer->upload_frame(address, memory->raw_pointer(address, bytes), d.width, d.height,
++                                                   d.buffer_width);
++                            ++memory_flips;
++                        }
++                        const Clock::time_point present_start = Clock::now();
++                        renderer->write_back_frame(*memory);
++                        renderer->present(address);
++                        present_ms += std::chrono::duration<double, std::milli>(Clock::now() - present_start).count();
++                    });
+                     break;
+                 }
+                 }
+             }
++            drain();
+             const double flip_ms = std::chrono::duration<double, std::milli>(Clock::now() - flip_start).count();
+             total_walk_ms += walk_ms;
+             total_submit_ms += submit_ms;
+@@ -533,7 +556,7 @@ int main(int argc, char **argv) {
+             total_flip_ms += flip_ms;
+             ++replayed;
+ #if defined(GE_REPLAY_HAS_GL)
+-            if (gl != nullptr) {
++            if (gl != nullptr) run_job([&, pass, flip, walk_ms, submit_ms, present_ms, flip_ms] {
+                 gl->flush();
+                 if (!options.png.empty() && pass + 1 == options.repeat) {
+                     std::vector<std::uint8_t> rgba;
+@@ -574,10 +597,33 @@ int main(int argc, char **argv) {
+                                 walk_ms - submit_ms, submit_ms, present_ms, flip_ms);
+                 }
+                 gl->reset_frame_stats();
+-            }
++            });
++            drain();
+ #endif
+         }
+     }
++    return 0;
++    };
++    if (options.threaded) {
++        const std::function<int()> replay_fn = replay;
++        struct Driver {
++            const std::function<int()> *replay;
++            int result;
++        } driver{&replay_fn, 0};
++        const bool started = gpu::ge_worker().run_with_guest_thread(
++            [](void *pointer) {
++                auto *d = static_cast<Driver *>(pointer);
++                d->result = (*d->replay)();
++            },
++            &driver, -1, 8u << 20, -1);
++        if (!started) {
++            std::cerr << "cannot start the guest thread\n";
++            return 1;
++        }
++        if (driver.result != 0) return driver.result;
++    } else if (const int result = replay(); result != 0) {
++        return result;
++    }
+     if (options.regs) {
+         for (const auto &[key, count] : register_values)
+             std::printf("reg 0x%02X = 0x%06X : %llu draws\n", static_cast<unsigned>(key >> 32u),

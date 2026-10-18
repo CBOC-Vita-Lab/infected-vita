@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:58:47 +0000
+Subject: [PATCH] GE: NEON skinning reads bone columns laid out once per vertex
+ run
+
+The bone matrices' columns were copied into a padded block for every bone of every vertex; they are now laid out once
+per run. Checked in Vita3K with CHECK_DECODE: 500,000 runs, all identical to the scalar decoder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index be8dcfc..c8af07a 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -277,6 +277,24 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+     const std::uint32_t color_type = layout.color_type;
+     const bool skinned = WeightType != 0u && layout.skinned;
+     const std::uint32_t bones = std::min(layout.weight_count, 8u);
++#if defined(__ARM_NEON) && defined(__arm__)
++    // The bone matrices' columns, each in a lane-aligned quad with a zero fourth lane, laid out once for the run rather
++    // than copied for every bone of every vertex.
++    [[maybe_unused]] alignas(16) float columns[8][16];
++    if constexpr (WeightType != 0u) {
++        if (skinned) {
++            for (std::uint32_t bone = 0; bone < bones; ++bone) {
++                const float *m = bone_matrices + bone * 12u;
++                for (std::uint32_t column = 0; column < 4u; ++column) {
++                    columns[bone][column * 4u + 0u] = m[column * 3u + 0u];
++                    columns[bone][column * 4u + 1u] = m[column * 3u + 1u];
++                    columns[bone][column * 4u + 2u] = m[column * 3u + 2u];
++                    columns[bone][column * 4u + 3u] = 0.0f;
++                }
++            }
++        }
++    }
++#endif
+     for (std::uint32_t i = 0; i < count; ++i) {
+         const std::uint8_t *base = data + static_cast<std::size_t>(i) * layout.stride;
+         Vertex vertex{};
+@@ -330,13 +348,10 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+                 for (std::uint32_t bone = 0; bone < bones; ++bone) {
+                     const float weight = read_field<WeightType, false>(at + bone * weight_size) * weight_scale;
+                     if (weight == 0.0f) continue;
+-                    const float *m = bone_matrices + bone * 12u;
+-                    // Columns m[0..2], m[3..5], m[6..8], m[9..11]; the fourth lane is whatever follows and is never used.
+-                    float column[16];
+-                    std::memcpy(column, m, 12u * sizeof(float));
+-                    column[12] = column[13] = column[14] = column[15] = 0.0f;
+-                    const float32x4_t c0 = vld1q_f32(column), c1 = vld1q_f32(column + 3), c2 = vld1q_f32(column + 6),
+-                                      c3 = vld1q_f32(column + 9);
++                    // Columns m[0..2], m[3..5], m[6..8], m[9..11] of the bone's matrix; the fourth lane is never used.
++                    const float *column = columns[bone];
++                    const float32x4_t c0 = vld1q_f32(column), c1 = vld1q_f32(column + 4), c2 = vld1q_f32(column + 8),
++                                      c3 = vld1q_f32(column + 12);
+                     float32x4_t p = vmulq_n_f32(c0, p0);
+                     p = vmlaq_n_f32(p, c1, p1);
+                     p = vmlaq_n_f32(p, c2, p2);

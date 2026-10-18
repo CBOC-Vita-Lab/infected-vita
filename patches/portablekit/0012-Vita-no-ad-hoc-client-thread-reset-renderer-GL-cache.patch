@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 02:06:42 +0000
+Subject: [PATCH] Vita: no ad hoc client thread, reset renderer GL cache after
+ the platform overlay, no %zu in Vita-built printf calls
+
+- adhoc client: on the Vita the client never goes online and starts no std::thread.
+- GlRenderer::present: after glp::swap_buffers() re-enable the scissor test and forget the cached GL state, because the platform's overlay
+  composite changes program, bindings and fixed-function state.
+- load_trace, text_input: %zu is not supported by vitasdk newlib printf (corrupts the argument list); use %lu with casts.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/adhoc/client.cpp b/host/adhoc/client.cpp
+index 7a13ef5..7325bfd 100644
+--- a/host/adhoc/client.cpp
++++ b/host/adhoc/client.cpp
+@@ -419,7 +419,13 @@ struct Client::Impl {
+     std::map<int, DatagramSocket> datagrams;
+     std::map<int, StreamSocket> streams;
+ 
++#if defined(__vita__)
++    // The handheld port has no ad hoc networking (and no host threads in the coroutine runtime): the client never goes
++    // online, so scans find nothing and joins fail, instead of a std::thread that cannot start.
++    Impl() {}
++#else
+     Impl() { thread = std::thread([this] { run(); }); }
++#endif
+ 
+     ~Impl() {
+         quit = true;
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 34f8b25..69abb44 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1892,6 +1892,10 @@ struct GlRenderer::Impl {
+             blit(target->color, 0, 0, static_cast<std::int32_t>(glp::caps().window_width),
+                  static_cast<std::int32_t>(glp::caps().window_height));
+             glp::swap_buffers();
++            // The platform may have drawn its own overlay on top (other program, fixed-function state, other bindings): forget what this
++            // renderer thinks is set. Scissor is the one state it never caches (always on).
++            glEnable(GL_SCISSOR_TEST);
++            cache = Cache{};
+         }
+         ++frames;
+         evict_textures();
+diff --git a/host/kernel/load_trace.cpp b/host/kernel/load_trace.cpp
+index ab44a2c..2298577 100644
+--- a/host/kernel/load_trace.cpp
++++ b/host/kernel/load_trace.cpp
+@@ -97,9 +97,10 @@ void tick(std::uint64_t emulated_us) {
+         threads += part;
+     }
+     const double at_s = std::chrono::duration<double>(now - s.run_start).count();
+-    std::printf("[loadtrace] t=%.2fs real=%.0fms emu=%.0fms flips=%zu disc=%zuKiB/%zu ms0=%zuKiB pace=%.0fms audio=%d/%zu |%s\n",
+-                at_s, real_ms, static_cast<double>(emulated_us - s.interval_emulated_start) / 1000.0, s.flips,
+-                s.disc_bytes / 1024u, s.disc_reads, s.stick_bytes / 1024u, s.pacing_ms, s.audio_peak, s.audio_buffers, threads.c_str());
++    std::printf("[loadtrace] t=%.2fs real=%.0fms emu=%.0fms flips=%lu disc=%luKiB/%lu ms0=%luKiB pace=%.0fms audio=%d/%lu |%s\n",
++                at_s, real_ms, static_cast<double>(emulated_us - s.interval_emulated_start) / 1000.0, static_cast<unsigned long>(s.flips),
++                static_cast<unsigned long>(s.disc_bytes / 1024u), static_cast<unsigned long>(s.disc_reads), static_cast<unsigned long>(s.stick_bytes / 1024u),
++                s.pacing_ms, s.audio_peak, static_cast<unsigned long>(s.audio_buffers), threads.c_str());
+     std::fflush(stdout);
+     s.interval_start = now;
+     s.interval_emulated_start = emulated_us;
+diff --git a/host/ui/text_input.cpp b/host/ui/text_input.cpp
+index e47b6f7..a95b771 100644
+--- a/host/ui/text_input.cpp
++++ b/host/ui/text_input.cpp
+@@ -388,7 +388,7 @@ void draw_field(ImDrawList *draw, float width) {
+     // The counter on the right, red while the text is full or a key was
+     // refused a moment ago.
+     char counter[32];
+-    std::snprintf(counter, sizeof(counter), "%zu / %zu", k.text.size(), k.request.max_length);
++    std::snprintf(counter, sizeof(counter), "%lu / %lu", static_cast<unsigned long>(k.text.size()), static_cast<unsigned long>(k.request.max_length));
+     const bool refused = Clock::now() - k.refused < kRefusedTime;
+     const bool full = k.text.size() >= k.request.max_length;
+     const ImVec2 counter_size = ImGui::CalcTextSize(counter);

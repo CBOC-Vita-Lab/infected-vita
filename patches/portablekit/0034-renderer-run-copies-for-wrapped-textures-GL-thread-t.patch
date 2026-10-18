@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:32:08 +0000
+Subject: [PATCH] renderer: run copies for wrapped textures, GL-thread timing,
+ fractional display scale
+
+- A texture that is not one run of host memory (the movie picture that wraps past the end
+  of VRAM) is copied run by run with GuestMemory::copy_out instead of byte by byte (80 ms
+  per MB on the Vita's CPU, every movie frame).
+- settings.timing=N (INFECTED_GL_TIMING): a [gl-time] line every N presents with target
+  switches, the first draw after each switch, other draws, texture uploads and the swap;
+  gpu_timing=1 adds a glFinish before the swap and reports its wait.
+- settings.display_scale_percent (INFECTED_GL_DISPLAY_SCALE_PERCENT, 100..300): display
+  targets drawn at that percentage of 480x272 (150 = 720x408) and enlarged to the window
+  with the blit's linear filter. Target::scale is a float; viewport, scissor and read-back
+  already scaled by a factor. Desktop replay of flips 4200-4203 at 150 checked by eye.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index 2bd01ba..6ef6300 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -26,6 +26,12 @@
+     std::uint32_t aux_programs{1u};      // the blit, then every post and overlay program built
+ 
+     [[nodiscard]] std::uint32_t display_scale() const { return ssaa_scale != 0u ? ssaa_scale : settings.display_scale; }
++    // The display targets' scale as drawn: display_scale, or display_scale_percent when it is set (never with the desktop's
++    // supersampled MSAA preview, which needs its whole multiple).
++    [[nodiscard]] float display_scale_factor() const {
++        if (ssaa_scale == 0u && settings.display_scale_percent != 0u) return static_cast<float>(settings.display_scale_percent) / 100.0f;
++        return static_cast<float>(display_scale());
++    }
+ 
+     // Called when the renderer starts and at the end of every frame: the options change between frames, never inside one.
+     void refresh_options(bool force) {
+@@ -96,7 +102,7 @@
+         glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, 16, vertices + 2);
+         if (program.location[glsl::kUTexture] != -1) glUniform1i(program.location[glsl::kUTexture], 0);
+         if (inv_size != nullptr) uniform(program, glsl::kUInvSize, inv_size);
+-        if (!settings.null_draw) glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        if (!settings.null_draw) timed_draw([] { glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); });
+         glEnableVertexAttribArray(1u);
+         glEnableVertexAttribArray(3u);
+         glEnable(GL_SCISSOR_TEST);
+@@ -291,12 +297,23 @@
+     // Puts a finished picture where it is seen: on the window if there is one (the Vita) and, for a picture that has
+     // something added to it (the counter, the overlay, a supersampled preview that needs averaging down), in the
+     // final picture that read_presented returns. Without any of those the game's target goes to the window as it is.
++    void timed_swap() {
++        if (settings.timing == 0u) {
++            glp::swap_buffers();
++        } else {
++            const Clock::time_point start = Clock::now();
++            glp::swap_buffers();
++            gt.swap_us += micros_since(start);
++        }
++        scene_fresh = true;   // the window's next picture is a new scene
++    }
++
+     void show(Target &target) {
+         resolve_picture(target);
+         composed.valid = false;
+         const bool counter = opt.show_fps;
+         const bool menu = overlay_wanted();
+-        const bool resolve = ssaa_scale != 0u && target.scale == ssaa_scale;
++        const bool resolve = ssaa_scale != 0u && target.scale == static_cast<float>(ssaa_scale);
+         const bool window = glp::has_window();
+         const auto window_w = static_cast<std::int32_t>(glp::caps().window_width);
+         const auto window_h = static_cast<std::int32_t>(glp::caps().window_height);
+@@ -305,7 +322,7 @@
+                 glBindFramebuffer(GL_FRAMEBUFFER, 0u);
+                 cache.fbo = 0u;
+                 blit(target.color, 0, 0, window_w, window_h, glp::caps().window_flip_y);
+-                glp::swap_buffers();
++                timed_swap();
+                 // The platform may have drawn on top (other program and bindings): forget the cached state. Scissor is never cached (always on).
+                 glEnable(GL_SCISSOR_TEST);
+                 cache = Cache{};
+@@ -318,14 +335,14 @@
+             cache.fbo = 0u;
+             blit(target.color, 0, 0, window_w, window_h, glp::caps().window_flip_y);
+             draw_overlays(window_w, window_h, glp::caps().window_flip_y, counter, menu);
+-            glp::swap_buffers();
++            timed_swap();
+             // The platform may have drawn on top (other program and bindings): forget the cached state. Scissor is never cached (always on).
+             glEnable(GL_SCISSOR_TEST);
+             cache = Cache{};
+             return;
+         }
+-        const std::uint32_t out_scale = resolve ? 2u : target.scale;
+-        const std::uint32_t out_w = target.psp_width * out_scale, out_h = target.psp_height * out_scale;
++        const std::uint32_t out_w = resolve ? target.psp_width * 2u : target.width;
++        const std::uint32_t out_h = resolve ? target.psp_height * 2u : target.height;
+         if (!ensure_composed(out_w, out_h)) return;
+         glBindFramebuffer(GL_FRAMEBUFFER, composed.fbo);
+         cache.fbo = composed.fbo;
+@@ -345,7 +362,7 @@
+             glBindFramebuffer(GL_FRAMEBUFFER, 0u);
+             cache.fbo = 0u;
+             blit(composed.color, 0, 0, window_w, window_h, glp::caps().window_flip_y);
+-            glp::swap_buffers();
++            timed_swap();
+             // The platform may have drawn on top (other program and bindings): forget the cached state. Scissor is never cached (always on).
+             glEnable(GL_SCISSOR_TEST);
+             cache = Cache{};
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 6ce626d..6715abc 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -157,8 +157,8 @@ struct Target {
+     std::uint32_t format{3u};
+     std::uint32_t psp_width{kPspWidth};
+     std::uint32_t psp_height{kPspHeight};
+-    std::uint32_t scale{1u};
+-    std::uint32_t width{};  // in pixels, psp * scale
++    float scale{1.0f};       // GPU pixels per PSP pixel (2 for the Vita's 960x544; 1.5 with display_scale_percent=150)
++    std::uint32_t width{};  // in pixels, psp * scale, rounded
+     std::uint32_t height{};
+     GLuint fbo{};
+     GLuint color{};
+@@ -479,8 +479,8 @@ struct GlRenderer::Impl {
+ 
+     // ---- render targets ------------------------------------------------------------------------
+ 
+-    std::uint32_t scale_for(std::uint32_t stride) const {
+-        return stride >= 512u ? display_scale() : offscreen_scale;
++    float scale_for(std::uint32_t stride) const {
++        return stride >= 512u ? display_scale_factor() : static_cast<float>(offscreen_scale);
+     }
+ 
+     static void size_for(std::uint32_t stride, std::uint32_t &width, std::uint32_t &height) {
+@@ -519,16 +519,61 @@ struct GlRenderer::Impl {
+         ++st().texture_binds;
+     }
+ 
++    // ---- settings.timing: where the GL thread's time goes ------------------------------------------------------------
++    struct GlTimes {
++        std::uint64_t first_us{}, draw_us{}, texture_us{}, swap_us{}, finish_us{}, max_first_us{};
++        std::uint32_t firsts{}, draws{}, switches{}, textures{}, frames{};
++    } gt;
++    bool scene_fresh{true};   // no draw has gone to the bound target since it was bound
++    [[nodiscard]] static std::uint64_t micros_since(Clock::time_point start) {
++        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
++    }
++    // Wraps one GL draw: the first one after a target switch is counted apart.
++    template <typename Draw> void timed_draw(Draw &&draw) {
++        if (settings.timing == 0u) {
++            draw();
++            scene_fresh = false;
++            return;
++        }
++        const Clock::time_point start = Clock::now();
++        draw();
++        const std::uint64_t us = micros_since(start);
++        if (scene_fresh) {
++            gt.first_us += us;
++            gt.max_first_us = std::max(gt.max_first_us, us);
++            ++gt.firsts;
++        } else {
++            gt.draw_us += us;
++            ++gt.draws;
++        }
++        scene_fresh = false;
++    }
++    void report_times() {
++        if (settings.timing == 0u || ++gt.frames < settings.timing) return;
++        const double n = static_cast<double>(gt.frames);
++        char line[400];
++        std::snprintf(line, sizeof(line),
++                      "[gl-time] per frame over %u: target switches %.1f | first draw after a switch %.2f ms (%.1f, worst %.1f ms) | "
++                      "other draws %.2f ms (%.1f) | texture uploads %.2f ms (%.1f) | swap %.2f ms | gpu finish %.2f ms",
++                      gt.frames, gt.switches / n, gt.first_us / n / 1000.0, gt.firsts / n, gt.max_first_us / 1000.0,
++                      gt.draw_us / n / 1000.0, gt.draws / n, gt.texture_us / n / 1000.0, gt.textures / n, gt.swap_us / n / 1000.0,
++                      gt.finish_us / n / 1000.0);
++        std::cout << line << std::endl;
++        gt = GlTimes{};
++    }
++
+     void bind_target(const Target &target) {
+         if (cache.fbo == target.fbo) return;
+         glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+         cache.fbo = target.fbo;
+         ++st().target_switches;
++        ++gt.switches;
++        scene_fresh = true;
+     }
+ 
+     void allocate_target(Target &target) {
+-        target.width = target.psp_width * target.scale;
+-        target.height = target.psp_height * target.scale;
++        target.width = static_cast<std::uint32_t>(std::lround(static_cast<float>(target.psp_width) * target.scale));
++        target.height = static_cast<std::uint32_t>(std::lround(static_cast<float>(target.psp_height) * target.scale));
+         if (target.fbo == 0u) {
+             glGenFramebuffers(1, &target.fbo);
+             glGenTextures(1, &target.color);
+@@ -587,7 +632,7 @@ struct GlRenderer::Impl {
+             found->second->address = key;
+         }
+         Target &target = *found->second;
+-        const std::uint32_t scale = scale_for(stride);
++        const float scale = scale_for(stride);
+         std::uint32_t width = 0u, height = 0u;
+         size_for(stride, width, height);
+         if (target.fbo == 0u || target.stride != stride || target.psp_width != width || target.scale != scale) {
+@@ -773,6 +818,15 @@ struct GlRenderer::Impl {
+     }
+ 
+     bool decode_into(TextureEntry &entry, const GuestMemory &memory, bool create) {
++        struct Scope {
++            Impl &impl;
++            Clock::time_point start{Clock::now()};
++            ~Scope() {
++                if (impl.settings.timing == 0u) return;
++                impl.gt.texture_us += micros_since(start);
++                ++impl.gt.textures;
++            }
++        } timing_scope{*this};
+         // The one place the HD texture pack takes part: a texture about to be uploaded is replaced by its
+         // pack entry (with mips) when the pack has one for its replacement key.
+         const bool counted = !create;  // an entry being created is added to texture_bytes by the caller
+@@ -820,14 +874,7 @@ struct GlRenderer::Impl {
+             // Legal in guest space but not one run of host memory: a 512-row texture in a 480-wide buffer at the
+             // end of VRAM (the movie picture of Infected) wraps to the start of VRAM. Gathered page by page.
+             wrap_scratch.resize(bytes);
+-            for (std::uint32_t offset = 0; offset < bytes; offset += 4096u) {
+-                const std::uint32_t length = std::min<std::uint32_t>(4096u, bytes - offset);
+-                if (const std::uint8_t *page = memory.raw_pointer(state.address + offset, length)) {
+-                    std::memcpy(wrap_scratch.data() + offset, page, length);
+-                } else {
+-                    for (std::uint32_t i = 0; i < length; ++i) wrap_scratch[offset + i] = memory.load8(state.address + offset + i);
+-                }
+-            }
++            memory.copy_out(state.address, std::span<std::uint8_t>(wrap_scratch.data(), bytes));
+             data = wrap_scratch.data();
+         }
+         if (data == nullptr || state.width == 0u || state.height == 0u) return nullptr;
+@@ -1251,8 +1298,9 @@ struct GlRenderer::Impl {
+         glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, texcoord));
+         glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), base + offsetof(Vertex, color));
+         if (!settings.null_draw)
+-            glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT,
+-                           batch_indices.data());
++            timed_draw([&] {
++                glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT, batch_indices.data());
++            });
+         ++st().gl_draws;
+         st().bytes_uploaded += batch_vertices.size() * sizeof(Vertex) + batch_indices.size() * sizeof(std::uint16_t);
+         st().vertices_uploaded += batch_vertices.size();
+@@ -1765,7 +1813,7 @@ struct GlRenderer::Impl {
+         if (du < 96.0f || dv < 54.0f || u0 < 0.0f || v0 < 0.0f || u1 > static_cast<float>(call.texture.width) + 0.01f ||
+             v1 > static_cast<float>(call.texture.height) + 0.01f)
+             return false;
+-        const float scale = static_cast<float>(target.scale);
++        const float scale = target.scale;
+         if ((x1 - x0) * scale < 1.5f * du || (y1 - y0) * scale < 1.5f * dv) return false;
+         rect[0] = u0 + 0.5f;
+         rect[1] = v0 + 0.5f;
+@@ -1870,7 +1918,7 @@ struct GlRenderer::Impl {
+ 
+         // Viewport. The GE maps ndc to the screen as ndc * scale + offset - region offset,
+         // with y pointing down on screen; the shader flips y so that GL's window rows are the PSP's.
+-        const float scale = static_cast<float>(target.scale);
++        const float scale = target.scale;
+         const float target_w = static_cast<float>(target.width), target_h = static_cast<float>(target.height);
+         float vx = 0.0f, vy = 0.0f, vw = target_w, vh = target_h;
+         state.flip[0] = 1.0f;
+@@ -2117,7 +2165,7 @@ struct GlRenderer::Impl {
+         glVertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, 16, vertices);
+         glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, 16, vertices + 2);
+         glUniform1i(blit_texture, 0);
+-        if (!settings.null_draw) glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        if (!settings.null_draw) timed_draw([] { glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); });
+         if (write_depth_zero) {
+             glDepthRangef(0.0f, 1.0f);
+             glDisable(GL_DEPTH_TEST);
+@@ -2189,7 +2237,13 @@ struct GlRenderer::Impl {
+         has_presented = true;
+         // A 3D frame with no HUD after it (or one the trigger in submit() did not see) gets its FXAA now.
+         if (opt.fxaa && !fxaa_done && scene_draws >= kFxaaMinDraws && target->stride >= 512u) run_fxaa(*target);
++        if (settings.gpu_timing) {
++            const Clock::time_point start = Clock::now();
++            glFinish();
++            gt.finish_us += micros_since(start);
++        }
+         show(*target);
++        report_times();
+         ++frames;
+         evict_textures();
+         release_stale_hd();
+@@ -2221,12 +2275,12 @@ struct GlRenderer::Impl {
+         const std::size_t bytes = static_cast<std::size_t>(target.stride) * target.psp_height * bytes_per_pixel;
+         std::uint8_t *out = memory.raw_pointer(target.address, bytes);
+         if (out == nullptr) return;
+-        const std::uint32_t scale = target.scale;
++        const float scale = target.scale;
+         for (std::uint32_t y = 0; y < target.psp_height; ++y) {
+-            const std::uint8_t *row = rgba.data() + static_cast<std::size_t>(y * scale) * target.width * 4u;
++            const std::uint8_t *row = rgba.data() + static_cast<std::size_t>(static_cast<float>(y) * scale) * target.width * 4u;
+             std::uint8_t *line = out + static_cast<std::size_t>(y) * target.stride * bytes_per_pixel;
+             for (std::uint32_t x = 0; x < target.psp_width; ++x) {
+-                const std::uint8_t *pixel = row + static_cast<std::size_t>(x * scale) * 4u;
++                const std::uint8_t *pixel = row + static_cast<std::size_t>(static_cast<float>(x) * scale) * 4u;
+                 if (target.format == 3u) {
+                     std::memcpy(line + x * 4u, pixel, 4u);
+                     continue;
+@@ -2259,6 +2313,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     const bool flag = number != 0u;
+     const auto u32 = static_cast<std::uint32_t>(number);
+     if (name == "display_scale") settings.display_scale = std::max(1u, u32);
++    else if (name == "display_scale_percent") settings.display_scale_percent = u32 == 0u ? 0u : std::clamp(u32, 100u, 300u);
+     else if (name == "offscreen_scale") settings.offscreen_scale = std::max(1u, u32);
+     else if (name == "no_blend_color") settings.force_no_blend_color = flag;
+     else if (name == "through_depth") settings.through_depth = flag;
+@@ -2266,6 +2321,8 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "writeback") settings.writeback = u32;
+     else if (name == "texture_budget_mb") settings.texture_budget = number * 1024ull * 1024ull;
+     else if (name == "stats_every") settings.stats_every = u32;
++    else if (name == "timing") settings.timing = u32;
++    else if (name == "gpu_timing") settings.gpu_timing = flag;
+     else if (name == "texture_always_validate") settings.texture_always_validate = flag;
+     else if (name == "merge") settings.merge_draws = flag;
+     else if (name == "null_draw") settings.null_draw = flag;
+@@ -2290,8 +2347,8 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ 
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+-        "display_scale", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
++        "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+@@ -2339,7 +2396,7 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     impl.hd.set_binder([&impl](std::uint32_t texture) { impl.bind_texture(texture); });
+     if (!impl.hd_configured) impl.hd.configure(hd_config_from_environment());
+     impl.ready = true;
+-    std::cout << "Renderer: OpenGL ES 2.0 backend on " << impl.description << ", display x" << impl.display_scale()
++    std::cout << "Renderer: OpenGL ES 2.0 backend on " << impl.description << ", display x" << impl.display_scale_factor()
+               << ", offscreen x" << impl.offscreen_scale << multisampling << "\n";
+     return true;
+ }
+@@ -2519,7 +2576,8 @@ std::vector<GlRenderer::TargetInfo> GlRenderer::target_infos() const {
+     std::vector<TargetInfo> out;
+     for (const auto &entry : impl_->targets) {
+         const Target &target = *entry.second;
+-        out.push_back({target.address, target.stride, target.format, target.width, target.height, target.scale,
++        out.push_back({target.address, target.stride, target.format, target.width, target.height,
++                       static_cast<std::uint32_t>(std::lround(target.scale)),
+                        target.draws});
+     }
+     return out;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 78bcab6..273c0b4 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -18,6 +18,10 @@ struct GlSettings {
+     // A display framebuffer (480 pixels wide or more) is drawn at this multiple of
+     // the PSP's 480x272: 2 gives the Vita's 960x544.
+     std::uint32_t display_scale{2};
++    // Non-zero: the display framebuffers are drawn at this percentage of the PSP's size instead (150 = 720x408), and
++    // enlarged to the window with linear filtering when shown. Less to fill per frame for a slightly softer picture
++    // (the Mario Kart Wii Vita port draws at 150 % by default for the same reason).
++    std::uint32_t display_scale_percent{0};
+     // The smaller targets the game renders into and samples again (240 and 120
+     // pixels wide in Infected): at 1 they are drawn at the PSP's own size and
+     // magnified when sampled, at 2 at the display's size.
+@@ -39,6 +43,12 @@ struct GlSettings {
+ #else
+     std::uint32_t stats_every{0};
+ #endif
++    // A line every `timing` presents with where the GL thread's time went: the first draw after each target switch (on a
++    // tile-based GPU that is where a new scene begins, and where the driver waits if it has to), the other draws, texture
++    // uploads and the swap. `gpu_timing` adds a glFinish before the picture goes to the window and reports its wait, which
++    // is the GPU's backlog for the frame; it changes the pacing, so it is for measuring only.
++    std::uint32_t timing{0};
++    bool gpu_timing{false};
+     // Hash and re-decode a texture on every use (the behaviour to compare the cache against).
+     bool texture_always_validate{false};
+     // Merge consecutive draws with the same state into one GL draw.
+diff --git a/host/gpu/texture_decode.cpp b/host/gpu/texture_decode.cpp
+index 3adac51..9217bd4 100644
+--- a/host/gpu/texture_decode.cpp
++++ b/host/gpu/texture_decode.cpp
+@@ -398,7 +398,9 @@ bool decode_texture(const GuestMemory &memory, const TextureState &texture, std:
+     if (const std::uint8_t *source = memory.raw_pointer(texture.address, total)) {
+         std::memcpy(data.data(), source, total);
+     } else {
+-        for (std::size_t i = 0; i < total; ++i) data[i] = memory.load8(texture.address + static_cast<std::uint32_t>(i));
++        // Not one run of host memory (a picture that wraps past the end of VRAM): run by run. Byte by byte this was
++        // 80 ms per megabyte on a 444 MHz ARM, which is every frame of a movie whose picture sits at the end of VRAM.
++        memory.copy_out(texture.address, std::span<std::uint8_t>(data.data(), total));
+     }
+     if (texture.swizzled) unswizzle(data, row_bytes, height);
+     decode_texels([&](std::uint32_t index) { return read_clut(memory, texture, index); }, texture, width, height,

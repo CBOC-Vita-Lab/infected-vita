@@ -1,0 +1,15 @@
+# third-party source trees, build output and generated artifacts are never committed.
+# Record URLs/commits + exact build commands instead (see LOG.md and scripts/).
+/third_party/
+/build/
+/sysroot/
+/out/
+/private/
+*.o
+*.a
+*.vpk
+*.self
+*.velf
+*.elf
+__pycache__/
+/dist/

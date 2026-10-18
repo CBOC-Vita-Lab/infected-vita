@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 12:45:14 +0000
+Subject: [PATCH] gl: timing report splits the GL thread's submit() into append
+ (the copy into scratch memory) and flush
+
+With gl_timing=N the [gl-time] line now starts with "submit() X ms (append Y, flush Z)": the whole of Impl::submit per frame, the time
+in append() (the vertices and indices written where the draw will read them) and in flush() (state applied, then the draw call, which
+is still reported on its own). On the console the old line accounted for some 7 ms (draw calls, first draws, present) of a GL thread
+that is busy 25-30 ms a frame; this shows how much of the rest is the copy into GPU-visible memory, which decides whether shrinking
+the vertex (36 bytes, 0.88 MB a mission frame) or moving the copy to the walker is worth doing.
+
+Verified on x86-64 (software GL): the line prints; framework tests 45 of 45; the Vita package builds. Not verified: any number from the
+console. The clock reads cost about 3 ms a frame there, so the mode is for diagnosis only.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 7ac1281..0d223c3 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -791,8 +791,24 @@ struct GlRenderer::Impl {
+     // ---- settings.timing: where the GL thread's time goes ------------------------------------------------------------
+     struct GlTimes {
+         std::uint64_t first_us{}, draw_us{}, texture_us{}, swap_us{}, finish_us{}, max_first_us{}, readback_us{}, present_us{};
++        std::uint64_t submit_us{}, append_us{}, flush_us{};   // Impl::submit as a whole, and the append() and flush() inside it
+         std::uint32_t firsts{}, draws{}, switches{}, textures{}, frames{}, readbacks{};
+     } gt;
++    // settings.timing: adds the time of its scope to one of gt's totals (two clock reads, which are system calls on the Vita).
++    struct Span {
++        Span(Impl &owner, std::uint64_t GlTimes::*total) : impl(owner), field(total), on(owner.settings.timing != 0u) {
++            if (on) start = Clock::now();
++        }
++        ~Span() {
++            if (on) impl.gt.*field += micros_since(start);
++        }
++        Span(const Span &) = delete;
++        Span &operator=(const Span &) = delete;
++        Impl &impl;
++        std::uint64_t GlTimes::*field;
++        bool on;
++        Clock::time_point start{};
++    };
+     bool scene_fresh{true};   // no draw has gone to the bound target since it was bound
+     [[nodiscard]] static std::uint64_t micros_since(Clock::time_point start) {
+         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
+@@ -820,12 +836,13 @@ struct GlRenderer::Impl {
+     void report_times() {
+         if (settings.timing == 0u || ++gt.frames < settings.timing) return;
+         const double n = static_cast<double>(gt.frames);
+-        char line[480];
++        char line[640];
+         std::snprintf(line, sizeof(line),
+-                      "[gl-time] per frame over %u: target switches %.1f | first draw after a switch %.2f ms (%.1f, worst %.1f ms) | "
++                      "[gl-time] per frame over %u: submit() %.2f ms (append %.2f, flush %.2f) | target switches %.1f | first draw after a switch %.2f ms (%.1f, worst %.1f ms) | "
+                       "other draws %.2f ms (%.1f) | texture uploads %.2f ms (%.1f) | read-backs %.2f ms (%.2f) | present %.2f ms "
+                       "(swap %.2f, gpu finish %.2f)",
+-                      gt.frames, gt.switches / n, gt.first_us / n / 1000.0, gt.firsts / n, gt.max_first_us / 1000.0,
++                      gt.frames, gt.submit_us / n / 1000.0, gt.append_us / n / 1000.0, gt.flush_us / n / 1000.0, gt.switches / n,
++                      gt.first_us / n / 1000.0, gt.firsts / n, gt.max_first_us / 1000.0,
+                       gt.draw_us / n / 1000.0, gt.draws / n, gt.texture_us / n / 1000.0, gt.textures / n,
+                       gt.readback_us / n / 1000.0, gt.readbacks / n, gt.present_us / n / 1000.0, gt.swap_us / n / 1000.0,
+                       gt.finish_us / n / 1000.0);
+@@ -1602,6 +1619,7 @@ struct GlRenderer::Impl {
+     // Applies the batch's state to GL and draws it.
+     void flush() {
+         if (!batch_open) return;
++        const Span timing_flush(*this, &GlTimes::flush_us);
+         batch_open = false;
+         if (batch_indices.empty()) {
+             batch_vertices.clear();
+@@ -1954,6 +1972,7 @@ struct GlRenderer::Impl {
+     // Adds a draw's vertices and indices to the batch. Returns false if there
+     // is nothing to draw.
+     bool append(const DrawCall &call, bool use_material_color, bool rect_clamp, const float *picture_rect = nullptr) {
++        const Span timing_append(*this, &GlTimes::append_us);
+         const std::size_t vertex_total = call.vertices.size();
+         const std::size_t count = call.indices.empty() ? vertex_total : call.indices.size();
+         const bool through = call.through;
+@@ -2527,6 +2546,7 @@ struct GlRenderer::Impl {
+ 
+     void submit(const DrawCall &call, const GuestMemory &memory) {
+         if (!ready) return;
++        const Span timing_submit(*this, &GlTimes::submit_us);
+         ++st().submits;
+         ++draws;
+         ++frame_draws;

@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 22:03:41 +0000
+Subject: [PATCH] Docs: switches of the coroutine kernel
+
+Clock mode, forced interpretation, the spin hook, stack size and report,
+switch trace, the movie ring release and the region histogram.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/BRINGING_UP_A_GAME.md b/docs/BRINGING_UP_A_GAME.md
+index 2b64b6f..225bbc8 100644
+--- a/docs/BRINGING_UP_A_GAME.md
++++ b/docs/BRINGING_UP_A_GAME.md
+@@ -83,6 +83,14 @@ Every one of these takes the profile's own prefix, so `TENKAWA_TRACE_KERNEL` for
+ | `<PREFIX>_TRACE_GE_LIST=N[:M]` | Every command word of display-list runs N to N+M-1: what a screen that draws nothing is built from |
+ | `<PREFIX>_TRACE_SAS` | SAS voices set, keyed on and off, and each change of the end flags a game polls |
+ | `<PREFIX>_NO_BUSY_CLOCK` | Keep emulated time still for a thread that never waits, as before the busy clock (`Kernel::charge_busy_time`) |
++| `<PREFIX>_CLOCK=virtual\|realtime` | Emulated time. `virtual` (the default) moves only when every thread waits, plus `<PREFIX>_CPU_NS_PER_INSN` nanoseconds for each interpreted instruction; `realtime` follows the platform's monotonic clock (`KernelPlatform` in `host/kernel/kernel_platform.hpp`) with a 59.94 Hz vblank |
++| `<PREFIX>_INTERP_ONLY=ADDR,ADDR-ADDR\|all`, `<PREFIX>_LEAN_ONLY=1` | With a recompiled corpus that has one entry point per function: run these functions (or all) in the interpreter even though a native entry exists, or make running the interpreter at all a fatal error |
++| `<PREFIX>_EXEC_REPORT=1` | At the end of the run: how many guest calls ran native code, how many the interpreter, and how often each called the other |
++| `<PREFIX>_SPIN_INSNS=N`, `<PREFIX>_SPIN_REPORT=1`, `<PREFIX>_STARVE_EQUAL=1` | A thread that interprets N instructions (4,000,000 by default) without entering the system lets time pass, timers fire and a higher priority thread run, as a PSP's timer interrupt would. The report lists where that happened and what ran instead; `STARVE_EQUAL` lets an equal priority thread run too, which the PSP's scheduler does not do |
++| `<PREFIX>_CO_STACK_KB=N`, `<PREFIX>_STACK_REPORT=1` | The host stack of every guest thread (256 KiB by default). With `PORTABLEKIT_STACK_CHECK=1` the report gives each thread's high-water mark and whether its canary survived |
++| `<PREFIX>_TRACE_SWITCH=SECONDS`, `<PREFIX>_THREAD_BACKTRACE=1` | One line per switch to a thread and per wake-up from that emulated time on; words on each thread's guest stack that follow a call, in the stall dump |
++| `<PREFIX>_MPEG_EAGER_RELEASE=1` | Give the movie ring's packets back as soon as they are demuxed instead of when the game has taken their access units (the old behaviour; it let a game's end-of-stream test fire with audio still queued) |
++| `PSPRECOMP_INTERPRETER_REGION_HISTOGRAM=1` | At the end of the run: interpreted loads and stores by 1 MiB of address, and the instructions that touched anything outside user RAM, VRAM and the scratchpad |
+ | `PSPRECOMP_NO_INTERPRETER=1` | Turn the interpreter off. Nothing runs without a corpus; with one, the runtime stops at the first address the recompiler missed and names it |
+ | `PSPRECOMP_MAX_DISPATCHES` | Stop after this many dispatches, for a bounded run |
+ | `PSPRECOMP_INTERPRETER_WATCH` | Guest addresses, comma separated: report the registers each time interpreted code reaches one. `PSPRECOMP_INTERPRETER_WATCH_WORDS=N` also dumps N words at `a0`, and `PSPRECOMP_INTERPRETER_WATCH_LIMIT` bounds how many times each address is reported (40 by default, 0 for no limit) |

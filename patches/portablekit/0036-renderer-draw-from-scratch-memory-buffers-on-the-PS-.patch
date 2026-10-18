@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:34:07 +0000
+Subject: [PATCH] renderer: draw from scratch-memory buffers on the PS Vita,
+ re-specify mipmapped textures, time read-backs and presents
+
+vitaGL copies every client-array draw and scans its indices for the highest vertex. Each batch now copies its vertices and indices once into vitaGL's per-frame scratch memory and binds them as buffers that point at that memory (vglBufferData), so the driver neither copies nor scans (GL_SCRATCH_BUFFERS=0 restores client arrays).
+A texture with mip levels is re-specified instead of updated in place: a partial update of a mipmapped texture made vitaGL read the old one back from video memory.
+gl_timing reports read-backs and the present separately; the line buffer grows to fit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index 75256db..ae449db 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -24,6 +24,7 @@ static inline void glBlendColor(GLfloat, GLfloat, GLfloat, GLfloat) {}
+ #include <GLES2/gl2ext.h>
+ #endif
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <string>
+ 
+@@ -61,6 +62,26 @@ void destroy_context();
+ void swap_buffers();
+ [[nodiscard]] Caps &caps();
+ // Turns dithering off where the driver has it (GL_DITHER is on by default in ES 2; vitaGL has no such state).
++// Per-frame GPU-visible memory (vitaGL's scratch pool: valid until the GPU has drawn the frame) and handing it to the
++// bound buffer object as its data, so a draw reads vertices and indices in place: the driver neither copies client
++// arrays nor scans the indices for the vertex range. nullptr / no-op where there is no such pool (desktop GL).
++inline void *scratch_alloc(std::size_t bytes) {
++#if defined(__vita__)
++    return vglAllocFromScratch(bytes);
++#else
++    (void)bytes;
++    return nullptr;
++#endif
++}
++inline void buffer_use_mapped(GLenum target, const void *data) {
++#if defined(__vita__)
++    vglBufferData(target, data);
++#else
++    (void)target;
++    (void)data;
++#endif
++}
++
+ inline void disable_dither() {
+ #if !defined(__vita__)
+     glDisable(GL_DITHER);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index afd1d7c..57a4fc5 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -524,8 +524,8 @@ struct GlRenderer::Impl {
+ 
+     // ---- settings.timing: where the GL thread's time goes ------------------------------------------------------------
+     struct GlTimes {
+-        std::uint64_t first_us{}, draw_us{}, texture_us{}, swap_us{}, finish_us{}, max_first_us{};
+-        std::uint32_t firsts{}, draws{}, switches{}, textures{}, frames{};
++        std::uint64_t first_us{}, draw_us{}, texture_us{}, swap_us{}, finish_us{}, max_first_us{}, readback_us{}, present_us{};
++        std::uint32_t firsts{}, draws{}, switches{}, textures{}, frames{}, readbacks{};
+     } gt;
+     bool scene_fresh{true};   // no draw has gone to the bound target since it was bound
+     [[nodiscard]] static std::uint64_t micros_since(Clock::time_point start) {
+@@ -554,12 +554,14 @@ struct GlRenderer::Impl {
+     void report_times() {
+         if (settings.timing == 0u || ++gt.frames < settings.timing) return;
+         const double n = static_cast<double>(gt.frames);
+-        char line[400];
++        char line[480];
+         std::snprintf(line, sizeof(line),
+                       "[gl-time] per frame over %u: target switches %.1f | first draw after a switch %.2f ms (%.1f, worst %.1f ms) | "
+-                      "other draws %.2f ms (%.1f) | texture uploads %.2f ms (%.1f) | swap %.2f ms | gpu finish %.2f ms",
++                      "other draws %.2f ms (%.1f) | texture uploads %.2f ms (%.1f) | read-backs %.2f ms (%.2f) | present %.2f ms "
++                      "(swap %.2f, gpu finish %.2f)",
+                       gt.frames, gt.switches / n, gt.first_us / n / 1000.0, gt.firsts / n, gt.max_first_us / 1000.0,
+-                      gt.draw_us / n / 1000.0, gt.draws / n, gt.texture_us / n / 1000.0, gt.textures / n, gt.swap_us / n / 1000.0,
++                      gt.draw_us / n / 1000.0, gt.draws / n, gt.texture_us / n / 1000.0, gt.textures / n,
++                      gt.readback_us / n / 1000.0, gt.readbacks / n, gt.present_us / n / 1000.0, gt.swap_us / n / 1000.0,
+                       gt.finish_us / n / 1000.0);
+         std::cout << line << std::endl;
+         gt = GlTimes{};
+@@ -839,6 +841,12 @@ struct GlRenderer::Impl {
+             st().texture_upload_bytes += entry.hd.gpu_bytes;
+             return true;
+         }
++        // A texture with a mip chain is specified anew, not patched: on vitaGL a level-0 update of a texture that has more
++        // levels keeps them and copies the whole chain out of GPU memory first (the chain is stale afterwards anyway).
++        if (!create && entry.mip_levels > 1u) {
++            create = true;
++            set_gpu_bytes(entry, static_cast<std::uint64_t>(entry.width) * entry.height * 4u, counted);
++        }
+         if (entry.hd.respecify) {  // it was a replacement: its storage has the replacement's size, so specify it anew
+             create = true;
+             entry.hd.respecify = false;
+@@ -1312,17 +1320,47 @@ struct GlRenderer::Impl {
+         if ((flags & glsl::kSharpen) != 0u) uniform(program, glsl::kUInvSize, state.inv_size);
+     }
+ 
++    GLuint scratch_vbo{}, scratch_ibo{};   // buffer objects whose data is the batch's scratch copy (settings.scratch_buffers)
++
+     void draw_batch(const DrawState &state) {
+-        const Vertex *vertices = batch_vertices.data();
+-        const auto *base = reinterpret_cast<const std::uint8_t *>(vertices);
+-        glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, position));
+-        glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, normal));
+-        glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + offsetof(Vertex, texcoord));
+-        glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), base + offsetof(Vertex, color));
++        const std::size_t vertex_bytes = batch_vertices.size() * sizeof(Vertex);
++        const std::size_t index_bytes = batch_indices.size() * sizeof(std::uint16_t);
++        void *vertex_copy = settings.scratch_buffers && !settings.null_draw ? glp::scratch_alloc(vertex_bytes) : nullptr;
++        void *index_copy = vertex_copy != nullptr ? glp::scratch_alloc(index_bytes) : nullptr;
++        const bool scratch = vertex_copy != nullptr && index_copy != nullptr;
++        const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(batch_vertices.data());
++        const void *indices = batch_indices.data();
++        if (scratch) {
++            std::memcpy(vertex_copy, batch_vertices.data(), vertex_bytes);
++            std::memcpy(index_copy, batch_indices.data(), index_bytes);
++            if (scratch_vbo == 0u) {
++                glGenBuffers(1, &scratch_vbo);
++                glGenBuffers(1, &scratch_ibo);
++            }
++            glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
++            glp::buffer_use_mapped(GL_ARRAY_BUFFER, vertex_copy);
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scratch_ibo);
++            glp::buffer_use_mapped(GL_ELEMENT_ARRAY_BUFFER, index_copy);
++            base = nullptr;      // the attribute pointers below are offsets into the bound buffer
++            indices = nullptr;
++            ++st().scratch_batches;
++        }
++        const auto at = [base](std::size_t offset) -> const void * {
++            return base != nullptr ? static_cast<const void *>(base + offset) : reinterpret_cast<const void *>(offset);
++        };
++        glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, position)));
++        glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, normal)));
++        glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), at(offsetof(Vertex, texcoord)));
++        glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), at(offsetof(Vertex, color)));
+         if (!settings.null_draw)
+             timed_draw([&] {
+-                glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT, batch_indices.data());
++                glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT, indices);
+             });
++        if (scratch) {
++            // Everything else (the blits, the post passes) draws from client arrays.
++            glBindBuffer(GL_ARRAY_BUFFER, 0u);
++            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0u);
++        }
+         ++st().gl_draws;
+         st().bytes_uploaded += batch_vertices.size() * sizeof(Vertex) + batch_indices.size() * sizeof(std::uint16_t);
+         st().vertices_uploaded += batch_vertices.size();
+@@ -2141,6 +2179,16 @@ struct GlRenderer::Impl {
+ 
+     // Reads a target's whole colour buffer as RGBA, top row first.
+     bool read_pixels(Target &target, std::vector<std::uint8_t> &rgba) {
++        const Clock::time_point timing_start = Clock::now();
++        struct Scope {
++            Impl &impl;
++            Clock::time_point start;
++            ~Scope() {
++                if (impl.settings.timing == 0u) return;
++                impl.gt.readback_us += micros_since(start);
++                ++impl.gt.readbacks;
++            }
++        } timing_scope{*this, timing_start};
+         resolve_picture(target);
+         flush();
+         bind_target(target);
+@@ -2255,6 +2303,7 @@ struct GlRenderer::Impl {
+     }
+ 
+     bool present(std::uint32_t display_address) {
++        const Clock::time_point present_start = Clock::now();
+         const std::uint64_t ge_draws = frame_draws;
+         frame_draws = 0;
+         if (!ready) return false;
+@@ -2271,6 +2320,7 @@ struct GlRenderer::Impl {
+             gt.finish_us += micros_since(start);
+         }
+         show(*target);
++        if (settings.timing != 0u) gt.present_us += micros_since(present_start);
+         report_times();
+         ++frames;
+         evict_textures();
+@@ -2351,6 +2401,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "texture_budget_mb") settings.texture_budget = number * 1024ull * 1024ull;
+     else if (name == "stats_every") settings.stats_every = u32;
+     else if (name == "timing") settings.timing = u32;
++    else if (name == "scratch_buffers") settings.scratch_buffers = flag;
+     else if (name == "gpu_timing") settings.gpu_timing = flag;
+     else if (name == "texture_always_validate") settings.texture_always_validate = flag;
+     else if (name == "merge") settings.merge_draws = flag;
+@@ -2377,7 +2428,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 273c0b4..bc8687c 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -48,6 +48,9 @@ struct GlSettings {
+     // uploads and the swap. `gpu_timing` adds a glFinish before the picture goes to the window and reports its wait, which
+     // is the GPU's backlog for the frame; it changes the pacing, so it is for measuring only.
+     std::uint32_t timing{0};
++    // Where the platform has a per-frame scratch pool (the Vita): each batch's vertices and indices are copied into it
++    // once and drawn from buffer objects, instead of client arrays the driver copies and scans per draw. 0 turns it off.
++    bool scratch_buffers{true};
+     bool gpu_timing{false};
+     // Hash and re-decode a texture on every use (the behaviour to compare the cache against).
+     bool texture_always_validate{false};
+@@ -148,6 +151,7 @@ struct GlStats {
+     std::uint64_t mip_textures{};       // textures given a mip chain
+     std::uint64_t mip_cpu_textures{};   // ... of which built on the CPU (alpha-weighted)
+     std::uint64_t mip_upload_bytes{};
++    std::uint64_t scratch_batches{};   // batches drawn from the platform's scratch pool (settings.scratch_buffers)
+     std::uint64_t post_passes{};        // full-screen passes: FXAA, resolve, bicubic, copy to the final picture
+     std::uint64_t post_copies{};        // copies of a framebuffer made for a pass to read
+     std::uint64_t smooth_draws{};       // 3D draws whose nearest filter was made linear

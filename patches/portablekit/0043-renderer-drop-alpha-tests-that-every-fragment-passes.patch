@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 17:37:16 +0000
+Subject: [PATCH] renderer: drop alpha tests that every fragment passes
+
+Infected keeps the GE's alpha test (greater than 0) on for nearly every draw, so nearly every program had a discard.
+When a draw's fragments all have alpha 255 (opaque vertex colours or material, the lighting's ambient alpha 255, and
+a texture whose texels are all opaque or a DXT1 HD replacement), the test has one answer: when it passes, the draw
+gets the program without it. GL_ALPHA_ELIDE=0 keeps every test.
+
+Verified: about 400 of a mission frame's 640 draws qualify (376 with the 2x pack); 25 replayed gameplay frames are
+pixel-identical with it on and off, with and without the HD pack, and so are four screenshots of a live mission-1
+game; framework tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 47cc136..dd27b8d 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -54,6 +54,12 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   light's shape (off, directional, point or spot; plain diffuse or not), which takes the Vita's vertex lighting
+   program from about 600 instructions to 96–182. `GL_SPECIALIZE=0` (`--set specialize=0`) goes back to the
+   uniform-driven programs; both give the same pictures.
++* **Alpha tests that decide nothing are dropped** (`GL_ALPHA_ELIDE`, on). Infected keeps the GE's alpha test on
++  ("greater than 0") for nearly everything. When every fragment of a draw has alpha 255 (opaque vertices or material,
++  and a texture whose texels are all opaque, or a DXT1 HD replacement), the comparison has one answer, so the draw
++  gets a program without the test and without `discard`, which on a tile-based GPU holds up the depth test of what
++  lies behind. About 400 of a mission frame's 640 draws qualify; the pictures are identical (replays with and without
++  the HD pack, and a live mission).
+ * **Blending without `glBlendColor`.** `GL_CONSTANT_COLOR` factors are used only where the driver has them and
+   the setting `no_blend_color` is off; otherwise the fragment shader pre-multiplies (`u_blend.x`: 1 doubles the
+   source alpha, 2 doubles and complements, 3 multiplies by a fixed colour, 4 a fixed colour against its
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 4cdc004..51078e1 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -433,6 +433,7 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+         info.gpu_bytes = 0u;
+         info.mips = 0u;
+     }
++    info.opaque = false;
+     info.key = 0u;
+     if (!active()) {
+         info.respecify = was_replaced;
+@@ -493,6 +494,7 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+                     stats_.blob_bytes += record.size;
+                     ++stats_.hits;
+                     info.replaced = replaced = true;
++                    info.opaque = record.format == HdFormat::Dxt1;
+                     info.gpu_bytes = gpu_bytes;
+                     info.width = record.width;
+                     info.height = record.height;
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index 5d60d59..1f8dbf0 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -22,6 +22,7 @@ struct HdTextureInfo {
+     std::uint16_t width{}, height{};
+     std::uint8_t mips{};        // mip levels uploaded
+     bool replaced{};
++    bool opaque{};              // the replacement has no alpha (a DXT1 record, uploaded as RGB): every texel's alpha is 1
+     bool recoloured{};          // the replacement was rebuilt for the palette in use (a recolour record)
+     bool respecify{};           // the texture was a replacement and is the original again: specify it anew
+ };
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 30721e3..ad027e6 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -1693,6 +1693,47 @@ struct GlRenderer::Impl {
+         return true;
+     }
+ 
++    // ---- alpha tests that decide nothing (settings.alpha_elide) ---------------------------------------------------
++
++    // The GE's comparison (the shader's: the 8-bit alpha against the reference) for an alpha of 255.
++    static bool alpha_test_passes_at_255(std::uint32_t function, std::uint32_t reference) {
++        switch (function) {
++        case 1u: return true;                   // always
++        case 2u: return reference == 255u;      // equal
++        case 3u: return reference != 255u;      // not equal
++        case 5u: return reference >= 255u;      // less or equal
++        case 6u: return reference < 255u;       // greater
++        case 7u: return true;                   // greater or equal
++        default: return false;                  // never, less
++        }
++    }
++
++    static bool vertices_opaque(const DrawCall &call) {
++        for (const Vertex &vertex : call.vertices)
++            if ((vertex.color >> 24u) != 0xFFu) return false;
++        return true;
++    }
++
++    // Every fragment of the draw has alpha 1.0 when it reaches the alpha test: the shader's alpha is the vertex colour's
++    // (the material's without vertex colours; with lighting, the ambient alpha times the vertex's or the material's), times
++    // the texel's when the texture function uses it. Conservative: anything not known to be opaque is not.
++    bool fragment_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured, bool lit) const {
++        if (lit) {
++            if (call.lighting.ambient_alpha != 0xFFu) return false;
++            const bool from_vertex = call.has_vertex_color && (call.lighting.material_update & 1u) != 0u;
++            if (from_vertex ? !vertices_opaque(call) : (call.material_color >> 24u) != 0xFFu) return false;
++        } else {
++            const bool use_material = !call.has_vertex_color && !call.lighting_enabled;
++            if (use_material ? (call.material_color >> 24u) != 0xFFu : !vertices_opaque(call)) return false;
++        }
++        if (!textured || !call.texture.alpha_from_texture || call.texture.function == 1u) return true;  // decal keeps the colour's
++        if (binding.opaque) return true;   // the shader sets the texel's alpha to 1
++        if (binding.from_target || binding.hd_movie || binding.entry == nullptr) return false;
++        const TextureEntry &entry = *binding.entry;
++        if (entry.hd.replaced) return entry.hd.opaque;
++        return entry.traits_known && entry.traits.transparent == 0u && entry.traits.translucent == 0u;
++    }
++
+     void refresh_environment(const DrawCall &call) {
+         const LightingState &state = call.lighting;
+         const auto ambient = unpack_color(state.ambient_color, static_cast<float>(state.ambient_alpha) / 255.0f);
+@@ -1959,7 +2000,7 @@ struct GlRenderer::Impl {
+             ++st().skipped_draws;  // never passes
+             return;
+         }
+-        const bool alpha_test = alpha_enabled && call.alpha_test.function != 1u;
++        bool alpha_test = alpha_enabled && call.alpha_test.function != 1u;
+         const bool lit = call.lighting_enabled && settings.lighting && !through;
+         const bool fogged = call.fog.enabled && settings.fog && !through;
+ 
+@@ -1972,6 +2013,11 @@ struct GlRenderer::Impl {
+                 return;
+             }
+         }
++        if (alpha_test && settings.alpha_elide && alpha_test_passes_at_255(call.alpha_test.function, call.alpha_test.reference) &&
++            fragment_alpha_is_255(call, binding, textured, lit)) {
++            alpha_test = false;
++            ++st().alpha_elided;
++        }
+         const bool rect_clamp = through && textured && settings.rect_clamp;
+         float picture_rect[4] = {};
+         const bool sharpen = opt.movie_sharp && rect_clamp && !binding.from_target && !binding.hd_movie && picture_draw(call, target, picture_rect);
+@@ -2431,6 +2477,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "null_draw") settings.null_draw = flag;
+     else if (name == "fill_test") settings.fill_test = flag;
+     else if (name == "specialize") settings.specialize = flag;
++    else if (name == "alpha_elide") settings.alpha_elide = flag;
+     else if (name == "depth_bits") settings.depth_bits = u32;
+     else if (name == "target_textures") settings.target_textures = flag;
+     else if (name == "use_glclear") settings.use_glclear = flag;
+@@ -2453,7 +2500,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "draw_first", "draw_last"};
+     return names;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 78cbc73..dbfd52f 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -63,6 +63,9 @@ struct GlSettings {
+     // Compile each draw's texture function, alpha comparison and blend fix-up into its fragment program (more programs,
+     // far shorter ones); off, one program per flag set chooses them per fragment from uniforms.
+     bool specialize{true};
++    // An alpha test that a draw's fragments cannot fail (every alpha is 255: opaque vertices or material, an opaque
++    // texture) is dropped, so the program has no discard. The picture is the same.
++    bool alpha_elide{true};
+     // Depth buffer precision of every render target: 16 is what ES 2.0 guarantees
+     // (and what the PSP has), 24 needs OES_depth24.
+     std::uint32_t depth_bits{16};
+@@ -163,6 +166,7 @@ struct GlStats {
+     std::uint64_t sharp_draws{};        // full-screen pictures enlarged bicubically (gfx.movie_filter=sharp)
+     std::uint64_t mip_draws{};          // 3D draws sampled with mips
+     std::uint64_t pixel_lit_draws{};    // draws lit per fragment
++    std::uint64_t alpha_elided{};       // alpha-tested draws whose every fragment has alpha 255: drawn without the test
+     std::uint64_t texture_evicted{};
+     std::uint64_t clut_hash_bytes{};
+     std::uint64_t shader_compile_us{};
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 4fa0d07..dbb57de 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1013,6 +1013,7 @@ int main(int argc, char **argv) {
+         line("textures evicted", t.texture_evicted);
+         line("approximated blends", t.unsupported_blend);
+         line("3D draws made smooth", t.smooth_draws);
++        line("alpha tests dropped (alpha 255)", t.alpha_elided);
+         line("full-screen pictures sharpened", t.sharp_draws);
+         line("3D draws sampled with mips", t.mip_draws);
+         line("textures given mips", t.mip_textures);

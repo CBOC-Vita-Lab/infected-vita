@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 05:34:03 +0000
+Subject: [PATCH] gl: an HD replacement keeps its own mip chain (no build_mips
+ over it, no stale decoded_owner)
+
+A texture replaced from the HD pack is uploaded without decoding, but acquire_texture still marked decode_buffer as holding
+its texels, and note_3d_use then built the original's mip chain (glGenerateMipmap plus the CPU alpha-weighted levels, sized for the
+ORIGINAL level 0) over the replacement's levels: a 64x64 sign of the original written into the 64x64 level 1 of a 128x128 replacement,
+with texels of another texture. Visible as grey swirl quads around street lights and fires (2x and 4x packs).
+
+build_mips returns for an entry with hd.replaced; decoded_owner is only claimed when the original was decoded.
+Verified on run9 flip 2200 with the street-light record only: crop difference to the off render 4.81 -> 0.24.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 167b577eff09ae8ac09ac36ddc966e8145456684)
+
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index 162a4b5..2bd01ba 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -438,6 +438,9 @@
+     // alpha then has its levels overwritten by the CPU's alpha-weighted chain, with the coverage of the alpha test kept.
+     void build_mips(TextureEntry &entry, const DrawCall &call, const GuestMemory &memory) {
+         entry.mips_tried = true;
++        // An HD replacement brings its own chain, sized for its own level 0: building one from the original's texels would
++        // overwrite its levels with a smaller picture of another size (or of another texture).
++        if (entry.hd.replaced) return;
+         if (entry.tiny || !entry.power_of_two || entry.uv_verdict == 2u || (entry.volatile_until != 0u && entry.volatile_until >= frames)) return;
+         bind_texture(entry.id);
+         glGenerateMipmap(GL_TEXTURE_2D);
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 917bd29..9765b6f 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -839,7 +839,7 @@ struct GlRenderer::Impl {
+                 return nullptr;
+             }
+             hash_all(data, bytes, entry->phase_hash);
+-            decoded_owner = entry.get();   // decode_buffer still holds this texture's texels
++            if (!entry->hd.replaced) decoded_owner = entry.get();   // decode_buffer holds this texture's texels (not when the HD pack's texture was uploaded instead)
+             entry->created = entry->last_check = entry->last_used = frames;
+             entry->list_serial = list_serial;
+             entry->uses = 1u;
+@@ -892,7 +892,7 @@ struct GlRenderer::Impl {
+                 entry.mip_levels = 1u;
+                 entry.mips_tried = true;
+                 entry.traits_known = false;
+-                decoded_owner = &entry;
++                if (!entry.hd.replaced) decoded_owner = &entry;   // an HD replacement was uploaded without decoding
+             }
+         }
+         return &entry;

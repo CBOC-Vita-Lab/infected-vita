@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 04:40:24 +0000
+Subject: [PATCH] Merge branch 'integration' into infected-next
+
+Brings in:
+* Realtime pacing: a late flip keeps the display schedule (bounded catch-up, INFECTED_FRAME_NO_CATCHUP=1 off); audio trace counts writes and producer restarts
+
+diff --git a/host/audio/audio_sink.cpp b/host/audio/audio_sink.cpp
+index 39f9953..a69dc39 100644
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -113,6 +113,8 @@ struct AudioSink::Impl {
+     std::uint64_t window_frames{};
+     std::uint64_t window_silent{};
+     std::uint64_t window_dropped{};
++    std::uint64_t window_restarts{};   // producer cursors found behind the read position and restarted
++    std::uint64_t window_writes{};     // mix() calls
+     std::int32_t window_peak{};
+     double window_energy{};
+     std::uint64_t total_frames{};
+@@ -192,14 +194,18 @@ struct AudioSink::Impl {
+         ++seconds;
+         if (dump.active()) dump.flush();
+         if (trace) {
+-            std::printf("[audio] %llus emu=%.3f frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu\n",
++            std::printf("[audio] %llus emu=%.3f frames=%llu peak=%d rms=%.1f silent=%llu dropped=%llu writes=%llu restarts=%llu\n",
+                         static_cast<unsigned long long>(seconds),
+                         time_source != nullptr ? static_cast<double>(time_source()) / 1e6 : 0.0,
+                         static_cast<unsigned long long>(window_frames), window_peak, rms,
+                         static_cast<unsigned long long>(window_silent),
+-                        static_cast<unsigned long long>(window_dropped));
++                        static_cast<unsigned long long>(window_dropped),
++                        static_cast<unsigned long long>(window_writes),
++                        static_cast<unsigned long long>(window_restarts));
+             std::fflush(stdout);
+         }
++        window_writes = 0u;
++        window_restarts = 0u;
+         window_frames = 0u;
+         window_silent = 0u;
+         window_dropped = 0u;
+@@ -379,7 +385,11 @@ void AudioSink::mix(std::uint64_t &cursor, const std::int16_t *frames, std::size
+ 
+     // A cursor behind the device belongs to a producer that stalled; restart it
+     // at the write target rather than writing frames that already played.
+-    if (cursor < impl.read_position + kPrebufferFrames / 4u) cursor = impl.read_position + kPrebufferFrames;
++    ++impl.window_writes;
++    if (cursor < impl.read_position + kPrebufferFrames / 4u) {
++        cursor = impl.read_position + kPrebufferFrames;
++        ++impl.window_restarts;
++    }
+ 
+     // The ring cannot hold what a runaway producer wants to write. Retire the
+     // oldest frames unplayed to make room: the device misses them, but the
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 72b253c..0e94d18 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -856,7 +856,14 @@ void register_display_ctrl(HleRegistrar &hle) {
+                 kernel().delay_current(ctx, due - now, 0u);
+                 return;
+             }
+-            last_flip_us = now;
++            // Late. A host that woke the thread a few milliseconds after its time (a loaded machine, a slow present) must not
++            // lose that time for good, or the average falls below the display's rate (56-58 flips/s measured under load):
++            // keep the schedule while the debt is under two periods, and start over from now when it is more (a load, a
++            // pause, a frame that took long), so that a slow stretch is not "made up" by a burst of flips.
++            // Only with the realtime clock (the virtual clock has no host jitter to absorb).
++            // <prefix>_FRAME_NO_CATCHUP=1 restores the old rule (a late flip restarts the schedule from now).
++            static const bool catch_up = kernel().realtime() && portablekit::env("FRAME_NO_CATCHUP") == nullptr;
++            last_flip_us = (catch_up && now - due < 2u * limit_us) ? due : now;
+         }
+         kernel().finish(ctx, 0u);
+     });

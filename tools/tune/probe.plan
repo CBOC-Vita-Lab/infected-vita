@@ -1,0 +1,33 @@
+0 -
+3600 LY=0   # walk up
+3640 -
+3680 LX=255   # walk right
+3720 -
+3760 LX=0   # walk left
+3800 -
+3840 LY=255   # walk down
+3880 -
+3920 R   # R
+3960 -
+4000 L   # L
+4040 -
+4080 SQUARE   # SQUARE
+4120 -
+4160 TRIANGLE   # TRIANGLE
+4200 -
+4240 CIRCLE   # CIRCLE
+4280 -
+4320 CROSS   # CROSS
+4360 -
+4400 UP   # UP
+4440 -
+4480 DOWN   # DOWN
+4520 -
+4560 LEFT   # LEFT
+4600 -
+4640 RIGHT   # RIGHT
+4680 -
+4720 RX=255   # RX right
+4760 -
+4800 RY=0   # RY up
+4840 -

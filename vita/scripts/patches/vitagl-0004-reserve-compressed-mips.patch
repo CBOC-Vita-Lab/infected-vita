@@ -1,0 +1,70 @@
+Infected port: vglReserveCompressedMips. With it on, level 0 of a compressed texture (glCompressedTexImage2D) is
+allocated with room for the whole mip chain, and a later level that fits is written in place. Each level is swizzled
+by an asynchronous sceGxmTransferCopy; a level that needed a bigger buffer used to vgl_realloc it while the GPU could
+still be writing an earlier level into the old one, so the caller had to sceGxmTransferFinish between levels, and that
+wait (for whatever the GPU was doing) cost 10 to 15 ms an HD texture on the console. The realloc that remains (the
+hint off, or a chain larger than reserved) now waits for the transfers itself. Off by default.
+
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1161,6 +1161,12 @@
+ // that the previous custom-shader draw already set and nothing has changed since (off by default).
+ void vglSkipRedundantState(GLboolean enable);
+ 
++// Infected port (patch 0004): level 0 of a compressed texture (glCompressedTexImage2D) reserves room for its whole mip
++// chain, so that uploading the other levels never reallocates the buffer while the GPU still swizzles a level into it,
++// and nobody has to wait for the GPU between levels (sceGxmTransferFinish). Costs a third more memory for a compressed
++// texture that never gets its levels. Off by default.
++void vglReserveCompressedMips(GLboolean enable);
++
+ // calloc implementation for vitaGL internal memory pools.
+ void *vglCalloc(uint32_t nmember, uint32_t size);
+ 
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -695,6 +695,12 @@
+ 	}
+ }
+ 
++// Infected port (patch 0004): level 0 of a compressed texture reserves its whole mip chain (off by default).
++GLboolean vgl_reserve_compressed_mips = GL_FALSE;
++void vglReserveCompressedMips(GLboolean enable) {
++	vgl_reserve_compressed_mips = enable;
++}
++
+ void gpu_alloc_compressed_texture(int32_t mip_level, uint32_t w, uint32_t h, SceGxmTextureFormat format, uint32_t image_size, const void *data, texture *tex, uint8_t src_bpp, GLboolean uncompressed) {
+ 	// If there's already a texture in passed texture object we first dealloc it
+ 	if (tex->status == TEX_VALID && !mip_level)
+@@ -732,7 +738,14 @@
+ 
+ 		if (mip_count >= mip_level)
+ 			texture_data = tex->data;
+-		else {
++		else if (vgl_malloc_usable_size(tex->data) >= (size_t)tex_size) {
++			// Infected port (patch 0004): the chain was reserved with level 0 (vglReserveCompressedMips): the level is
++			// written in place and nothing moves, so a transfer still swizzling an earlier level needs no wait.
++			texture_data = tex->data;
++			mip_count = mip_level;
++		} else {
++			// The buffer may move and be freed: a transfer still swizzling an earlier level into it must land first.
++			sceGxmTransferFinish();
+ 			texture_data = vgl_realloc(tex->data, tex_size);
+ 			if (!texture_data) {
+ 				// Reallocation in the same mspace failed, try manually.
+@@ -749,7 +762,15 @@
+ 		mip_count = mip_level;
+ 		tex_width = w;
+ 		tex_height = h;
+-		texture_data = gpu_alloc_mapped_for_gpu(tex_size);
++		int alloc_size = tex_size;
++		if (vgl_reserve_compressed_mips) {
++			// Infected port (patch 0004): room for the whole chain down to 1x1, so that its levels never move the buffer.
++			int top = 0;
++			for (uint32_t d = MAX(aligned_max_width, aligned_max_height); d > 1; d >>= 1)
++				top++;
++			alloc_size = gpu_get_compressed_mipchain_size(top, aligned_max_width, aligned_max_height, format);
++		}
++		texture_data = gpu_alloc_mapped_for_gpu(alloc_size);
+ 	}
+ 
+ 	// Initializing texture data buffer

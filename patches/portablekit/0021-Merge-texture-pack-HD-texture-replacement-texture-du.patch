@@ -1,0 +1,2067 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 04:43:15 +0000
+Subject: [PATCH] Merge texture-pack (HD texture replacement, texture dump)
+ into the Vita line
+
+Brings in:
+* HD texture packs: replacement key, pack reader, GL hook, texture dump, ge_replay switches
+* texkey CLI (batch keys over raw texture records), ge_replay parser fix for HD options
+* HD textures: image key and recolour records (palette-agnostic replacement rebuilt for the palette in use)
+* gl hd textures: never replace 8888 render-target copies (counted as not_replaceable)
+* HD textures: work in progress at interruption (renderer counters, replay switches)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 89afd32..91a06a8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -596,6 +596,8 @@ if(PORTABLEKIT_GE_REPLAY)
+         "${PORTABLEKIT_ROOT}/tools/ge_replay/ge_replay.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_state.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/texture_decode.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/texture_key.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/hd_texture_pack.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_dump.cpp"
+         "${PORTABLEKIT_ROOT}/host/gpu/ge_worker.cpp"
+         "${PORTABLEKIT_ROOT}/host/profile.cpp"
+@@ -629,6 +631,29 @@ if(PORTABLEKIT_GE_REPLAY)
+     set_target_properties(ge_replay PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+ endif()
+ 
++# texkey: the replacement key and decoded picture of raster records, from the same code the renderer
++# uses; the offline texture pack tools (the port repository's tools/texpack) run it.
++option(PORTABLEKIT_TEXKEY "Build texkey, the offline replacement-key tool" OFF)
++if(PORTABLEKIT_TEXKEY)
++    add_executable(texkey
++        "${PORTABLEKIT_ROOT}/tools/texkey/texkey.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/texture_decode.cpp"
++        "${PORTABLEKIT_ROOT}/host/gpu/texture_key.cpp"
++        "${PORTABLEKIT_ROOT}/host/profile.cpp"
++        "${PORTABLEKIT_ROOT}/host/perf/frame_stats.cpp"
++        "${PORTABLEKIT_ROOT}/host/settings/settings.cpp"
++        "${PORTABLEKIT_ROOT}/host/input/bindings.cpp"
++        "${PORTABLEKIT_ROOT}/host/install/user_data.cpp"
++        "${PORTABLEKIT_ROOT}/host/app_paths.cpp"
++        "${PORTABLEKIT_ROOT}/tests/test_profile.cpp")
++    target_compile_features(texkey PRIVATE cxx_std_20)
++    target_include_directories(texkey PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party")
++    target_link_libraries(texkey PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
++    find_package(Threads REQUIRED)
++    target_link_libraries(texkey PRIVATE Threads::Threads)
++    set_target_properties(texkey PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++endif()
++
+ # The desktop app's keys file as extension modules look keys up in it. The
+ # values of PortableKit's own keys come from crypto_keys_builtin.cpp, compiled
+ # under other names (tests/builtin_keys_renamed.cpp) beside the app's own.
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index 66f135b..c36a40c 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -44,6 +44,8 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/gpu/ge_dump.cpp
+     host/gpu/ge_worker.cpp
+     host/gpu/texture_decode.cpp
++    host/gpu/texture_key.cpp
++    host/gpu/hd_texture_pack.cpp
+     host/perf/frame_stats.cpp
+     host/perf/bench.cpp
+     host/perf/bringup_stats.cpp
+@@ -169,6 +171,7 @@ set(PORTABLEKIT_GL_RENDERER_SOURCES
+     host/gpu/gl/gl_overlay.cpp
+     host/gpu/mip_chain.cpp
+     host/gpu/gl/gl_png.cpp
++    host/gpu/gl/gl_hd_textures.cpp
+     host/gpu/gl/gl_platform_egl.cpp
+     CACHE INTERNAL "PortableKit GLES2 renderer sources, relative to PORTABLEKIT_ROOT")
+ 
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+new file mode 100644
+index 0000000..d9bc17c
+--- /dev/null
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -0,0 +1,491 @@
++#include "gl_hd_textures.hpp"
++
++#include "../texture_decode.hpp"
++#include "gl_platform.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <iostream>
++#include <sstream>
++
++#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
++#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
++#endif
++#ifndef GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
++#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
++#endif
++
++namespace portablekit::gpu {
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++std::uint64_t nanoseconds_since(Clock::time_point start) {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
++}
++
++// ---- DXT in software, for a driver without S3TC (a desktop Mesa without it) -------------------
++
++std::uint32_t expand565(std::uint32_t c) {
++    const std::uint32_t r = (c >> 11u) & 31u, g = (c >> 5u) & 63u, b = c & 31u;
++    return ((r << 3u) | (r >> 2u)) | (((g << 2u) | (g >> 4u)) << 8u) | (((b << 3u) | (b >> 2u)) << 16u);
++}
++
++void decode_bc1_colors(const std::uint8_t *block, std::uint32_t *out, bool punch_through) {
++    const std::uint32_t c0 = block[0] | block[1] << 8u, c1 = block[2] | block[3] << 8u;
++    std::uint32_t palette[4];
++    palette[0] = expand565(c0) | 0xFF000000u;
++    palette[1] = expand565(c1) | 0xFF000000u;
++    const auto mix = [](std::uint32_t a, std::uint32_t b, std::uint32_t wa, std::uint32_t wb, std::uint32_t div) {
++        std::uint32_t result = 0xFF000000u;
++        for (std::uint32_t shift = 0; shift < 24u; shift += 8u)
++            result |= (((a >> shift) & 0xFFu) * wa + ((b >> shift) & 0xFFu) * wb) / div << shift;
++        return result;
++    };
++    if (c0 > c1 || !punch_through) {
++        if (c0 > c1) {
++            palette[2] = mix(palette[0], palette[1], 2u, 1u, 3u);
++            palette[3] = mix(palette[0], palette[1], 1u, 2u, 3u);
++        } else {
++            palette[2] = mix(palette[0], palette[1], 1u, 1u, 2u);
++            palette[3] = 0xFF000000u;
++        }
++    } else {
++        palette[2] = mix(palette[0], palette[1], 1u, 1u, 2u);
++        palette[3] = 0u;
++    }
++    const std::uint32_t indices = block[4] | block[5] << 8u | block[6] << 16u | static_cast<std::uint32_t>(block[7]) << 24u;
++    for (std::uint32_t i = 0; i < 16u; ++i) out[i] = palette[(indices >> (2u * i)) & 3u];
++}
++
++void decode_bc3_alpha(const std::uint8_t *block, std::uint32_t *out) {
++    const std::uint32_t a0 = block[0], a1 = block[1];
++    std::uint32_t table[8] = {a0, a1};
++    if (a0 > a1) {
++        for (std::uint32_t i = 1; i < 7u; ++i) table[i + 1u] = ((7u - i) * a0 + i * a1) / 7u;
++    } else {
++        for (std::uint32_t i = 1; i < 5u; ++i) table[i + 1u] = ((5u - i) * a0 + i * a1) / 5u;
++        table[6] = 0u;
++        table[7] = 255u;
++    }
++    std::uint64_t bits = 0u;
++    for (int i = 0; i < 6; ++i) bits |= static_cast<std::uint64_t>(block[2 + i]) << (8 * i);
++    for (std::uint32_t i = 0; i < 16u; ++i) out[i] = (out[i] & 0x00FFFFFFu) | table[(bits >> (3u * i)) & 7u] << 24u;
++}
++
++void decode_dxt_level(HdFormat format, const std::uint8_t *data, std::uint32_t width, std::uint32_t height,
++                      std::vector<std::uint32_t> &rgba) {
++    rgba.assign(static_cast<std::size_t>(width) * height, 0u);
++    const std::uint32_t bw = (width + 3u) / 4u, bh = (height + 3u) / 4u;
++    const std::uint32_t block_bytes = format == HdFormat::Dxt1 ? 8u : 16u;
++    std::uint32_t texels[16];
++    for (std::uint32_t by = 0; by < bh; ++by)
++        for (std::uint32_t bx = 0; bx < bw; ++bx) {
++            const std::uint8_t *block = data + (static_cast<std::size_t>(by) * bw + bx) * block_bytes;
++            if (format == HdFormat::Dxt1) {
++                decode_bc1_colors(block, texels, false);
++            } else {
++                decode_bc1_colors(block + 8, texels, false);
++                decode_bc3_alpha(block, texels);
++            }
++            for (std::uint32_t y = 0; y < 4u && by * 4u + y < height; ++y)
++                for (std::uint32_t x = 0; x < 4u && bx * 4u + x < width; ++x)
++                    rgba[static_cast<std::size_t>(by * 4u + y) * width + bx * 4u + x] = texels[y * 4u + x];
++        }
++}
++
++} // namespace
++
++GlHdTextures::GlHdTextures() = default;
++GlHdTextures::~GlHdTextures() = default;
++
++void GlHdTextures::configure(const HdConfig &config) {
++    config_ = config;
++    if (!config_.dump_dir.empty() && !dump_.active()) dump_.open(config_.dump_dir, config_.dump_raw);
++    open_pack();
++    if (config_.log && (pack_.is_open() || dump_.active()))
++        std::cout << "[hdtex] mode " << hd_mode_name(config_.mode) << ", budget " << config_.budget_bytes / (1024u * 1024u)
++                  << " MB" << (pack_.is_open() ? ", pack of " + std::to_string(pack_.count()) + " textures (index " +
++                                                       std::to_string(pack_.index_ram_bytes()) + " bytes in RAM)"
++                                                 : std::string())
++                  << (dump_.active() ? ", dumping to " + config_.dump_dir.string() : std::string()) << "\n";
++}
++
++void GlHdTextures::open_pack() {
++    pack_.close();
++    missing_logged_ = false;
++    if (config_.mode == HdMode::Off) return;
++    const std::filesystem::path path =
++        config_.data_root / (config_.mode == HdMode::X2 ? "texpack_2x.bin" : "texpack_4x.bin");
++    std::string error;
++    if (!pack_.open(path, error)) {
++        if (config_.log) std::cerr << "[hdtex] " << error << "; the original textures are used\n";
++        missing_logged_ = true;
++    }
++}
++
++void GlHdTextures::set_mode(HdMode mode) {
++    if (mode == config_.mode) return;
++    config_.mode = mode;
++    open_pack();
++    exhausted_ = false;
++    mode_changed_ = true;
++    ++stats_.flushes;
++    if (config_.log) std::cout << "[hdtex] gfx.hd_textures is now " << hd_mode_name(mode) << "\n";
++}
++
++bool GlHdTextures::tick(std::uint64_t frame) {
++    frame_ = frame;
++    if (frame < last_poll_ || frame >= last_poll_ + 60u) {
++        last_poll_ = frame;
++        // The environment decides for the whole run; otherwise settings.txt may have been edited (the overlay saves it).
++        if (std::getenv("INFECTED_HD_TEXTURES") == nullptr) {
++            std::error_code error;
++            const auto time = std::filesystem::last_write_time(config_.data_root / "settings.txt", error);
++            if (!error && time != settings_time_) {
++                settings_time_ = time;
++                set_mode(hd_textures_setting(config_.data_root));
++            }
++        }
++    }
++    const bool changed = mode_changed_;
++    mode_changed_ = false;
++    return changed;
++}
++
++bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, const std::vector<std::uint8_t> &blob,
++                               std::uint64_t &gpu_bytes, std::uint8_t &levels) {
++    if (!s3tc_known_) {
++        s3tc_known_ = true;
++#if defined(__vita__)
++        s3tc_ = true;
++#else
++        const char *extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
++        s3tc_ = extensions != nullptr && (std::strstr(extensions, "GL_EXT_texture_compression_s3tc") != nullptr ||
++                                          std::strstr(extensions, "GL_EXT_texture_compression_dxt1") != nullptr);
++        if (!s3tc_ && config_.log) std::cerr << "[hdtex] the driver has no S3TC: DXT levels are expanded to RGBA8 on the CPU\n";
++#endif
++    }
++    if (bind_) bind_(texture);
++    else glBindTexture(GL_TEXTURE_2D, texture);
++    std::uint32_t width = record.width, height = record.height;
++    std::size_t offset = 0u;
++    gpu_bytes = 0u;
++    std::uint32_t uploaded = 0u;
++    for (std::uint32_t level = 0; level < record.mip_count; ++level) {
++        const std::uint32_t bytes = hd_level_bytes(record.format, width, height);
++        if (offset + bytes > blob.size()) return false;
++#if defined(__vita__)
++        // vitaGL swizzles compressed levels in 4x4 blocks; the chain stops at the last level that is whole blocks.
++        if (record.format != HdFormat::Rgba8 && (width < 4u || height < 4u)) break;
++#endif
++        const std::uint8_t *data = blob.data() + offset;
++        if (record.format == HdFormat::Rgba8) {
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA, static_cast<GLsizei>(width),
++                         static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
++            gpu_bytes += bytes;
++        } else if (s3tc_) {
++            glCompressedTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level),
++                                   record.format == HdFormat::Dxt1 ? GL_COMPRESSED_RGB_S3TC_DXT1_EXT
++                                                                   : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
++                                   static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, static_cast<GLsizei>(bytes), data);
++            gpu_bytes += bytes;
++        } else {
++            decode_dxt_level(record.format, data, width, height, decode_);
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA, static_cast<GLsizei>(width),
++                         static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, decode_.data());
++            gpu_bytes += static_cast<std::uint64_t>(width) * height * 4u;
++        }
++        offset += bytes;
++        ++uploaded;
++        width = std::max(width / 2u, 1u);
++        height = std::max(height / 2u, 1u);
++    }
++    levels = static_cast<std::uint8_t>(uploaded);
++    return uploaded != 0u;
++}
++
++bool GlHdTextures::admit(std::uint64_t needed) {
++    if (exhausted_ && stats_.resident_bytes < config_.budget_bytes / 10u * 9u) exhausted_ = false;
++    if (exhausted_ || stats_.resident_bytes + needed > config_.budget_bytes) {
++        exhausted_ = true;
++        ++stats_.skipped_budget;
++        if (!logged_exhausted_ && config_.log) {
++            logged_exhausted_ = true;
++            std::cerr << "[hdtex] replacement textures reached the budget of " << config_.budget_bytes / (1024u * 1024u)
++                      << " MB; the remaining textures use the originals (this is logged once)\n";
++        }
++        return false;
++    }
++    return true;
++}
++
++namespace {
++
++// RGBA bytes (red in the low byte) of the palette entry each index value reads, as the renderer's decode sees it.
++void read_palette(const TextureState &state, const std::uint8_t *clut, std::uint32_t entries, std::uint32_t *out) {
++    for (std::uint32_t index = 0; index < entries; ++index) {
++        const std::uint32_t entry = ((index >> std::min(state.clut_shift, 31u)) & state.clut_mask) | state.clut_offset << 4u;
++        if (state.clut_format == 3u) {
++            const std::uint8_t *at = clut + entry * 4u;
++            out[index] = at[0] | at[1] << 8u | at[2] << 16u | static_cast<std::uint32_t>(at[3]) << 24u;
++            continue;
++        }
++        const std::uint32_t v = clut[entry * 2u] | clut[entry * 2u + 1u] << 8u;
++        std::uint32_t r, g, b, a = 255u;
++        if (state.clut_format == 0u) {
++            r = (v & 31u) * 255u / 31u; g = ((v >> 5u) & 63u) * 255u / 63u; b = ((v >> 11u) & 31u) * 255u / 31u;
++        } else if (state.clut_format == 1u) {
++            r = (v & 31u) * 255u / 31u; g = ((v >> 5u) & 31u) * 255u / 31u; b = ((v >> 10u) & 31u) * 255u / 31u;
++            a = ((v >> 15u) & 1u) * 255u;
++        } else {
++            r = (v & 15u) * 17u; g = ((v >> 4u) & 15u) * 17u; b = ((v >> 8u) & 15u) * 17u; a = ((v >> 12u) & 15u) * 17u;
++        }
++        out[index] = r | g << 8u | b << 16u | a << 24u;
++    }
++}
++
++// Halves an RGBA picture with a box filter (odd sizes keep the last row or column).
++void halve(const std::vector<std::uint32_t> &in, std::uint32_t w, std::uint32_t h, std::vector<std::uint32_t> &out) {
++    const std::uint32_t nw = std::max(w / 2u, 1u), nh = std::max(h / 2u, 1u);
++    out.resize(static_cast<std::size_t>(nw) * nh);
++    for (std::uint32_t y = 0; y < nh; ++y)
++        for (std::uint32_t x = 0; x < nw; ++x) {
++            const std::uint32_t x0 = std::min(x * 2u, w - 1u), x1 = std::min(x * 2u + 1u, w - 1u);
++            const std::uint32_t y0 = std::min(y * 2u, h - 1u), y1 = std::min(y * 2u + 1u, h - 1u);
++            const std::uint32_t p[4] = {in[y0 * w + x0], in[y0 * w + x1], in[y1 * w + x0], in[y1 * w + x1]};
++            std::uint32_t result = 0u;
++            for (std::uint32_t c = 0; c < 4u; ++c)
++                result |= (((p[0] >> (8u * c)) & 255u) + ((p[1] >> (8u * c)) & 255u) + ((p[2] >> (8u * c)) & 255u) +
++                           ((p[3] >> (8u * c)) & 255u) + 2u) / 4u << (8u * c);
++            out[static_cast<std::size_t>(y) * nw + x] = result;
++        }
++}
++
++constexpr std::uint64_t kRecolourWindowFrames = 120u;   // a texture whose palette changes this often is left alone
++constexpr std::uint32_t kRecoloursPerWindow = 6u;
++constexpr std::uint64_t kRecolourPenaltyFrames = 1800u;
++
++} // namespace
++
++bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state,
++                                HdTextureInfo &info) {
++    const std::uint64_t image_key = texture_image_key(memory, state);
++    if (image_key == 0u) return false;
++    HdRecord record;
++    if (!pack_.find(image_key, record) || (record.flags & kHdFlagRecolour) == 0u) return false;
++    // A palette that changes every few frames (a colour animation of a recolourable image) would cost a rebuild
++    // each time: such a texture keeps its original.
++    Thrash &thrash = thrash_[image_key];
++    if (frame_ < thrash.refuse_until) {
++        ++stats_.recolour_refused;
++        return false;
++    }
++    if (frame_ >= thrash.window_start + kRecolourWindowFrames || frame_ < thrash.window_start) {
++        thrash.window_start = frame_;
++        thrash.count = 0u;
++    }
++    if (++thrash.count > kRecoloursPerWindow) {
++        thrash.refuse_until = frame_ + kRecolourPenaltyFrames;
++        ++stats_.recolour_refused;
++        if (!thrash.logged && config_.log) {
++            thrash.logged = true;
++            std::cerr << "[hdtex] the palette of image " << std::hex << image_key << std::dec
++                      << " changes too often to recolour: its original is used for a while (logged once per image)\n";
++        }
++        return false;
++    }
++    const std::uint64_t needed = static_cast<std::uint64_t>(record.width) * record.height * 4u * 4u / 3u;
++    if (!admit(needed)) return false;
++
++    const Clock::time_point start = Clock::now();
++    if (!pack_.read_blob(record, blob_)) {
++        ++stats_.upload_failed;
++        return false;
++    }
++    HdRecolour recolour;
++    if (!hd_parse_recolour(record, blob_, recolour)) {
++        ++stats_.upload_failed;
++        return false;
++    }
++    const std::uint32_t clut_bytes = texture_clut_bytes_needed(state);
++    const std::uint8_t *clut = memory.raw_pointer(state.clut_address, clut_bytes);
++    if (clut == nullptr) return false;
++    std::uint32_t palette[256];
++    read_palette(state, clut, recolour.palette_entries, palette);
++
++    const std::uint32_t width = record.width, height = record.height;
++    const std::uint8_t *base_data = blob_.data() + recolour.base_offset;
++    const std::vector<std::uint32_t> *base = nullptr;
++    if (record.format == HdFormat::Rgba8) {
++        recolour_base_.resize(static_cast<std::size_t>(width) * height);
++        std::memcpy(recolour_base_.data(), base_data, recolour_base_.size() * 4u);
++    } else {
++        decode_dxt_level(record.format, base_data, width, height, recolour_base_);
++    }
++    base = &recolour_base_;
++    std::vector<std::uint32_t> &level = recolour_level_;
++    level.resize(static_cast<std::size_t>(width) * height);
++    hd_apply_recolour(recolour, base->data(), palette, level.data());
++
++    if (bind_) bind_(texture);
++    else glBindTexture(GL_TEXTURE_2D, texture);
++    std::uint64_t gpu_bytes = 0u;
++    std::uint32_t levels = 0u, w = width, h = height;
++    for (;;) {
++        glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(levels), GL_RGBA, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, level.data());
++        gpu_bytes += static_cast<std::uint64_t>(w) * h * 4u;
++        ++levels;
++        if (w == 1u && h == 1u) break;
++        halve(level, w, h, recolour_mip_);
++        level.swap(recolour_mip_);
++        w = std::max(w / 2u, 1u);
++        h = std::max(h / 2u, 1u);
++    }
++    stats_.blob_bytes += record.size;
++    ++stats_.recolour_hits;
++    ++stats_.hits;
++    info.replaced = true;
++    info.recoloured = true;
++    info.gpu_bytes = gpu_bytes;
++    info.width = record.width;
++    info.height = record.height;
++    info.mips = static_cast<std::uint8_t>(levels);
++    ++stats_.resident_textures;
++    stats_.resident_bytes += gpu_bytes;
++    stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
++    stats_.recolour_ns += nanoseconds_since(start);
++    return true;
++}
++
++bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info) {
++    const bool was_replaced = info.replaced;
++    if (was_replaced) {
++        stats_.resident_bytes -= std::min(stats_.resident_bytes, info.gpu_bytes);
++        if (stats_.resident_textures != 0u) --stats_.resident_textures;
++        info.replaced = false;
++        info.gpu_bytes = 0u;
++        info.mips = 0u;
++    }
++    info.key = 0u;
++    if (!active()) {
++        info.respecify = was_replaced;
++        return false;
++    }
++
++    // 8888 textures are copies of render targets (the game's own post effects): never replaced, never keyed.
++    if (state.format == TextureFormat::Rgba8888) {
++        ++stats_.not_replaceable;
++        info.respecify = was_replaced;
++        return false;
++    }
++
++    // The key: once per upload of a texture (first sight or changed contents), never per draw.
++    const Clock::time_point key_start = Clock::now();
++    const std::uint64_t key = texture_replacement_key(memory, state);
++    stats_.key_ns += nanoseconds_since(key_start);
++    ++stats_.keyed;
++    info.key = key;
++    if (key == 0u) {
++        ++stats_.key_failed;
++        info.respecify = was_replaced;
++        return false;
++    }
++
++    if (dump_.active() && !dump_.known(key)) {
++        std::vector<std::uint32_t> rgba;
++        decode_texture(memory, state, rgba);
++        const std::uint32_t stored = texture_stored_bytes(state);
++        const std::uint32_t clut_bytes = texture_clut_bytes_needed(state);
++        dump_.texture(key, state, memory.raw_pointer(state.address, stored), stored,
++                      clut_bytes != 0u ? memory.raw_pointer(state.clut_address, clut_bytes) : nullptr, clut_bytes, rgba);
++    }
++
++    info.recoloured = false;
++    bool replaced = false;
++    if (pack_.is_open()) {
++        const Clock::time_point lookup_start = Clock::now();
++        HdRecord record;
++        const bool found = pack_.find(key, record);
++        stats_.lookup_ns += nanoseconds_since(lookup_start);
++        if (!found || (record.flags & kHdFlagRecolour) != 0u) {
++            // The full key is not in the pack. A recolourable image (a character whose clothes the game recolours)
++            // is found by its image key and rebuilt for the palette in use.
++            if (pack_.recolour_count() != 0u && texture_is_indexed(state.format) && try_recolour(texture, memory, state, info))
++                replaced = true;
++            else
++                ++stats_.misses;
++        } else {
++            const std::uint64_t needed = hd_chain_bytes(record.format, record.width, record.height, record.mip_count);
++            if (!admit(needed)) {
++                // refused by the budget: the original is used
++            } else {
++                const Clock::time_point upload_start = Clock::now();
++                std::uint64_t gpu_bytes = 0u;
++                std::uint8_t levels = 0u;
++                if (pack_.read_blob(record, blob_) && upload_blob(texture, record, blob_, gpu_bytes, levels)) {
++                    stats_.blob_bytes += record.size;
++                    ++stats_.hits;
++                    info.replaced = replaced = true;
++                    info.gpu_bytes = gpu_bytes;
++                    info.width = record.width;
++                    info.height = record.height;
++                    info.mips = levels;
++                    ++stats_.resident_textures;
++                    stats_.resident_bytes += gpu_bytes;
++                    stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
++                } else {
++                    ++stats_.upload_failed;
++                }
++                stats_.upload_ns += nanoseconds_since(upload_start);
++            }
++        }
++    }
++    info.respecify = was_replaced && !replaced;
++    return replaced;
++}
++
++void GlHdTextures::released(HdTextureInfo &info) {
++    if (info.replaced) {
++        stats_.resident_bytes -= std::min(stats_.resident_bytes, info.gpu_bytes);
++        if (stats_.resident_textures != 0u) --stats_.resident_textures;
++    }
++    info = HdTextureInfo{};
++}
++
++void GlHdTextures::note_draw(const HdTextureInfo &info, const DrawCall &call) {
++    if (!dump_.active() || info.key == 0u) return;
++    HdDrawInfo draw;
++    draw.through = call.through;
++    draw.wrap_s = call.texture.wrap_s;
++    draw.wrap_t = call.texture.wrap_t;
++    draw.min_filter = call.texture.min_filter;
++    draw.mag_filter = call.texture.mag_filter;
++    draw.function = call.texture.function;
++    draw.alpha_from_texture = call.texture.alpha_from_texture;
++    draw.alpha_test = call.alpha_test.enabled;
++    draw.blend = call.blend.enabled;
++    dump_.draw(info.key, draw);
++}
++
++std::string GlHdTextures::summary() const {
++    std::ostringstream out;
++    const HdStats &s = stats_;
++    const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
++    char text[512];
++    std::snprintf(text, sizeof text,
++                  "hd textures %s: keyed %llu (%.2f us each), hits %llu (recoloured %llu, %.2f ms), misses %llu, no key %llu, "
++                  "render-target copies skipped %llu, budget refusals %llu, recolour refusals %llu, failed %llu; "
++                  "resident %llu textures %.2f MB (peak %.2f MB), read %.2f MB, lookup %.2f ms, upload %.2f ms, flushes %llu",
++                  hd_mode_name(config_.mode), n(s.keyed), s.keyed != 0u ? static_cast<double>(s.key_ns) / 1000.0 / static_cast<double>(s.keyed) : 0.0,
++                  n(s.hits), n(s.recolour_hits), static_cast<double>(s.recolour_ns) / 1.0e6, n(s.misses), n(s.key_failed),
++                  n(s.not_replaceable), n(s.skipped_budget), n(s.recolour_refused), n(s.upload_failed), n(s.resident_textures),
++                  static_cast<double>(s.resident_bytes) / 1048576.0, static_cast<double>(s.peak_bytes) / 1048576.0,
++                  static_cast<double>(s.blob_bytes) / 1048576.0, static_cast<double>(s.lookup_ns) / 1.0e6,
++                  static_cast<double>(s.upload_ns) / 1.0e6, n(s.flushes));
++    return text;
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+new file mode 100644
+index 0000000..61a089c
+--- /dev/null
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -0,0 +1,103 @@
++#pragma once
++
++#include "../hd_texture_pack.hpp"
++#include "../texture_key.hpp"
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace portablekit::gpu {
++
++struct DrawCall;
++
++// What the renderer's texture cache entry remembers about a texture's replacement.
++struct HdTextureInfo {
++    std::uint64_t key{};        // the replacement key (0 until computed, or when the texture cannot be keyed)
++    std::uint64_t gpu_bytes{};  // GPU bytes of the replacement (0 when the original is on the GPU)
++    std::uint16_t width{}, height{};
++    std::uint8_t mips{};        // mip levels uploaded
++    bool replaced{};
++    bool recoloured{};          // the replacement was rebuilt for the palette in use (a recolour record)
++    bool respecify{};           // the texture was a replacement and is the original again: specify it anew
++};
++
++// The GL side of the HD texture pack: finds the replacement for a texture the renderer is about to upload,
++// reads its blob from the pack and uploads the mip chain (DXT1, DXT5 or RGBA8), keeps the budget and the
++// counters, and writes the texture dump. The renderer calls it from one place, where it would otherwise
++// decode and upload the original (GlRenderer::Impl::decode_into).
++class GlHdTextures {
++public:
++    GlHdTextures();
++    ~GlHdTextures();
++
++    // Sets the mode, the data root, the budget and the dump from the config; opens the pack of the mode.
++    void configure(const HdConfig &config);
++    // The renderer's glBindTexture with its cache, so the upload binds through it.
++    void set_binder(std::function<void(std::uint32_t)> bind) { bind_ = std::move(bind); }
++    // Switches the pack at run time. The renderer must drop every texture it holds (see tick).
++    void set_mode(HdMode mode);
++    [[nodiscard]] HdMode mode() const noexcept { return config_.mode; }
++    [[nodiscard]] bool has_pack() const noexcept { return pack_.is_open(); }
++    [[nodiscard]] std::uint32_t scale() const noexcept { return pack_.is_open() ? pack_.scale() : 1u; }
++    // Once per display list: re-reads the setting now and then; true when the mode changed since the last
++    // call, i.e. the renderer has to clear its texture cache so every texture is uploaded again.
++    bool tick(std::uint64_t frame);
++
++    // Whether the texture hook has anything to do (a pack is loaded or a dump is being written).
++    [[nodiscard]] bool active() const noexcept { return pack_.is_open() || dump_.active(); }
++    [[nodiscard]] bool dumping() const noexcept { return dump_.active(); }
++
++    // A texture is about to be uploaded: finds its replacement. True when `texture` now holds the replacement
++    // (with its mip chain); false when the caller uploads the original. `info` is the entry's.
++    bool upload(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info);
++    // The entry is gone from the GPU.
++    void released(HdTextureInfo &info);
++    // A draw used the texture (texture dump metadata only).
++    void note_draw(const HdTextureInfo &info, const DrawCall &call);
++
++    [[nodiscard]] const HdStats &stats() const noexcept { return stats_; }
++    [[nodiscard]] std::string summary() const;
++    [[nodiscard]] const HdPackFile &pack() const noexcept { return pack_; }
++
++private:
++    void open_pack();
++    bool upload_blob(std::uint32_t texture, const HdRecord &record, const std::vector<std::uint8_t> &blob,
++                     std::uint64_t &gpu_bytes, std::uint8_t &levels);
++    // The texture's full key is not in the pack: looks for its image under the image key and rebuilds the
++    // replacement for the palette in use. True when `texture` holds it.
++    bool try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state, HdTextureInfo &info);
++    bool admit(std::uint64_t needed_bytes);   // budget check with hysteresis; logs the first refusal
++
++    HdConfig config_;
++    HdPackFile pack_;
++    HdTextureDump dump_;
++    HdStats stats_;
++    std::function<void(std::uint32_t)> bind_;
++    bool s3tc_{true};
++    bool s3tc_known_{};
++    bool exhausted_{};          // the budget was spent: no replacements until memory is freed
++    bool logged_exhausted_{};
++    bool missing_logged_{};
++    bool mode_changed_{};
++    std::uint64_t last_poll_{};
++    std::uint64_t frame_{};
++    struct Thrash {
++        std::uint64_t window_start{};
++        std::uint32_t count{};
++        std::uint64_t refuse_until{};
++        bool logged{};
++    };
++    std::unordered_map<std::uint64_t, Thrash> thrash_;   // image key -> recolours in the current window
++    std::filesystem::file_time_type settings_time_{};
++    std::vector<std::uint8_t> blob_;
++    std::vector<std::uint32_t> decode_;
++    std::vector<std::uint32_t> recolour_base_, recolour_level_, recolour_mip_;
++    std::vector<std::uint8_t> level_;
++};
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 13463c0..95f5802 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -18,6 +18,7 @@
+ #include "../texture_decode.hpp"
+ #include "../triangle_indices.hpp"
+ #include "gl_overlay.hpp"
++#include "gl_hd_textures.hpp"
+ #include "gl_platform.h"
+ #include "gl_shaders.hpp"
+ 
+@@ -240,6 +241,7 @@ struct TextureEntry {
+     std::uint8_t uv_verdict{};     // 3D draws with clamped wrap: 0 not looked at, 1 uses the whole texture, 2 a part (an atlas)
+     bool mips_tried{};
+     std::uint32_t mip_levels{1u};  // levels the GPU texture holds, including level 0
++    HdTextureInfo hd;    // the HD pack's replacement for it, if any (gl_hd_textures.hpp)
+ };
+ 
+ struct Sampler {
+@@ -254,6 +256,7 @@ struct TextureBinding {
+     float offset[2]{};
+     bool from_target{};
+     bool opaque{};
++    std::uint8_t hd_mips{};  // mip levels of an HD replacement (0: the original texture)
+ };
+ 
+ struct BlendPlan {
+@@ -306,6 +309,8 @@ struct GlRenderer::Impl {
+     std::map<std::array<std::uint32_t, 3>, bool> target_verdicts;  // per display list: target, texture, size -> unchanged
+     std::vector<std::uint32_t> decode_buffer;
+     std::vector<std::uint8_t> wrap_scratch;  // a texture that wraps the end of VRAM, gathered into one run
++    GlHdTextures hd;          // HD texture pack (gfx.hd_textures) and the texture dump
++    bool hd_configured{};
+     GLuint upload_texture{};  // for upload_frame
+     GLuint clear_texture{};   // 1x1 transparent black for quad_clear
+     std::uint32_t upload_width{}, upload_height{};
+@@ -753,7 +758,27 @@ struct GlRenderer::Impl {
+         ++st().texture_hash_full;
+     }
+ 
++    // Changes what the GPU holds for the entry (the cache's byte count follows).
++    void set_gpu_bytes(TextureEntry &entry, std::uint64_t bytes, bool counted) {
++        if (counted) texture_bytes = texture_bytes - entry.gpu_bytes + bytes;
++        entry.gpu_bytes = bytes;
++    }
++
+     bool decode_into(TextureEntry &entry, const GuestMemory &memory, bool create) {
++        // The one place the HD texture pack takes part: a texture about to be uploaded is replaced by its
++        // pack entry (with mips) when the pack has one for its replacement key.
++        const bool counted = !create;  // an entry being created is added to texture_bytes by the caller
++        if (hd.upload(entry.id, memory, entry.state, entry.hd)) {
++            set_gpu_bytes(entry, entry.hd.gpu_bytes, counted);
++            ++st().texture_misses;
++            st().texture_upload_bytes += entry.hd.gpu_bytes;
++            return true;
++        }
++        if (entry.hd.respecify) {  // it was a replacement: its storage has the replacement's size, so specify it anew
++            create = true;
++            entry.hd.respecify = false;
++            set_gpu_bytes(entry, static_cast<std::uint64_t>(entry.width) * entry.height * 4u, counted);
++        }
+         if (!decode_texture(memory, entry.state, decode_buffer)) return false;
+         bind_texture(entry.id);
+         if (create) {
+@@ -890,6 +915,7 @@ struct GlRenderer::Impl {
+         if (cache.texture == entry.id) cache.texture = ~0u;
+         samplers.erase(entry.id);
+         glDeleteTextures(1, &entry.id);
++        hd.released(entry.hd);
+         texture_bytes -= entry.gpu_bytes;
+         ++st().texture_evicted;
+     }
+@@ -1613,6 +1639,8 @@ struct GlRenderer::Impl {
+         out.id = entry->id;
+         out.entry = entry;
+         if (!call.through && (opt.smooth || opt.mips)) note_3d_use(*entry, call, memory);
++        out.hd_mips = entry->hd.replaced ? std::max<std::uint8_t>(entry->hd.mips, 1u) : 0u;
++        if (hd.dumping()) hd.note_draw(entry->hd, call);  // texture dump metadata only
+         if (call.through) {
+             out.scale[0] = 1.0f / static_cast<float>(texture.width);
+             out.scale[1] = 1.0f / static_cast<float>(texture.height);
+@@ -1845,6 +1873,11 @@ struct GlRenderer::Impl {
+             }
+             state.min_filter = with_mips ? GL_LINEAR_MIPMAP_LINEAR : (linear_min ? GL_LINEAR : GL_NEAREST);
+             state.mag_filter = linear_mag ? GL_LINEAR : GL_NEAREST;
++            if (binding.hd_mips != 0u) {
++                // An HD replacement has several texels to the game's one: filter it smoothly, through its mips.
++                state.min_filter = binding.hd_mips > 1u ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR;
++                state.mag_filter = GL_LINEAR;
++            }
+             if (sharpen) {
+                 // The shader's weights assume the hardware's bilinear fetch.
+                 state.min_filter = state.mag_filter = GL_LINEAR;
+@@ -2212,6 +2245,8 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+                             std::to_string(impl.ssaa_scale) + " averaged to x2)";
+         }
+     }
++    impl.hd.set_binder([&impl](std::uint32_t texture) { impl.bind_texture(texture); });
++    if (!impl.hd_configured) impl.hd.configure(hd_config_from_environment());
+     impl.ready = true;
+     std::cout << "Renderer: OpenGL ES 2.0 backend on " << impl.description << ", display x" << impl.display_scale()
+               << ", offscreen x" << impl.offscreen_scale << multisampling << "\n";
+@@ -2232,6 +2267,7 @@ void GlRenderer::begin_display_list() {
+     Impl &impl = *impl_;
+     if (!impl.ready) return;
+     impl.flush();
++    if (impl.hd.tick(impl.frames)) clear_texture_cache();  // gfx.hd_textures changed: every texture is uploaded again
+     ++impl.list_serial;
+     impl.clut_hashes.clear();
+     impl.target_verdicts.clear();
+@@ -2370,6 +2406,27 @@ std::vector<std::string> GlRenderer::shader_variant_names() const { return impl_
+ std::string GlRenderer::gl_description() const { return impl_->description; }
+ std::size_t GlRenderer::cached_textures() const noexcept { return impl_->textures.size(); }
+ std::uint64_t GlRenderer::cached_texture_bytes() const noexcept { return impl_->texture_bytes; }
++std::uint64_t GlRenderer::texture_bytes_used_last_frame() const noexcept {
++    std::uint64_t bytes = 0;
++    for (const auto &entry : impl_->textures)
++        if (entry.second->last_used + 1u == impl_->frames) bytes += entry.second->gpu_bytes;
++    return bytes;
++}
++
++void GlRenderer::configure_hd_textures(const HdConfig &config) {
++    impl_->hd.configure(config);
++    impl_->hd_configured = true;
++}
++
++void GlRenderer::set_hd_mode(HdMode mode) {
++    Impl &impl = *impl_;
++    impl.hd.set_mode(mode);
++    if (impl.ready && impl.hd.tick(impl.frames)) clear_texture_cache();
++}
++
++HdMode GlRenderer::hd_mode() const noexcept { return impl_->hd.mode(); }
++const HdStats &GlRenderer::hd_stats() const noexcept { return impl_->hd.stats(); }
++std::string GlRenderer::hd_summary() const { return impl_->hd.summary(); }
+ 
+ void GlRenderer::clear_texture_cache() {
+     Impl &impl = *impl_;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 5983c56..5bc273f 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "../hd_texture_pack.hpp"
+ #include "../renderer.hpp"
+ 
+ #include <array>
+@@ -214,9 +215,20 @@ public:
+     // Texture cache: entries and bytes held.
+     [[nodiscard]] std::size_t cached_textures() const noexcept;
+     [[nodiscard]] std::uint64_t cached_texture_bytes() const noexcept;
++    /// GPU bytes of the cached textures that were drawn in the flip that just ended: the working set of one scene.
++    [[nodiscard]] std::uint64_t texture_bytes_used_last_frame() const noexcept;
+     // Forgets every cached texture (a replayer does between unrelated dumps).
+     void clear_texture_cache();
+ 
++    // HD texture pack (gfx.hd_textures, hd_texture_pack.hpp). Without configure_hd_textures() the mode,
++    // data root, budget and dump directory come from the environment and settings.txt at initialize().
++    void configure_hd_textures(const HdConfig &config);
++    // Switches the pack at run time; the texture cache is cleared and every texture uploaded again.
++    void set_hd_mode(HdMode mode);
++    [[nodiscard]] HdMode hd_mode() const noexcept;
++    [[nodiscard]] const HdStats &hd_stats() const noexcept;
++    [[nodiscard]] std::string hd_summary() const;
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+new file mode 100644
+index 0000000..b563d8d
+--- /dev/null
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -0,0 +1,461 @@
++#include "hd_texture_pack.hpp"
++
++#include "../profile.hpp"
++#include "texture_key.hpp"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <sstream>
++
++#define STB_IMAGE_WRITE_STATIC
++#define STB_IMAGE_WRITE_IMPLEMENTATION
++#include "stb_image_write.h"
++
++namespace portablekit::gpu {
++namespace {
++
++constexpr std::uint32_t kRecordBytes = 28u;
++constexpr std::uint32_t kHeaderBytes = 16u;
++
++std::uint32_t read32(const std::uint8_t *at) {
++    return static_cast<std::uint32_t>(at[0]) | static_cast<std::uint32_t>(at[1]) << 8u |
++           static_cast<std::uint32_t>(at[2]) << 16u | static_cast<std::uint32_t>(at[3]) << 24u;
++}
++std::uint64_t read64(const std::uint8_t *at) { return read32(at) | static_cast<std::uint64_t>(read32(at + 4)) << 32u; }
++std::uint16_t read16(const std::uint8_t *at) { return static_cast<std::uint16_t>(at[0] | at[1] << 8u); }
++
++void put32(std::vector<std::uint8_t> &out, std::uint32_t value) {
++    for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
++}
++void put16(std::vector<std::uint8_t> &out, std::uint32_t value) {
++    out.push_back(static_cast<std::uint8_t>(value));
++    out.push_back(static_cast<std::uint8_t>(value >> 8u));
++}
++
++const char *format_name(TextureFormat format) {
++    switch (format) {
++    case TextureFormat::Rgba5650: return "rgb565";
++    case TextureFormat::Rgba5551: return "rgba5551";
++    case TextureFormat::Rgba4444: return "rgba4444";
++    case TextureFormat::Rgba8888: return "rgba8888";
++    case TextureFormat::Clut4: return "clut4";
++    case TextureFormat::Clut8: return "clut8";
++    case TextureFormat::Clut16: return "clut16";
++    case TextureFormat::Clut32: return "clut32";
++    case TextureFormat::Dxt1: return "dxt1";
++    case TextureFormat::Dxt3: return "dxt3";
++    case TextureFormat::Dxt5: return "dxt5";
++    }
++    return "?";
++}
++
++const char *clut_format_name(std::uint32_t format) {
++    switch (format) {
++    case 0u: return "rgb565";
++    case 1u: return "rgba5551";
++    case 2u: return "rgba4444";
++    default: return "rgba8888";
++    }
++}
++
++std::string hex_key(std::uint64_t key) {
++    char text[17];
++    std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(key));
++    return text;
++}
++
++std::string trim(std::string text) {
++    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
++    text.erase(text.begin(), std::find_if(text.begin(), text.end(), not_space));
++    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(), text.end());
++    return text;
++}
++
++const char *env_any(const char *name) {
++    if (const char *value = portablekit::env(name); value != nullptr && *value != '\0') return value;
++    const std::string full = std::string("INFECTED_") + name;
++    if (const char *value = std::getenv(full.c_str()); value != nullptr && *value != '\0') return value;
++    return nullptr;
++}
++
++} // namespace
++
++std::uint32_t hd_level_bytes(HdFormat format, std::uint32_t width, std::uint32_t height) {
++    width = std::max(width, 1u);
++    height = std::max(height, 1u);
++    switch (format) {
++    case HdFormat::Dxt1: return ((width + 3u) / 4u) * ((height + 3u) / 4u) * 8u;
++    case HdFormat::Dxt5: return ((width + 3u) / 4u) * ((height + 3u) / 4u) * 16u;
++    default: return width * height * 4u;
++    }
++}
++
++std::uint32_t hd_chain_bytes(HdFormat format, std::uint32_t width, std::uint32_t height, std::uint32_t levels) {
++    std::uint32_t total = 0u;
++    for (std::uint32_t level = 0; level < levels; ++level) {
++        total += hd_level_bytes(format, width, height);
++        width = std::max(width / 2u, 1u);
++        height = std::max(height / 2u, 1u);
++    }
++    return total;
++}
++
++// ---- the pack file -----------------------------------------------------------------------------
++
++HdPackFile::~HdPackFile() { close(); }
++
++void HdPackFile::close() {
++    if (file_ != nullptr) std::fclose(file_);
++    file_ = nullptr;
++    keys_.clear();
++    keys_.shrink_to_fit();
++    scale_ = 0u;
++    recolour_records_ = 0u;
++}
++
++bool HdPackFile::open(const std::filesystem::path &path, std::string &error) {
++    close();
++    file_ = std::fopen(path.string().c_str(), "rb");
++    if (file_ == nullptr) {
++        error = "cannot open " + path.string();
++        return false;
++    }
++    std::fseek(file_, 0, SEEK_END);
++    file_size_ = static_cast<std::uint64_t>(std::ftell(file_));
++    std::fseek(file_, 0, SEEK_SET);
++    std::uint8_t header[kHeaderBytes];
++    if (std::fread(header, 1, sizeof header, file_) != sizeof header || std::memcmp(header, "IFTP", 4) != 0 ||
++        read32(header + 4) != 1u) {
++        error = path.string() + " is not an IFTP version 1 texture pack";
++        close();
++        return false;
++    }
++    const std::uint32_t count = read32(header + 8);
++    scale_ = read32(header + 12);
++    index_offset_ = kHeaderBytes;
++    if (index_offset_ + static_cast<std::uint64_t>(count) * kRecordBytes > file_size_) {
++        error = path.string() + ": the index runs past the end of the file";
++        close();
++        return false;
++    }
++    // Only the keys stay in RAM: read the index in blocks.
++    keys_.reserve(count);
++    std::vector<std::uint8_t> block(kRecordBytes * 2048u);
++    std::uint32_t done = 0u;
++    bool sorted = true;
++    while (done < count) {
++        const std::uint32_t n = std::min<std::uint32_t>(count - done, 2048u);
++        if (std::fread(block.data(), kRecordBytes, n, file_) != n) {
++            error = path.string() + ": short read in the index";
++            close();
++            return false;
++        }
++        for (std::uint32_t i = 0; i < n; ++i) {
++            const std::uint64_t key = read64(block.data() + i * kRecordBytes);
++            if (!keys_.empty() && key <= keys_.back()) sorted = false;
++            keys_.push_back(key);
++            if ((read16(block.data() + i * kRecordBytes + 26u) & kHdFlagRecolour) != 0u) ++recolour_records_;
++        }
++        done += n;
++    }
++    bytes_read_ += static_cast<std::uint64_t>(count) * kRecordBytes + kHeaderBytes;
++    if (!sorted) {
++        error = path.string() + ": the index is not sorted by key";
++        close();
++        return false;
++    }
++    return true;
++}
++
++bool HdPackFile::find(std::uint64_t key, HdRecord &record) {
++    if (file_ == nullptr) return false;
++    const auto at = std::lower_bound(keys_.begin(), keys_.end(), key);
++    if (at == keys_.end() || *at != key) return false;
++    const std::uint64_t position = static_cast<std::uint64_t>(at - keys_.begin());
++    std::uint8_t raw[kRecordBytes];
++    if (std::fseek(file_, static_cast<long>(index_offset_ + position * kRecordBytes), SEEK_SET) != 0 ||
++        std::fread(raw, 1, sizeof raw, file_) != sizeof raw)
++        return false;
++    bytes_read_ += sizeof raw;
++    record.key = read64(raw);
++    record.offset = read64(raw + 8);
++    record.size = read32(raw + 16);
++    record.width = read16(raw + 20);
++    record.height = read16(raw + 22);
++    record.format = static_cast<HdFormat>(raw[24]);
++    record.mip_count = raw[25];
++    record.flags = read16(raw + 26);
++    return record.key == key && record.offset + record.size <= file_size_ && record.mip_count != 0u;
++}
++
++bool HdPackFile::read_blob(const HdRecord &record, std::vector<std::uint8_t> &out) {
++    if (file_ == nullptr) return false;
++    out.resize(record.size);
++    if (std::fseek(file_, static_cast<long>(record.offset), SEEK_SET) != 0 ||
++        std::fread(out.data(), 1, record.size, file_) != record.size)
++        return false;
++    bytes_read_ += record.size;
++    return true;
++}
++
++// ---- recolour records ----------------------------------------------------------------------------
++
++bool hd_unpackbits(const std::uint8_t *in, std::size_t in_size, std::uint8_t *out, std::size_t out_size) {
++    std::size_t i = 0u, o = 0u;
++    while (i < in_size && o < out_size) {
++        const std::uint8_t n = in[i++];
++        if (n < 128u) {  // n + 1 literal bytes
++            const std::size_t count = static_cast<std::size_t>(n) + 1u;
++            if (i + count > in_size || o + count > out_size) return false;
++            std::memcpy(out + o, in + i, count);
++            i += count;
++            o += count;
++        } else if (n > 128u) {  // the next byte, 257 - n times
++            const std::size_t count = 257u - n;
++            if (i >= in_size || o + count > out_size) return false;
++            std::memset(out + o, in[i++], count);
++            o += count;
++        }
++    }
++    return o == out_size && i == in_size;
++}
++
++bool hd_parse_recolour(const HdRecord &record, const std::vector<std::uint8_t> &blob, HdRecolour &out) {
++    if (blob.size() < 8u) return false;
++    const std::uint32_t entries = read16(blob.data());
++    const std::uint32_t encoding = read16(blob.data() + 2);
++    const std::uint32_t encoded = read32(blob.data() + 4);
++    if (entries == 0u || entries > 256u) return false;
++    const std::size_t pixels = static_cast<std::size_t>(record.width) * record.height;
++    const std::size_t palette_at = 8u, map_at = palette_at + entries * 4u, base_at = map_at + encoded;
++    if (base_at > blob.size() || pixels == 0u) return false;
++    if (blob.size() - base_at < hd_level_bytes(record.format, record.width, record.height)) return false;
++    out.palette_entries = entries;
++    out.base_palette.resize(entries);
++    for (std::uint32_t i = 0; i < entries; ++i) out.base_palette[i] = read32(blob.data() + palette_at + i * 4u);
++    out.index_map.resize(pixels);
++    if (encoding == 0u) {
++        if (encoded != pixels) return false;
++        std::memcpy(out.index_map.data(), blob.data() + map_at, pixels);
++    } else if (encoding == 1u) {
++        if (!hd_unpackbits(blob.data() + map_at, encoded, out.index_map.data(), pixels)) return false;
++    } else {
++        return false;
++    }
++    for (const std::uint8_t index : out.index_map)
++        if (index >= entries) return false;
++    out.base_offset = base_at;
++    return true;
++}
++
++void hd_apply_recolour(const HdRecolour &recolour, const std::uint32_t *base_rgba, const std::uint32_t *new_palette,
++                       std::uint32_t *out_rgba) {
++    // The change of each palette entry, per channel; a pixel moves by the change of the entry it belongs to.
++    std::int16_t delta[256][4];
++    for (std::uint32_t i = 0; i < recolour.palette_entries; ++i)
++        for (std::uint32_t c = 0; c < 4u; ++c)
++            delta[i][c] = static_cast<std::int16_t>(static_cast<int>((new_palette[i] >> (8u * c)) & 0xFFu) -
++                                                    static_cast<int>((recolour.base_palette[i] >> (8u * c)) & 0xFFu));
++    const std::size_t pixels = recolour.index_map.size();
++    for (std::size_t p = 0; p < pixels; ++p) {
++        const std::int16_t *d = delta[recolour.index_map[p]];
++        const std::uint32_t v = base_rgba[p];
++        std::uint32_t result = 0u;
++        for (std::uint32_t c = 0; c < 4u; ++c) {
++            const int value = static_cast<int>((v >> (8u * c)) & 0xFFu) + d[c];
++            result |= static_cast<std::uint32_t>(value < 0 ? 0 : (value > 255 ? 255 : value)) << (8u * c);
++        }
++        out_rgba[p] = result;
++    }
++}
++
++// ---- settings ----------------------------------------------------------------------------------
++
++const char *hd_mode_name(HdMode mode) {
++    switch (mode) {
++    case HdMode::X2: return "2x";
++    case HdMode::X4: return "4x";
++    default: return "off";
++    }
++}
++
++bool hd_parse_mode(const std::string &text, HdMode &mode) {
++    if (text == "off" || text == "0" || text == "false") mode = HdMode::Off;
++    else if (text == "2x" || text == "2") mode = HdMode::X2;
++    else if (text == "4x" || text == "4") mode = HdMode::X4;
++    else return false;
++    return true;
++}
++
++std::filesystem::path hd_data_root() {
++    if (const char *dir = env_any("DATA_DIR")) return dir;
++    return std::filesystem::current_path();
++}
++
++HdMode hd_textures_setting(const std::filesystem::path &data_root) {
++    // This function is the one place gfx.hd_textures is read; the port settings header replaces its body.
++    HdMode mode = HdMode::Off;
++    if (const char *text = env_any("HD_TEXTURES")) {
++        if (hd_parse_mode(text, mode)) return mode;
++        std::cerr << "[hdtex] " << text << " is not off, 2x or 4x\n";
++    }
++    std::ifstream settings(data_root / "settings.txt");
++    std::string line;
++    while (std::getline(settings, line)) {
++        const std::size_t eq = line.find('=');
++        if (eq == std::string::npos || trim(line.substr(0, eq)) != "gfx.hd_textures") continue;
++        const std::string value = trim(line.substr(eq + 1));
++        if (hd_parse_mode(value, mode)) return mode;
++        break;  // "auto" or a word we do not know: the default below
++    }
++    // Default: the best pack present.
++    std::error_code ignored;
++    if (std::filesystem::exists(data_root / "texpack_4x.bin", ignored)) return HdMode::X4;
++    if (std::filesystem::exists(data_root / "texpack_2x.bin", ignored)) return HdMode::X2;
++    return HdMode::Off;
++}
++
++HdConfig hd_config_from_environment() {
++    HdConfig config;
++    config.data_root = hd_data_root();
++    config.mode = hd_textures_setting(config.data_root);
++    if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = std::strtoull(text, nullptr, 10) * 1024ull * 1024ull;
++    if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
++    config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
++    return config;
++}
++
++// ---- the dump ----------------------------------------------------------------------------------
++
++void HdTextureDump::open(const std::filesystem::path &directory, bool raw) {
++    directory_ = directory;
++    raw_ = raw;
++    std::error_code ignored;
++    std::filesystem::create_directories(directory_, ignored);
++    active_ = !directory.empty();
++    // A dump directory that already holds textures: they are known, not written again.
++    if (active_) {
++        for (const auto &entry : std::filesystem::directory_iterator(directory_, ignored)) {
++            const std::string name = entry.path().filename().string();
++            if (name.size() == 21u && name.compare(16, 5, ".json") == 0)
++                seen_.insert(std::strtoull(name.substr(0, 16).c_str(), nullptr, 16));
++        }
++    }
++}
++
++void HdTextureDump::texture(std::uint64_t key, const TextureState &state, const std::uint8_t *texels,
++                            std::size_t texel_bytes, const std::uint8_t *clut, std::size_t clut_bytes,
++                            const std::vector<std::uint32_t> &rgba) {
++    if (!active_ || key == 0u || !seen_.insert(key).second) return;
++    Meta meta;
++    meta.state = state;
++    meta.image_key = texture_image_key(state, texels);
++    std::size_t zero = 0, opaque = 0;
++    for (const std::uint32_t texel : rgba) {
++        const std::uint32_t alpha = texel >> 24u;
++        if (alpha == 0u) ++zero;
++        else if (alpha == 255u) ++opaque;
++    }
++    const double total = rgba.empty() ? 1.0 : static_cast<double>(rgba.size());
++    meta.zero = static_cast<double>(zero) / total;
++    meta.opaque = static_cast<double>(opaque) / total;
++    meta.partial = 1.0 - meta.zero - meta.opaque;
++    const std::string stem = (directory_ / hex_key(key)).string();
++    if (!rgba.empty())
++        stbi_write_png((stem + ".png").c_str(), state.width, state.height, 4, rgba.data(), static_cast<int>(state.width) * 4);
++    if (raw_ && texels != nullptr) {
++        std::vector<std::uint8_t> out;
++        out.insert(out.end(), {'I', 'F', 'R', 'W'});
++        put32(out, 1u);
++        out.push_back(static_cast<std::uint8_t>(state.format));
++        out.push_back(static_cast<std::uint8_t>(state.clut_format));
++        out.push_back(state.swizzled ? 1u : 0u);
++        out.push_back(0u);
++        put16(out, state.width);
++        put16(out, state.height);
++        put16(out, state.buffer_width);
++        put16(out, state.clut_shift);
++        put16(out, state.clut_mask);
++        put16(out, state.clut_offset);
++        put32(out, static_cast<std::uint32_t>(texel_bytes));
++        put32(out, static_cast<std::uint32_t>(clut_bytes));
++        out.insert(out.end(), texels, texels + texel_bytes);
++        if (clut != nullptr) out.insert(out.end(), clut, clut + clut_bytes);
++        std::ofstream file(stem + ".raw", std::ios::binary);
++        file.write(reinterpret_cast<const char *>(out.data()), static_cast<std::streamsize>(out.size()));
++    }
++    write_json(key, meta);
++    meta_.emplace(key, std::move(meta));
++}
++
++void HdTextureDump::draw(std::uint64_t key, const HdDrawInfo &info) {
++    if (!active_) return;
++    const auto found = meta_.find(key);
++    if (found == meta_.end()) return;
++    Meta &meta = found->second;
++    bool changed = false;
++    const char *kind = info.through ? "through" : "3d";
++    if (meta.first_draw.empty()) {
++        meta.first_draw = kind;
++        changed = true;
++    }
++    (info.through ? meta.used_through : meta.used_3d) = true;
++    const std::uint32_t wrap = info.wrap_s | info.wrap_t << 8u | (info.through ? 1u : 0u) << 16u;
++    changed |= meta.wraps.insert(wrap).second;
++    const std::uint32_t filter = info.min_filter | info.mag_filter << 8u | (info.through ? 1u : 0u) << 16u;
++    changed |= meta.filters.insert(filter).second;
++    changed |= meta.functions.insert(info.function | (info.alpha_from_texture ? 0x100u : 0u)).second;
++    if (info.alpha_test && !meta.alpha_test) meta.alpha_test = changed = true;
++    if (info.blend && !meta.blend) meta.blend = changed = true;
++    if (changed) write_json(key, meta);
++}
++
++void HdTextureDump::write_json(std::uint64_t key, const Meta &meta) {
++    const TextureState &s = meta.state;
++    std::ostringstream out;
++    out << "{\n";
++    out << "  \"key\": \"" << hex_key(key) << "\",\n";
++    if (meta.image_key != 0u) out << "  \"image_key\": \"" << hex_key(meta.image_key) << "\",\n";
++    out << "  \"width\": " << s.width << ",\n  \"height\": " << s.height << ",\n";
++    out << "  \"buffer_width\": " << s.buffer_width << ",\n";
++    out << "  \"format\": \"" << format_name(s.format) << "\",\n";
++    out << "  \"swizzled\": " << (s.swizzled ? "true" : "false") << ",\n";
++    out << "  \"clut_format\": " << (s.format >= TextureFormat::Clut4 && s.format <= TextureFormat::Clut32
++                                         ? std::string("\"") + clut_format_name(s.clut_format) + "\""
++                                         : std::string("null")) << ",\n";
++    out << "  \"clut_shift\": " << s.clut_shift << ", \"clut_mask\": " << s.clut_mask << ", \"clut_start\": " << s.clut_offset << ",\n";
++    out << "  \"alpha\": {\"zero\": " << meta.zero << ", \"opaque\": " << meta.opaque << ", \"partial\": " << meta.partial
++        << ", \"cutout\": " << ((meta.partial < 0.001 && meta.zero > 0.0005) ? "true" : "false") << "},\n";
++    out << "  \"first_draw\": \"" << meta.first_draw << "\",\n";
++    out << "  \"used_through\": " << (meta.used_through ? "true" : "false")
++        << ", \"used_3d\": " << (meta.used_3d ? "true" : "false") << ",\n";
++    out << "  \"alpha_test\": " << (meta.alpha_test ? "true" : "false") << ", \"blend\": " << (meta.blend ? "true" : "false") << ",\n";
++    out << "  \"wrap\": [";
++    bool first = true;
++    for (const std::uint32_t wrap : meta.wraps) {
++        out << (first ? "" : ", ") << "{\"s\": \"" << ((wrap & 0xFFu) != 0u ? "clamp" : "repeat") << "\", \"t\": \""
++            << (((wrap >> 8u) & 0xFFu) != 0u ? "clamp" : "repeat") << "\", \"through\": " << (((wrap >> 16u) & 1u) != 0u ? "true" : "false") << "}";
++        first = false;
++    }
++    out << "],\n  \"filter\": [";
++    first = true;
++    for (const std::uint32_t filter : meta.filters) {
++        out << (first ? "" : ", ") << "{\"min\": " << (filter & 0xFFu) << ", \"mag\": " << ((filter >> 8u) & 0xFFu)
++            << ", \"through\": " << (((filter >> 16u) & 1u) != 0u ? "true" : "false") << "}";
++        first = false;
++    }
++    out << "],\n  \"texture_function\": [";
++    first = true;
++    for (const std::uint32_t function : meta.functions) {
++        out << (first ? "" : ", ") << "{\"tfx\": " << (function & 0xFFu) << ", \"tcc\": " << (((function >> 8u) & 1u) != 0u ? 1 : 0) << "}";
++        first = false;
++    }
++    out << "]\n}\n";
++    std::ofstream file(directory_ / (hex_key(key) + ".json"));
++    file << out.str();
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+new file mode 100644
+index 0000000..667d17c
+--- /dev/null
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -0,0 +1,208 @@
++#pragma once
++
++#include "ge_state.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++// HD texture packs for a renderer that replaces whole textures by key
++// (docs/ARCHITECTURE.md section 7): texpack_2x.bin / texpack_4x.bin, a sorted
++// index of replacement keys (texture_key.hpp) and one blob per texture holding
++// its mip chain, DXT1, DXT5 or RGBA8.
++//
++// Nothing here touches a graphics API. The GL side, which uploads a blob, is
++// gl/gl_hd_textures.hpp. The pack is read from one file; only the keys of the
++// index stay in RAM (8 bytes per texture), a record and its blob are read
++// the first time a texture is seen.
++//
++//   file (little endian):
++//     "IFTP"  u32 version=1  u32 count  u32 scale
++//     count x { u64 key  u64 offset  u32 size  u16 width  u16 height
++//               u8 format (0 RGBA8, 1 DXT1, 2 DXT5)  u8 mip_count  u16 reserved }   sorted by key
++//     blobs: offset is absolute in the file, size bytes, the mip chain largest first, each level
++//            tightly packed: RGBA8 w*h*4 bytes, DXT max(1,(w+3)/4)*max(1,(h+3)/4) blocks of 8 or 16 bytes.
++//
++//   reserved = flags. Bit 0 (kHdFlagRecolour) marks a recolour record: its key is the image key
++//   (texture_image_key, the texels without the palette) and its blob is
++//        u16 palette_entries (16 or 256)  u16 encoding (0 raw, 1 PackBits)  u32 encoded_bytes
++//        palette_entries x RGBA8        the palette the picture was upscaled with
++//        encoded index map              width*height bytes: the palette index each upscaled pixel belongs to
++//        level 0 of the colour picture  in the record's format (mip_count is 1)
++//   The renderer rebuilds the picture for the palette the game uses now: pixel + new[index] - old[index].
++namespace portablekit::gpu {
++
++enum class HdMode : std::uint8_t { Off = 0, X2 = 2, X4 = 4 };
++
++enum class HdFormat : std::uint8_t { Rgba8 = 0, Dxt1 = 1, Dxt5 = 2 };
++
++constexpr std::uint16_t kHdFlagRecolour = 1u;
++
++struct HdRecord {
++    std::uint64_t key{};
++    std::uint64_t offset{};
++    std::uint32_t size{};
++    std::uint16_t width{};
++    std::uint16_t height{};
++    HdFormat format{HdFormat::Rgba8};
++    std::uint8_t mip_count{};
++    std::uint16_t flags{};
++};
++
++// Bytes of one mip level of the given size and format.
++[[nodiscard]] std::uint32_t hd_level_bytes(HdFormat format, std::uint32_t width, std::uint32_t height);
++// Bytes of a whole chain of `levels` levels starting at width x height (each level half the one before, at least 1).
++[[nodiscard]] std::uint32_t hd_chain_bytes(HdFormat format, std::uint32_t width, std::uint32_t height,
++                                           std::uint32_t levels);
++
++class HdPackFile {
++public:
++    HdPackFile() = default;
++    ~HdPackFile();
++    HdPackFile(const HdPackFile &) = delete;
++    HdPackFile &operator=(const HdPackFile &) = delete;
++
++    bool open(const std::filesystem::path &path, std::string &error);
++    void close();
++    [[nodiscard]] bool is_open() const noexcept { return file_ != nullptr; }
++    [[nodiscard]] std::uint32_t scale() const noexcept { return scale_; }
++    [[nodiscard]] std::uint32_t count() const noexcept { return static_cast<std::uint32_t>(keys_.size()); }
++    // Bytes the index occupies in RAM.
++    [[nodiscard]] std::size_t index_ram_bytes() const noexcept { return keys_.capacity() * sizeof(std::uint64_t); }
++    [[nodiscard]] std::uint64_t file_bytes() const noexcept { return file_size_; }
++    // Whether the pack has recolour records (looked up by image key after a miss of the full key).
++    [[nodiscard]] std::uint32_t recolour_count() const noexcept { return recolour_records_; }
++    // Binary search over the keys in RAM; on a hit the record is read from the file.
++    [[nodiscard]] bool find(std::uint64_t key, HdRecord &record);
++    // The blob of a record.
++    bool read_blob(const HdRecord &record, std::vector<std::uint8_t> &out);
++    [[nodiscard]] std::uint64_t bytes_read() const noexcept { return bytes_read_; }
++
++private:
++    std::FILE *file_{};
++    std::uint32_t scale_{};
++    std::uint64_t index_offset_{};
++    std::uint64_t file_size_{};
++    std::uint64_t bytes_read_{};
++    std::uint32_t recolour_records_{};
++    std::vector<std::uint64_t> keys_;
++};
++
++// ---- recolour records -------------------------------------------------------------------------
++
++struct HdRecolour {
++    std::uint32_t palette_entries{};
++    std::vector<std::uint32_t> base_palette;  // the palette of the stored picture, RGBA bytes (red in the low byte)
++    std::vector<std::uint8_t> index_map;      // record.width * record.height palette indices
++    std::size_t base_offset{};                // offset of the colour picture (level 0) in the blob
++};
++
++// Parses a recolour blob; false when it is malformed.
++[[nodiscard]] bool hd_parse_recolour(const HdRecord &record, const std::vector<std::uint8_t> &blob, HdRecolour &out);
++// out = clamp(base + new_palette[index] - base_palette[index]) per channel, for width*height pixels.
++// `new_palette` has at least palette_entries colours.
++void hd_apply_recolour(const HdRecolour &recolour, const std::uint32_t *base_rgba, const std::uint32_t *new_palette,
++                       std::uint32_t *out_rgba);
++// PackBits decoder used by the index map (false when the data does not decode to exactly out_size bytes).
++[[nodiscard]] bool hd_unpackbits(const std::uint8_t *in, std::size_t in_size, std::uint8_t *out, std::size_t out_size);
++
++// ---- settings ---------------------------------------------------------------------------------
++
++// Everything the HD texture code takes from outside, from one place.
++struct HdConfig {
++    HdMode mode{HdMode::Off};
++    std::filesystem::path data_root;   // where texpack_<n>x.bin lives
++    std::uint64_t budget_bytes{64ull * 1024ull * 1024ull};  // GPU memory the replacements may use
++    std::filesystem::path dump_dir;    // INFECTED_TEX_DUMP: write every distinct texture seen, empty for none
++    bool dump_raw{};                   // also write <key>.raw (state, texel bytes, palette) for the pack tools
++    bool log{true};
++};
++
++// THE place gfx.hd_textures is read from. Until host/settings/port_settings.hpp lands this looks at
++// <PREFIX>_HD_TEXTURES (off|2x|4x) and then at settings.txt in the data root; replace the body by a
++// lookup in the port settings header. `auto_best` is what the setting's default means: the largest
++// pack present in the data root.
++[[nodiscard]] HdMode hd_textures_setting(const std::filesystem::path &data_root);
++// The port data root ($<PREFIX>_DATA_DIR).
++[[nodiscard]] std::filesystem::path hd_data_root();
++// Mode, data root, budget (<PREFIX>_HD_BUDGET_MB), dump directory (<PREFIX>_TEX_DUMP) from the environment and settings.txt.
++[[nodiscard]] HdConfig hd_config_from_environment();
++[[nodiscard]] const char *hd_mode_name(HdMode mode);
++[[nodiscard]] bool hd_parse_mode(const std::string &text, HdMode &mode);
++
++// ---- counters ---------------------------------------------------------------------------------
++
++struct HdStats {
++    std::uint64_t keyed{};             // textures a key was computed for (once per texture upload)
++    std::uint64_t key_failed{};        // textures that could not be keyed
++    std::uint64_t hits{};              // keys found in the pack and uploaded
++    std::uint64_t misses{};            // keys not in the pack (the original is used)
++    std::uint64_t skipped_budget{};    // hits not replaced because the budget was spent
++    std::uint64_t upload_failed{};     // blobs that could not be read or uploaded
++    std::uint64_t key_ns{};            // time computing keys
++    std::uint64_t lookup_ns{};         // time searching the index and reading records
++    std::uint64_t upload_ns{};         // time reading blobs and uploading them
++    std::uint64_t blob_bytes{};        // bytes read from the pack
++    std::uint64_t resident_textures{}; // replaced textures on the GPU now
++    std::uint64_t resident_bytes{};    // their GPU bytes
++    std::uint64_t peak_bytes{};
++    std::uint64_t flushes{};           // times the mode changed and everything was reloaded
++    std::uint64_t not_replaceable{};   // render-target copies (8888): skipped without a key
++    std::uint64_t recolour_hits{};     // textures rebuilt from a recolour record (image key found, palette differs)
++    std::uint64_t recolour_refused{};  // recolours not done because the texture's palette kept changing
++    std::uint64_t recolour_ns{};       // time rebuilding recoloured pictures (decode, palette transfer, mips)
++};
++
++// ---- the texture dump --------------------------------------------------------------------------
++
++// What is known about a draw that uses a texture, for the dump's metadata.
++struct HdDrawInfo {
++    bool through{};
++    std::uint32_t wrap_s{}, wrap_t{};
++    std::uint32_t min_filter{}, mag_filter{};
++    std::uint32_t function{};
++    bool alpha_from_texture{};
++    bool alpha_test{};
++    bool blend{};
++};
++
++// INFECTED_TEX_DUMP=<dir>: every distinct texture (by replacement key) as <key>.png (the renderer's own
++// RGBA decode) and <key>.json (sizes, formats, palette mapping, alpha statistics, how it was drawn),
++// and with raw on <key>.raw. It is a development tool and the way to harvest textures from live play.
++class HdTextureDump {
++public:
++    void open(const std::filesystem::path &directory, bool raw);
++    [[nodiscard]] bool active() const noexcept { return active_; }
++    [[nodiscard]] bool known(std::uint64_t key) const { return seen_.count(key) != 0u; }
++    // The texture the renderer decoded (RGBA, red in the low byte), keyed. Writes the files the first time.
++    void texture(std::uint64_t key, const TextureState &state, const std::uint8_t *texels, std::size_t texel_bytes,
++                 const std::uint8_t *clut, std::size_t clut_bytes, const std::vector<std::uint32_t> &rgba);
++    // A draw that uses the texture; rewrites the JSON when it adds something new.
++    void draw(std::uint64_t key, const HdDrawInfo &info);
++    [[nodiscard]] std::size_t distinct() const noexcept { return seen_.size(); }
++
++private:
++    struct Meta {
++        TextureState state;
++        std::uint64_t image_key{};
++        double zero{}, opaque{}, partial{};
++        bool used_through{}, used_3d{};
++        std::string first_draw;  // "through", "3d" or "" until drawn
++        std::unordered_set<std::uint32_t> wraps;  // wrap_s | wrap_t << 8 | draw kind << 16
++        bool alpha_test{}, blend{};
++        std::unordered_set<std::uint32_t> filters;
++        std::unordered_set<std::uint32_t> functions;
++    };
++    void write_json(std::uint64_t key, const Meta &meta);
++    bool active_{};
++    bool raw_{};
++    std::filesystem::path directory_;
++    std::unordered_set<std::uint64_t> seen_;
++    std::unordered_map<std::uint64_t, Meta> meta_;
++};
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/texture_key.cpp b/host/gpu/texture_key.cpp
+new file mode 100644
+index 0000000..c9ddc75
+--- /dev/null
++++ b/host/gpu/texture_key.cpp
+@@ -0,0 +1,164 @@
++#include "texture_key.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <vector>
++
++#define XXH_INLINE_ALL
++#include "xxhash/xxhash.h"
++
++namespace portablekit::gpu {
++namespace {
++
++std::uint32_t bits_per_texel(TextureFormat format) {
++    switch (format) {
++    case TextureFormat::Clut4: return 4u;
++    case TextureFormat::Clut8: return 8u;
++    case TextureFormat::Rgba5650:
++    case TextureFormat::Rgba5551:
++    case TextureFormat::Rgba4444:
++    case TextureFormat::Clut16: return 16u;
++    case TextureFormat::Rgba8888:
++    case TextureFormat::Clut32: return 32u;
++    default: return 0u;
++    }
++}
++
++// How many index values the format produces (the palette is read once for each).
++std::uint32_t index_count(TextureFormat format) {
++    switch (format) {
++    case TextureFormat::Clut4: return 16u;
++    case TextureFormat::Clut8: return 256u;
++    default: return 65536u;  // CLUT16 and CLUT32: every value the GE's 8-bit mask can tell apart, generously
++    }
++}
++
++std::uint32_t clut_entry_bytes(const TextureState &texture) { return texture.clut_format == 3u ? 4u : 2u; }
++
++// The palette entry an index value reads (what texture_decode's read_clut computes).
++std::uint32_t clut_entry(const TextureState &texture, std::uint32_t index) {
++    return ((index >> std::min(texture.clut_shift, 31u)) & texture.clut_mask) | (texture.clut_offset << 4u);
++}
++
++void put16(std::uint8_t *at, std::uint32_t value) {
++    at[0] = static_cast<std::uint8_t>(value);
++    at[1] = static_cast<std::uint8_t>(value >> 8u);
++}
++
++} // namespace
++
++bool texture_is_indexed(TextureFormat format) {
++    return format == TextureFormat::Clut4 || format == TextureFormat::Clut8 || format == TextureFormat::Clut16 ||
++           format == TextureFormat::Clut32;
++}
++
++std::uint32_t texture_stored_bytes(const TextureState &texture) {
++    const std::uint32_t width = texture.width, height = texture.height;
++    if (width == 0u || height == 0u || width > 1024u || height > 1024u) return 0u;
++    switch (texture.format) {
++    case TextureFormat::Dxt1: return ((width + 3u) / 4u) * ((height + 3u) / 4u) * 8u;
++    case TextureFormat::Dxt3:
++    case TextureFormat::Dxt5: return ((width + 3u) / 4u) * ((height + 3u) / 4u) * 16u;
++    default: break;
++    }
++    const std::uint32_t bits = bits_per_texel(texture.format);
++    if (bits == 0u) return 0u;
++    const std::uint32_t stride = texture.buffer_width != 0u ? texture.buffer_width : width;
++    return stride * bits / 8u * height;
++}
++
++std::uint32_t texture_clut_bytes_needed(const TextureState &texture) {
++    if (!texture_is_indexed(texture.format)) return 0u;
++    std::uint32_t highest = 0u;
++    const std::uint32_t count = index_count(texture.format);
++    for (std::uint32_t index = 0; index < count; ++index) highest = std::max(highest, clut_entry(texture, index));
++    return std::min(highest + 1u, 512u) * clut_entry_bytes(texture);
++}
++
++std::uint64_t texture_replacement_key(const TextureState &texture, const std::uint8_t *texels,
++                                      const std::uint8_t *clut, std::size_t clut_bytes) {
++    const std::uint32_t stored = texture_stored_bytes(texture);
++    if (stored == 0u || texels == nullptr) return 0u;
++    const bool indexed = texture_is_indexed(texture.format);
++
++    std::array<std::uint8_t, 16> header{};
++    header[0] = 'I';
++    header[1] = 'F';
++    header[2] = 'K';
++    header[3] = static_cast<std::uint8_t>(kTextureKeyVersion);
++    header[4] = static_cast<std::uint8_t>(texture.format);
++    header[5] = indexed ? static_cast<std::uint8_t>(texture.clut_format) : 0xFFu;
++    header[6] = texture.swizzled ? 1u : 0u;
++    put16(&header[8], texture.width);
++    put16(&header[10], texture.height);
++    put16(&header[12], texture.buffer_width != 0u && texture.buffer_width != texture.width ? texture.buffer_width : 0u);
++
++    std::uint64_t key = XXH3_64bits_withSeed(header.data(), header.size(), 0u);
++    key = XXH3_64bits_withSeed(texels, stored, key);
++
++    if (indexed) {
++        const std::uint32_t entry_bytes = clut_entry_bytes(texture);
++        const std::uint32_t count = index_count(texture.format);
++        if (clut == nullptr || clut_bytes < texture_clut_bytes_needed(texture)) return 0u;
++        // The palette in index order. The common sizes stay on the stack.
++        std::array<std::uint8_t, 256u * 4u> small;
++        std::vector<std::uint8_t> large;
++        std::uint8_t *out = small.data();
++        if (count > 256u) {
++            large.resize(static_cast<std::size_t>(count) * entry_bytes);
++            out = large.data();
++        }
++        if (entry_bytes == 2u) {
++            for (std::uint32_t index = 0; index < count; ++index)
++                std::memcpy(out + index * 2u, clut + clut_entry(texture, index) * 2u, 2u);
++        } else {
++            for (std::uint32_t index = 0; index < count; ++index)
++                std::memcpy(out + index * 4u, clut + clut_entry(texture, index) * 4u, 4u);
++        }
++        key = XXH3_64bits_withSeed(out, static_cast<std::size_t>(count) * entry_bytes, key);
++    }
++    return key != 0u ? key : 1u;
++}
++
++std::uint64_t texture_image_key(const TextureState &texture, const std::uint8_t *texels) {
++    const std::uint32_t stored = texture_stored_bytes(texture);
++    if (stored == 0u || texels == nullptr || !texture_is_indexed(texture.format)) return 0u;
++    std::array<std::uint8_t, 16> header{};
++    header[0] = 'I';
++    header[1] = 'F';
++    header[2] = 'I';
++    header[3] = static_cast<std::uint8_t>(kTextureKeyVersion);
++    header[4] = static_cast<std::uint8_t>(texture.format);
++    header[5] = 0xFFu;
++    header[6] = texture.swizzled ? 1u : 0u;
++    put16(&header[8], texture.width);
++    put16(&header[10], texture.height);
++    put16(&header[12], texture.buffer_width != 0u && texture.buffer_width != texture.width ? texture.buffer_width : 0u);
++    std::uint64_t key = XXH3_64bits_withSeed(header.data(), header.size(), 0u);
++    key = XXH3_64bits_withSeed(texels, stored, key);
++    return key != 0u ? key : 1u;
++}
++
++std::uint64_t texture_image_key(const GuestMemory &memory, const TextureState &texture) {
++    const std::uint32_t stored = texture_stored_bytes(texture);
++    if (stored == 0u || !texture_is_indexed(texture.format)) return 0u;
++    return texture_image_key(texture, memory.raw_pointer(texture.address, stored));
++}
++
++std::uint64_t texture_replacement_key(const GuestMemory &memory, const TextureState &texture) {
++    const std::uint32_t stored = texture_stored_bytes(texture);
++    if (stored == 0u) return 0u;
++    const std::uint8_t *texels = memory.raw_pointer(texture.address, stored);
++    if (texels == nullptr) return 0u;
++    const std::uint8_t *clut = nullptr;
++    std::size_t clut_bytes = 0u;
++    if (texture_is_indexed(texture.format)) {
++        clut_bytes = texture_clut_bytes_needed(texture);
++        clut = memory.raw_pointer(texture.clut_address, clut_bytes);
++        if (clut == nullptr) return 0u;
++    }
++    return texture_replacement_key(texture, texels, clut, clut_bytes);
++}
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/texture_key.hpp b/host/gpu/texture_key.hpp
+new file mode 100644
+index 0000000..73af0c1
+--- /dev/null
++++ b/host/gpu/texture_key.hpp
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include "ge_state.hpp"
++
++#include <cstddef>
++#include <cstdint>
++
++// The replacement key: the identity under which a texture pack stores the
++// replacement of one texture image (docs/ARCHITECTURE.md section 7).
++//
++// It is a 64-bit hash of what the GE would sample, and of nothing else:
++//
++//   * the texel bytes as the GE addresses them: the stored layout (swizzled or
++//     linear) of buffer_width x height texels, or the blocks of a block format;
++//   * the palette as the texture sees it, for the indexed formats: for every
++//     index value the format can produce (16 for CLUT4, 256 for CLUT8), in
++//     index order, the stored bytes of the entry ((index >> shift) & mask) |
++//     start << 4. So a palette is identified by its contents and by how the
++//     draw maps indices onto it, not by where in CLUT memory it was loaded, and
++//     two palettes of one image give two keys;
++//   * the pixel format, the CLUT entry format, the width, the height, the
++//     buffer width when it differs from the width, and the swizzle flag.
++//
++// The address of the texture or of the palette, the texture function, the
++// filtering and wrap modes, and the host (byte order, SIMD, GL) do not enter.
++// The hash is XXH3-64 (platform independent by its specification), chained over
++// a small header, the texel bytes and the palette bytes.
++//
++// The renderer computes it once per texture cache entry, when the texture is
++// first uploaded or found changed, never per draw. The pack tools call the same
++// function (the raw-pointer form) on the rasters they extract from the disc.
++namespace portablekit::gpu {
++
++constexpr std::uint32_t kTextureKeyVersion = 1u;
++
++// How many bytes of texel data the GE reads for this texture (its stored size),
++// 0 for a texture the key cannot describe (zero or oversized dimensions).
++[[nodiscard]] std::uint32_t texture_stored_bytes(const TextureState &texture);
++
++// True for the formats that read a palette.
++[[nodiscard]] bool texture_is_indexed(TextureFormat format);
++
++// Bytes of palette memory, counted from the palette's first entry, that must be
++// readable to key this texture (0 for a direct-colour or block texture).
++[[nodiscard]] std::uint32_t texture_clut_bytes_needed(const TextureState &texture);
++
++// The key from the bytes. `texels` points at texture_stored_bytes(texture) bytes,
++// `clut` at the palette's entry 0 with `clut_bytes` readable (at least
++// texture_clut_bytes_needed). Returns 0 when the texture cannot be keyed.
++[[nodiscard]] std::uint64_t texture_replacement_key(const TextureState &texture, const std::uint8_t *texels,
++                                                     const std::uint8_t *clut, std::size_t clut_bytes);
++
++// The same from guest memory (0 when the texels or the palette are not readable).
++[[nodiscard]] std::uint64_t texture_replacement_key(const GuestMemory &memory, const TextureState &texture);
++
++// The image key of an indexed texture: the same hash without the palette (texel bytes, pixel format, width,
++// height, buffer width, swizzle). A game that recolours a texture by rewriting its palette at run time (the
++// characters' clothes, hair and skin) draws one image with palettes no disc stream contains, so the full key
++// misses; the pack stores such images under their image key and the renderer recolours the replacement with the
++// palette it finds (docs/ARCHITECTURE.md section 7, recolour records). 0 for a texture that is not indexed.
++[[nodiscard]] std::uint64_t texture_image_key(const TextureState &texture, const std::uint8_t *texels);
++[[nodiscard]] std::uint64_t texture_image_key(const GuestMemory &memory, const TextureState &texture);
++
++} // namespace portablekit::gpu
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index b638784..98fdc4e 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -30,6 +30,13 @@
+ //     --menu PAGE         draw the settings overlay (page 1 or 2) over each picture
+ //     --shader-lint       no dump: compile and link every shader variant the renderer can use, and check the sources against
+ //                         the rules of vitaGL's shader translator (reserved names, the 10-varying limit)
++//     --hd off|2x|4x      HD texture pack mode (gfx.hd_textures); default off in the replayer unless
++//                         INFECTED_HD_TEXTURES is set
++//     --pack-dir DIR      where texpack_2x.bin / texpack_4x.bin are (default $INFECTED_DATA_DIR)
++//     --hd-budget-mb N    GPU memory the replacements may use
++//     --hd-switch LIST    FLIP=MODE,FLIP=MODE: switch the mode before replaying that flip (run-time switching)
++//     --tex-dump DIR      write every distinct texture seen as <key>.png/.json (INFECTED_TEX_DUMP)
++//     --tex-dump-raw      with --tex-dump: also <key>.raw (texel bytes, palette) for the pack tools
+ #include "gpu/ge_dump.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "gpu/ge_worker.hpp"
+@@ -43,6 +50,7 @@
+ #include "gpu/gl/gl_shaders.hpp"
+ #include <regex>
+ #endif
++#include "gpu/hd_texture_pack.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -104,6 +112,12 @@ struct Options {
+     // recorded picture whose 512-row texture runs past the end of VRAM (the picture itself is 272 rows).
+     std::uint32_t clip_address{};
+     std::uint32_t clip_rows{};
++    std::string hd;
++    std::string pack_dir;
++    std::string hd_budget_mb;
++    std::string hd_switch;
++    std::string tex_dump;
++    bool tex_dump_raw{};
+ };
+ 
+ bool parse_flips(const std::string &text, std::vector<std::uint64_t> &out) {
+@@ -497,7 +511,13 @@ int main(int argc, char **argv) {
+             std::vector<std::uint64_t> list;
+             if (!parse_flips(value(), list)) return 2;
+             options.detail.insert(list.begin(), list.end());
+-        } else if (arg == "--null-draw") options.null_draw = true;
++        } else if (arg == "--hd") options.hd = value();
++        else if (arg == "--pack-dir") options.pack_dir = value();
++        else if (arg == "--hd-budget-mb") options.hd_budget_mb = value();
++        else if (arg == "--hd-switch") options.hd_switch = value();
++        else if (arg == "--tex-dump") options.tex_dump = value();
++        else if (arg == "--tex-dump-raw") options.tex_dump_raw = true;
++        else if (arg == "--null-draw") options.null_draw = true;
+         else if (arg == "--no-submit") options.no_submit = true;
+         else if (arg == "--threaded") options.threaded = true;
+         else if (arg == "--repeat") options.repeat = static_cast<std::uint32_t>(std::max(1, std::atoi(value().c_str())));
+@@ -568,6 +588,25 @@ int main(int argc, char **argv) {
+         return 1;
+     }
+ 
++    std::map<std::uint64_t, gpu::HdMode> hd_switches;
++    {
++        std::string text = options.hd_switch;
++        std::size_t at = 0;
++        while (at < text.size()) {
++            std::size_t end = text.find(',', at);
++            if (end == std::string::npos) end = text.size();
++            const std::string item = text.substr(at, end - at);
++            const std::size_t eq = item.find('=');
++            gpu::HdMode mode{};
++            if (eq == std::string::npos || !gpu::hd_parse_mode(item.substr(eq + 1), mode)) {
++                std::cerr << "--hd-switch wants FLIP=off|2x|4x,...\n";
++                return 2;
++            }
++            hd_switches[std::strtoull(item.c_str(), nullptr, 10)] = mode;
++            at = end + 1;
++        }
++    }
++
+     std::unique_ptr<gpu::Renderer> renderer;
+ #if defined(GE_REPLAY_HAS_GL)
+     gpu::GlRenderer *gl = nullptr;
+@@ -596,6 +635,22 @@ int main(int argc, char **argv) {
+             }
+         }
+         made->set_settings(settings);
++        {
++            gpu::HdConfig hd = gpu::hd_config_from_environment();
++            if (!options.pack_dir.empty()) hd.data_root = options.pack_dir;
++            if (!options.hd.empty()) {
++                if (!gpu::hd_parse_mode(options.hd, hd.mode)) {
++                    std::cerr << "--hd wants off, 2x or 4x\n";
++                    return 2;
++                }
++            } else if (std::getenv("INFECTED_HD_TEXTURES") == nullptr) {
++                hd.mode = gpu::HdMode::Off;  // a replay never reads settings.txt unless asked
++            }
++            if (!options.hd_budget_mb.empty()) hd.budget_bytes = std::strtoull(options.hd_budget_mb.c_str(), nullptr, 10) << 20u;
++            if (!options.tex_dump.empty()) hd.dump_dir = options.tex_dump;
++            if (options.tex_dump_raw) hd.dump_raw = true;
++            made->configure_hd_textures(hd);
++        }
+         gl = made.get();
+         renderer = std::move(made);
+ #else
+@@ -633,6 +688,7 @@ int main(int argc, char **argv) {
+     std::map<std::uint64_t, std::uint64_t> register_values;
+     std::map<std::uint32_t, std::uint64_t> mask_draws;
+     double total_walk_ms = 0, total_flip_ms = 0, total_submit_ms = 0, total_present_ms = 0;
++    std::uint64_t working_sum = 0, working_max = 0, working_max_flip = 0, working_flips = 0;
+     std::uint64_t replayed = 0;
+     std::uint64_t transfers = 0;
+     std::uint64_t picture_uploads = 0, memory_flips = 0;  // movie frames: CPU-written pictures and flips shown from main memory
+@@ -647,6 +703,15 @@ int main(int argc, char **argv) {
+     const auto replay = [&]() -> int {
+     for (std::uint32_t pass = 0; pass < options.repeat; ++pass) {
+         for (const std::uint64_t flip : flips) {
++#if defined(GE_REPLAY_HAS_GL)
++            if (gl != nullptr) {
++                const auto found = hd_switches.find(flip);
++                if (found != hd_switches.end()) {
++                    gl->flush();
++                    gl->set_hd_mode(found->second);
++                }
++            }
++#endif
+             gpu::gedump::FlipDump dump;
+             if (!gpu::gedump::load_flip(options.dump, flip, dump, error)) {
+                 std::cerr << error << "\n";
+@@ -796,6 +861,12 @@ int main(int argc, char **argv) {
+                         gpu::write_png_rgba(path, rgba.data(), w, h);
+                     }
+                 }
++                if (pass + 1 == options.repeat) {
++                    const std::uint64_t used = gl->texture_bytes_used_last_frame();
++                    working_sum += used;
++                    ++working_flips;
++                    if (used > working_max) working_max = used, working_max_flip = flip;
++                }
+                 if (options.stats && pass + 1 == options.repeat) {
+                     const gpu::GlStats &s = gl->frame_stats();
+                     const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+@@ -910,6 +981,11 @@ int main(int argc, char **argv) {
+                 std::printf("    %-26s %10llu  [%.1f]\n", names[i], n(t.merge_breaks[i]),
+                             static_cast<double>(t.merge_breaks[i]) / flips_n);
+         }
++        std::printf("  texture working set per flip (GPU bytes of the textures drawn in one flip): max %.2f MiB at flip %llu, mean %.2f MiB over %llu flips\n",
++                    static_cast<double>(working_max) / 1048576.0, n(working_max_flip),
++                    working_flips != 0 ? static_cast<double>(working_sum) / static_cast<double>(working_flips) / 1048576.0 : 0.0,
++                    n(working_flips));
++        std::printf("  %s\n", gl->hd_summary().c_str());
+         std::printf("  shader variants %zu, shader compile+link %.1f ms, %zu cached textures (%llu KiB)\n",
+                     gl->shader_variants(), static_cast<double>(t.shader_compile_us) / 1000.0, gl->cached_textures(),
+                     n(gl->cached_texture_bytes() / 1024u));
+diff --git a/tools/texkey/texkey.cpp b/tools/texkey/texkey.cpp
+new file mode 100644
+index 0000000..0e667a7
+--- /dev/null
++++ b/tools/texkey/texkey.cpp
+@@ -0,0 +1,134 @@
++// texkey: the replacement key and the decoded picture of PSP-native rasters, computed by the same
++// functions the renderer uses (host/gpu/texture_key.cpp, host/gpu/texture_decode.cpp), for the offline
++// texture pack tools (tools/texpack in the port repository).
++//
++//   texkey batch IN.raw [OUT_DIR] [--png] [--rgba]
++//       IN.raw is a concatenation of records in the format of the renderer's texture dump (<key>.raw):
++//         "IFRW" u32 version=1 | u8 format u8 clut_format u8 swizzled u8 0 | u16 width u16 height u16 buffer_width
++//         u16 clut_shift u16 clut_mask u16 clut_start | u32 texel_bytes u32 clut_bytes | texels | palette bytes
++//       One line per record on stdout:  <index> <key hex> <width> <height> <format> <zero%> <opaque%> <partial%> <decoded hash> <image key (palette excluded; 0 when not indexed)>
++//       --png writes OUT_DIR/<key>.png once per distinct key (the renderer's RGBA decode of the raster);
++//       --rgba writes OUT_DIR/<key>.rgba (width*height*4 raw bytes) instead of or as well.
++//   texkey key FILE.raw      prints the key of one record.
++#include "gpu/ge_state.hpp"
++#include "gpu/texture_decode.hpp"
++#include "gpu/texture_key.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++#define STB_IMAGE_WRITE_STATIC
++#define STB_IMAGE_WRITE_IMPLEMENTATION
++#include "stb_image_write.h"
++
++namespace {
++
++using namespace portablekit::gpu;
++
++std::uint32_t rd32(const std::uint8_t *at) {
++    return at[0] | at[1] << 8u | at[2] << 16u | static_cast<std::uint32_t>(at[3]) << 24u;
++}
++std::uint32_t rd16(const std::uint8_t *at) { return at[0] | at[1] << 8u; }
++
++constexpr std::uint32_t kTexelAddress = 0x08A00000u;
++constexpr std::uint32_t kClutAddress = 0x08C00000u;
++
++} // namespace
++
++int main(int argc, char **argv) {
++    if (argc < 3) {
++        std::cerr << "usage: texkey batch IN.raw [OUT_DIR] [--png] [--rgba] | texkey key FILE.raw\n";
++        return 2;
++    }
++    const std::string command = argv[1];
++    std::string input = argv[2], out_dir;
++    bool png = false, rgba_out = false;
++    for (int i = 3; i < argc; ++i) {
++        const std::string arg = argv[i];
++        if (arg == "--png") png = true;
++        else if (arg == "--rgba") rgba_out = true;
++        else out_dir = arg;
++    }
++    std::ifstream file(input, std::ios::binary);
++    if (!file) {
++        std::cerr << "cannot open " << input << "\n";
++        return 1;
++    }
++    std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (!out_dir.empty()) std::filesystem::create_directories(out_dir);
++
++    portablekit::gpu::GuestMemory memory(32u * 1024u * 1024u);
++    std::unordered_set<std::uint64_t> written;
++    std::vector<std::uint32_t> rgba;
++    std::size_t at = 0, index = 0;
++    while (at + 40u <= data.size()) {
++        const std::uint8_t *r = data.data() + at;
++        if (std::memcmp(r, "IFRW", 4) != 0 || rd32(r + 4) != 1u) {
++            std::cerr << "bad record at byte " << at << "\n";
++            return 1;
++        }
++        TextureState state;
++        state.enabled = true;
++        state.format = static_cast<TextureFormat>(r[8]);
++        state.clut_format = r[9];
++        state.swizzled = r[10] != 0u;
++        state.width = static_cast<std::uint16_t>(rd16(r + 12));
++        state.height = static_cast<std::uint16_t>(rd16(r + 14));
++        state.buffer_width = rd16(r + 16);
++        state.clut_shift = rd16(r + 18);
++        state.clut_mask = rd16(r + 20);
++        state.clut_offset = rd16(r + 22);
++        const std::uint32_t texel_bytes = rd32(r + 24), clut_bytes = rd32(r + 28);
++        if (at + 32u + texel_bytes + clut_bytes > data.size()) {
++            std::cerr << "truncated record at byte " << at << "\n";
++            return 1;
++        }
++        state.address = kTexelAddress;
++        state.clut_address = kClutAddress;
++        memory.zero(kClutAddress, 2048u);
++        memory.copy_in(kTexelAddress, std::span<const std::uint8_t>(r + 32, texel_bytes));
++        if (clut_bytes != 0u) memory.copy_in(kClutAddress, std::span<const std::uint8_t>(r + 32 + texel_bytes, clut_bytes));
++        const std::uint64_t key = texture_replacement_key(memory, state);
++        double zero = 0, opaque = 0, partial = 0;
++        std::uint64_t picture_hash = 0;
++        if (key != 0u && decode_texture(memory, state, rgba)) {
++            std::size_t z = 0, o = 0;
++            for (const std::uint32_t texel : rgba) {
++                const std::uint32_t a = texel >> 24u;
++                if (a == 0u) ++z;
++                else if (a == 255u) ++o;
++                picture_hash = (picture_hash ^ texel) * 0x100000001B3ull;
++            }
++            const double n = rgba.empty() ? 1.0 : static_cast<double>(rgba.size());
++            zero = 100.0 * static_cast<double>(z) / n;
++            opaque = 100.0 * static_cast<double>(o) / n;
++            partial = 100.0 - zero - opaque;
++            if (!out_dir.empty() && written.insert(key).second) {
++                char name[40];
++                std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(key));
++                const std::string stem = (std::filesystem::path(out_dir) / name).string();
++                if (png) stbi_write_png((stem + ".png").c_str(), state.width, state.height, 4, rgba.data(), state.width * 4);
++                if (rgba_out) {
++                    std::ofstream out(stem + ".rgba", std::ios::binary);
++                    out.write(reinterpret_cast<const char *>(rgba.data()), static_cast<std::streamsize>(rgba.size() * 4u));
++                }
++            }
++        }
++        const std::uint64_t image_key = texture_image_key(memory, state);
++        std::printf("%zu %016llx %u %u %u %.3f %.3f %.3f %016llx %016llx\n", index, static_cast<unsigned long long>(key),
++                    state.width, state.height, static_cast<unsigned>(state.format), zero, opaque, partial,
++                    static_cast<unsigned long long>(picture_hash), static_cast<unsigned long long>(image_key));
++        at += 32u + texel_bytes + clut_bytes;
++        ++index;
++        if (command == "key") break;
++    }
++    return 0;
++}

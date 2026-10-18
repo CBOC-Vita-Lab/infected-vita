@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 13:37:36 +0000
+Subject: [PATCH] gl: compact_vertices, a batch without the vertex fields a
+ program never reads (off by default)
+
+A transformed draw's vertex shader reads the position's x, y and z, the texture coordinates and the colour, and the normal only when the
+draw is lit; it never reads the position's w (gl_shaders.cpp uses it only for a through draw's texture rectangle). With
+settings.compact_vertices (config.txt gl_compact_vertices, INFECTED_GL_COMPACT_VERTICES) such a draw is written to the batch as 36 bytes
+(lit) or 24 (unlit) in place of the decoder's 40. The batch is now bytes: the stride comes from the program's flags
+(vertex_stride_for), the vertex count is kept apart, and the attribute pointers are set again only when the stride changes between
+batches (vitaGL starts a new vertex layout whenever one changes; a mission frame has about 14 such changes in 410 batches). A
+through-mode draw keeps the whole vertex, its quads carry the texture rectangle in the normal and w. An attribute the program does not
+read points at bytes inside the vertex. The copies are done in whole words (assume_aligned): a byte-aligned copy cost 23 ARM
+instructions a vertex.
+
+Measured on the mission-1 replay (100 frames, x86-64 software GL, MMPX time budget off so that a replay is repeatable):
+ - pictures byte-identical with the switch off and on, with per-vertex and per-pixel lighting, and with --prepare --threaded;
+ - vertex and index bytes a frame 890 KB -> 759 KB (-14.7 %). Three quarters of a mission frame's vertices are lit, so this is 15 %,
+   not the third that an unlit-only layout would suggest;
+ - the GL thread's ARM instructions a frame (armprof, --prepare) 2.498 M -> 2.537 M (+1.6 %);
+ - framework tests 45 of 45; the desktop game builds.
+Not verified: anything on the console (whether fewer bytes written and fetched shows in the frame time; how vitaGL treats a
+three-component pointer for the vec4 position; the extra layout changes). The switch is off until it is.
+
+Also: the previous commit's message gives the vertex as 36 bytes and the frame as 0.88 MB; it is 40 bytes and 0.96 MB
+(20,480 x 40 + 68,550 x 2 = 956,300, the replay's own count).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index 0d899cd..fa4074b 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -115,6 +115,18 @@ to 3.0 million instructions a frame and the walk from 6.0 to 3.5 million. Every
+   scratch buffer objects at the batch (`vglBufferData`) and draws, with no staging copy. The buffer objects and the
+   attribute offsets stay bound from one batch to the next; blits, post passes and the overlay call `client_arrays()`
+   first. On desktop GL the same class keeps one heap buffer and draws from client arrays.
++* **Compact vertices** (`compact_vertices`, off by default). The decoder's `Vertex` is 40 bytes (position with a w, normal,
++  texture coordinates, colour). A transformed draw's shader never reads the w, and an unlit one never reads the normal, so
++  with the switch on such a draw is written to the batch as 36 bytes (lit) or 24 (unlit): the batch is bytes, and its stride
++  comes from its program's flags (`vertex_stride_for`; every draw of a batch has the same flags). A through-mode draw keeps
++  the whole vertex, as its quads carry the texture rectangle in the normal and w. The attribute pointers are set again only
++  when the stride changes from one batch to the next (vitaGL starts a new vertex layout when a pointer changes; a mission
++  frame has about 14 such changes in 410 batches), and an attribute the program does not read points at bytes inside the
++  vertex. Checked on the mission-1 replay (100 frames): the pictures are identical byte for byte with the switch off and on,
++  with per-vertex and per-pixel lighting and with the split renderer; vertex and index bytes a frame go from 890 KB to
++  759 KB (three quarters of the vertices are lit, which is why it is 15 % and not a third); the GL thread's share of ARM
++  instructions a frame goes from 2.498 M to 2.537 M (the copies are done in whole words). **Not measured on the console:**
++  whether fewer bytes written and fetched shows in the frame time.
+ * **The walker sends less**: lighting and material versions move only when a value changes (65 more merged draws a
+   frame), and the split renderer takes a draw's vertex and index storage instead of copying it
+   (`Renderer::submit_taking`).
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 0d223c3..f683ca5 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -92,6 +92,21 @@ static_assert(offsetof(Vertex, position) == 0u && offsetof(Vertex, normal) == 16
+                   offsetof(Vertex, texcoord) == 28u && offsetof(Vertex, color) == 36u,
+               "attribute offsets assume this vertex layout");
+ 
++// The compact layouts of settings.compact_vertices, for a transformed (not a through-mode) draw, whose vertex shader reads the
++// position's x, y and z, the texture coordinates and the colour, and the normal only when the draw is lit (it never reads
++// the position's w: gl_shaders.cpp uses it only for a through draw's texture rectangle). A lit vertex leaves out that w
++// (36 bytes in place of 40); an unlit one leaves out the normal as well (24). The normal, texture coordinates and colour
++// are adjacent in Vertex, so a vertex is two copies.
++constexpr std::uint32_t kUnlitStride = 24u;   // position (3 floats), texture coordinates (2), colour (4 bytes)
++constexpr std::uint32_t kLitStride = 36u;     // position (3 floats), normal (3), texture coordinates (2), colour (4 bytes)
++constexpr std::uint32_t kUnlitTexcoordOffset = 12u;
++constexpr std::uint32_t kLitNormalOffset = 12u;
++constexpr std::uint32_t kLitTexcoordOffset = 24u;
++static_assert(offsetof(Vertex, texcoord) == offsetof(Vertex, normal) + sizeof(Vertex::normal) &&
++                  offsetof(Vertex, color) == offsetof(Vertex, texcoord) + sizeof(Vertex::texcoord) &&
++                  sizeof(Vertex) == offsetof(Vertex, color) + sizeof(std::uint32_t),
++              "the compact vertices copy the normal, the texture coordinates and the colour in one piece");
++
+ Matrix multiply(const Matrix &a, const Matrix &b) {
+     Matrix result{};
+     for (std::uint32_t column = 0; column < 4u; ++column) {
+@@ -468,8 +483,12 @@ struct GlRenderer::Impl {
+     bool has_presented{};
+ 
+     // ---- the batch ---------------------------------------------------------------------------
+-    BatchBuffer<Vertex> batch_vertices{16384u, 2u};          // 640 KiB chunks; batches at multiples of 80 bytes
++    // The vertices are bytes: a batch is 40-byte Vertex records, or compact ones of 36 or 24 bytes (vertex_stride_for()), as its
++    // program reads them. batch_vertex_count counts them; the stride of the batch in flight is batch_stride.
++    BatchBuffer<std::uint8_t> batch_vertices{16384u * sizeof(Vertex), 16u};   // 640 KiB chunks; batches at multiples of 16 bytes
+     BatchBuffer<std::uint16_t> batch_indices{65536u, 8u};    // 128 KiB chunks; batches at multiples of 16 bytes
++    std::size_t batch_vertex_count{};
++    std::uint32_t batch_stride{sizeof(Vertex)};
+     DrawState batch_state{};
+     bool batch_open{};
+     std::vector<std::uint16_t> index_scratch;
+@@ -1622,7 +1641,7 @@ struct GlRenderer::Impl {
+         const Span timing_flush(*this, &GlTimes::flush_us);
+         batch_open = false;
+         if (batch_indices.empty()) {
+-            batch_vertices.clear();
++            clear_vertices();
+             return;
+         }
+         const DrawState &state = batch_state;
+@@ -1630,7 +1649,7 @@ struct GlRenderer::Impl {
+         Target *target = find_target(state.target);
+         if (program == nullptr || target == nullptr) {
+             ++st().skipped_draws;
+-            batch_vertices.clear();
++            clear_vertices();
+             batch_indices.clear();
+             return;
+         }
+@@ -1677,10 +1696,55 @@ struct GlRenderer::Impl {
+         }
+         upload_uniforms(*program, state);
+         draw_batch(state);
+-        batch_vertices.clear();
++        clear_vertices();
+         batch_indices.clear();
+     }
+ 
++    // The batch's vertices are done with (drawn, or dropped); the next batch starts after them.
++    void clear_vertices() {
++        batch_vertices.clear();
++        batch_vertex_count = 0u;
++    }
++
++    // The bytes a vertex takes in a batch whose program has these flags (see kUnlitStride): the decoder's 40 unless
++    // settings.compact_vertices and a transformed draw. A through draw keeps the whole vertex: its quads carry the texture
++    // rectangle in the normal and w.
++    [[nodiscard]] std::uint32_t vertex_stride_for(std::uint32_t flags) const {
++        if (!settings.compact_vertices || (flags & glsl::kThrough) != 0u) return static_cast<std::uint32_t>(sizeof(Vertex));
++        return (flags & glsl::kLight) != 0u ? kLitStride : kUnlitStride;
++    }
++
++    // Appends vertices to the batch in flight, in its layout.
++    void add_vertices(const Vertex *source, std::size_t n) {
++        if (n == 0u) return;
++        if (batch_stride == sizeof(Vertex)) {
++            batch_vertices.append(reinterpret_cast<const std::uint8_t *>(source), n * sizeof(Vertex));
++        } else {
++            // Every address here is a multiple of four (a batch starts 16-byte aligned, the strides are multiples of four, a
++            // Vertex is four-aligned), which the copies are told so that the compiler moves whole words with ldm/stm: a
++            // byte-aligned 12-byte copy was 23 instructions a vertex on the Vita's CPU, the 40-byte memcpy it replaces 19.
++            std::uint8_t *out = batch_vertices.extend(n * batch_stride);
++            const auto *in = reinterpret_cast<const std::uint8_t *>(source);
++            if (batch_stride == kLitStride) {
++                for (std::size_t i = 0; i < n; ++i, in += sizeof(Vertex), out += kLitStride) {
++                    std::uint8_t *to = static_cast<std::uint8_t *>(std::assume_aligned<4>(static_cast<void *>(out)));
++                    std::memcpy(to, std::assume_aligned<4>(in + offsetof(Vertex, position)), 3u * sizeof(float));
++                    std::memcpy(to + kLitNormalOffset, std::assume_aligned<4>(in + offsetof(Vertex, normal)),
++                                sizeof(Vertex) - offsetof(Vertex, normal));
++                }
++            } else {
++                for (std::size_t i = 0; i < n; ++i, in += sizeof(Vertex), out += kUnlitStride) {
++                    std::uint8_t *to = static_cast<std::uint8_t *>(std::assume_aligned<4>(static_cast<void *>(out)));
++                    std::memcpy(to, std::assume_aligned<4>(in + offsetof(Vertex, position)), 3u * sizeof(float));
++                    std::memcpy(to + kUnlitTexcoordOffset, std::assume_aligned<4>(in + offsetof(Vertex, texcoord)),
++                                sizeof(Vertex) - offsetof(Vertex, texcoord));
++                }
++            }
++        }
++        batch_vertex_count += n;
++    }
++    void add_vertex(const Vertex &vertex) { add_vertices(&vertex, 1u); }
++
+     void apply_depth(const DrawState &state) {
+         if (cache.depth_test != static_cast<int>(state.depth_test)) {
+             if (state.depth_test != 0u) glEnable(GL_DEPTH_TEST);
+@@ -1788,6 +1852,7 @@ struct GlRenderer::Impl {
+     // the next: a batch only points them at its own data (four GL calls a draw fewer, and vitaGL's vertex layout stays
+     // the same). Every other draw (blits, post passes, the overlay) draws from client arrays and calls client_arrays().
+     bool scratch_bound{false};
++    std::uint32_t scratch_stride{0};   // the vertex stride the bound scratch attributes were set for
+ 
+     void client_arrays() {
+         if (!scratch_bound) return;
+@@ -1802,14 +1867,26 @@ struct GlRenderer::Impl {
+         const bool scratch = batch_vertices.in_scratch() && batch_indices.in_scratch() && !settings.null_draw;
+         const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(batch_vertices.data());
+         const void *indices = batch_indices.data();
+-        const auto attributes = [](const std::uint8_t *at) {
++        const bool compact = batch_stride != sizeof(Vertex);
++        const auto attributes = [compact, stride = batch_stride](const std::uint8_t *at) {
+             const auto field = [at](std::size_t offset) -> const void * {
+                 return at != nullptr ? static_cast<const void *>(at + offset) : reinterpret_cast<const void *>(offset);
+             };
+-            glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, position)));
+-            glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, normal)));
+-            glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, texcoord)));
+-            glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), field(offsetof(Vertex, color)));
++            if (!compact) {
++                glVertexAttribPointer(0u, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, position)));
++                glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, normal)));
++                glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), field(offsetof(Vertex, texcoord)));
++                glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), field(offsetof(Vertex, color)));
++            } else {
++                // The position is three floats (the shader reads x, y and z). An unlit vertex has no normal, which its
++                // program does not read: the attribute points at bytes inside the vertex, so that nothing it could fetch
++                // is outside the batch.
++                const bool lit = stride == kLitStride;
++                glVertexAttribPointer(0u, 3, GL_FLOAT, GL_FALSE, stride, field(0u));
++                glVertexAttribPointer(1u, 3, GL_FLOAT, GL_FALSE, stride, field(lit ? kLitNormalOffset : kUnlitTexcoordOffset));
++                glVertexAttribPointer(2u, 2, GL_FLOAT, GL_FALSE, stride, field(lit ? kLitTexcoordOffset : kUnlitTexcoordOffset));
++                glVertexAttribPointer(3u, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, field(stride - sizeof(std::uint32_t)));
++            }
+         };
+         if (scratch) {
+             if (!scratch_bound) {
+@@ -1819,9 +1896,15 @@ struct GlRenderer::Impl {
+                 }
+                 glBindBuffer(GL_ARRAY_BUFFER, scratch_vbo);
+                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scratch_ibo);
+-                attributes(nullptr);  // offsets into the bound buffer
++                scratch_stride = 0u;
+                 scratch_bound = true;
+             }
++            // Offsets into the bound buffer, set again only when the batch's layout is not the one they were set for (vitaGL
++            // starts a new vertex layout whenever an attribute pointer changes).
++            if (scratch_stride != batch_stride) {
++                attributes(nullptr);
++                scratch_stride = batch_stride;
++            }
+             glp::buffer_use_mapped(GL_ARRAY_BUFFER, batch_vertices.data());
+             glp::buffer_use_mapped(GL_ELEMENT_ARRAY_BUFFER, batch_indices.data());
+             indices = nullptr;
+@@ -1835,8 +1918,12 @@ struct GlRenderer::Impl {
+                 glDrawElements(state.mode, static_cast<GLsizei>(batch_indices.size()), GL_UNSIGNED_SHORT, indices);
+             });
+         ++st().gl_draws;
+-        st().bytes_uploaded += batch_vertices.size() * sizeof(Vertex) + batch_indices.size() * sizeof(std::uint16_t);
+-        st().vertices_uploaded += batch_vertices.size();
++        st().bytes_uploaded += batch_vertices.size() + batch_indices.size() * sizeof(std::uint16_t);
++        st().vertices_uploaded += batch_vertex_count;
++        if (compact) {
++            st().vertices_compact += batch_vertex_count;
++            st().vertex_bytes_saved += batch_vertex_count * (sizeof(Vertex) - batch_stride);
++        }
+         st().indices_uploaded += batch_indices.size();
+         st().triangles += state.mode == GL_LINES ? batch_indices.size() / 2u : batch_indices.size() / 3u;
+         check("draw");
+@@ -1931,9 +2018,12 @@ struct GlRenderer::Impl {
+         vertex.position[3] = v_max;
+     }
+ 
++    // (A through draw's batch is always in the full layout.)
++    Vertex *batch_records() { return reinterpret_cast<Vertex *>(batch_vertices.data()); }
++
+     void clamp_through_quad(std::size_t first_vertex, const std::uint16_t *six, float texture_width,
+                             float texture_height) {
+-        Vertex *base = batch_vertices.data() + first_vertex;
++        Vertex *base = batch_records() + first_vertex;
+         float x0 = base[six[0]].position[0], x1 = x0, y0 = base[six[0]].position[1], y1 = y0;
+         for (int i = 0; i < 6; ++i) {
+             const Vertex &vertex = base[six[i]];
+@@ -1977,7 +2067,9 @@ struct GlRenderer::Impl {
+         const std::size_t count = call.indices.empty() ? vertex_total : call.indices.size();
+         const bool through = call.through;
+         index_scratch.clear();
+-        const std::size_t first_vertex = batch_vertices.size();
++        // The batch's layout comes from its program (batch_state is this draw's: every draw of a batch has the same flags).
++        batch_stride = vertex_stride_for(batch_state.program_flags);
++        const std::size_t first_vertex = batch_vertex_count;
+         const std::size_t first_index = batch_indices.size();
+         std::size_t added = 0u;
+         switch (call.primitive) {
+@@ -2005,7 +2097,7 @@ struct GlRenderer::Impl {
+                         batch_open = true;
+                         return append(call, use_material_color, rect_clamp, picture_rect);
+                     }
+-                    batch_vertices.append(call.vertices.data(), call.vertices.size());
++                    add_vertices(call.vertices.data(), call.vertices.size());
+                     std::uint16_t *out = batch_indices.extend(index_total);
+                     const auto base = static_cast<std::uint32_t>(first_vertex);
+                     const auto last = static_cast<std::uint32_t>(vertex_total - 1u);
+@@ -2086,7 +2178,7 @@ struct GlRenderer::Impl {
+                 batch_open = true;
+                 return append(call, use_material_color, rect_clamp, picture_rect);
+             }
+-            batch_vertices.append(source.data(), source.size());
++            add_vertices(source.data(), source.size());
+             const auto base = static_cast<std::uint16_t>(first_vertex);
+             for (const std::uint16_t index : index_scratch) batch_indices.push_back(static_cast<std::uint16_t>(base + index));
+             break;
+@@ -2118,11 +2210,11 @@ struct GlRenderer::Impl {
+                 Vertex bottom_left = a;
+                 bottom_left.position[1] = b.position[1];
+                 bottom_left.texcoord[1] = b.texcoord[1];
+-                const auto base = static_cast<std::uint16_t>(batch_vertices.size());
+-                batch_vertices.push_back(a);
+-                batch_vertices.push_back(top_right);
+-                batch_vertices.push_back(b);
+-                batch_vertices.push_back(bottom_left);
++                const auto base = static_cast<std::uint16_t>(batch_vertex_count);
++                add_vertex(a);
++                add_vertex(top_right);
++                add_vertex(b);
++                add_vertex(bottom_left);
+                 const std::uint16_t quad[6] = {0, 1, 2, 0, 2, 3};
+                 for (const std::uint16_t index : quad) batch_indices.push_back(static_cast<std::uint16_t>(base + index));
+             }
+@@ -2137,7 +2229,7 @@ struct GlRenderer::Impl {
+                 batch_open = true;
+                 return append(call, use_material_color, rect_clamp, picture_rect);
+             }
+-            batch_vertices.append(call.vertices.data(), call.vertices.size());
++            add_vertices(call.vertices.data(), call.vertices.size());
+             const auto base = static_cast<std::uint16_t>(first_vertex);
+             const auto at = [&](std::size_t index) {
+                 const std::size_t mapped = call.indices.empty() ? index : call.indices[index];
+@@ -2159,10 +2251,19 @@ struct GlRenderer::Impl {
+         default: return false;
+         }
+ 
+-        Vertex *fresh = batch_vertices.data() + first_vertex;
+-        if (use_material_color)
+-            for (std::size_t i = 0; i < added; ++i) fresh[i].color = call.material_color;
++        if (use_material_color) {
++            if (batch_stride == sizeof(Vertex)) {
++                Vertex *fresh = batch_records() + first_vertex;
++                for (std::size_t i = 0; i < added; ++i) fresh[i].color = call.material_color;
++            } else {
++                const std::uint32_t color = call.material_color;
++                // The colour is the last four bytes of a compact vertex.
++                std::uint8_t *at = batch_vertices.data() + first_vertex * batch_stride + (batch_stride - sizeof(std::uint32_t));
++                for (std::size_t i = 0; i < added; ++i, at += batch_stride) std::memcpy(at, &color, sizeof(color));
++            }
++        }
+         if (through) {
++            Vertex *fresh = batch_records() + first_vertex;   // (the full layout: vertex_stride_for() keeps a through draw's)
+             for (std::size_t i = 0; i < added; ++i) set_rect(fresh[i], -kNoClamp, -kNoClamp, kNoClamp, kNoClamp);
+             if (rect_clamp) {
+                 const float width = static_cast<float>(call.texture.width);
+@@ -3043,6 +3144,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "ui_upscale") settings.ui_upscale = flag;
+     else if (name == "prewarm") settings.prewarm = flag;
+     else if (name == "variant_dir") settings.variant_dir = value;
++    else if (name == "compact_vertices") settings.compact_vertices = flag;
+     else if (name == "ui_upscale_budget_us") settings.ui_upscale_budget_us = u32;
+     else if (name == "ui_upscale_max_us") settings.ui_upscale_max_us = u32;
+     else if (name == "vgl_skip_redundant") settings.vgl_skip_redundant = flag;
+@@ -3069,7 +3171,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index c3df002..d1d1d6e 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -85,6 +85,11 @@ struct GlSettings {
+     bool prewarm{true};
+     // The folder of the lists above; empty: the folder of the port's settings.txt (no list without one).
+     std::string variant_dir;
++    // A transformed (not a through-mode) draw is written to the batch without the vertex fields its program does not read,
++    // in place of the decoder's 40 bytes: a lit draw without the position's w (36 bytes), an unlit one without the normal as
++    // well (24). The picture is the same; the renderer thread copies, and the GPU fetches, fewer vertex bytes (about
++    // 15 % fewer in a mission, where three quarters of the vertices are lit). 2D draws keep the whole vertex.
++    bool compact_vertices{false};
+     // Of ui_upscale: the most time (microseconds) the passes of one frame may take once the first has run; a texture
+     // over it is drawn as the original and done at a later frame. 0 = no limit.
+     std::uint32_t ui_upscale_budget_us{1500};
+@@ -197,6 +202,8 @@ struct GlStats {
+     std::uint64_t ui2x_textures{};      // textures uploaded at twice their size (settings.ui_upscale)
+     std::uint64_t ui2x_us{};            // ... and the microseconds the MMPX passes took
+     std::uint64_t ui2x_deferred{};      // passes put off to a later frame by ui_upscale_budget_us
++    std::uint64_t vertices_compact{};   // of vertices_uploaded, those written in a compact layout (settings.compact_vertices)
++    std::uint64_t vertex_bytes_saved{}; // ... and the bytes that saved against the decoder's 40-byte vertex
+     std::uint64_t texture_evicted{};
+     std::uint64_t clut_hash_bytes{};
+     std::uint64_t shader_compile_us{};
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index fddf846..6b87775 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1057,6 +1057,8 @@ int main(int argc, char **argv) {
+         line("textures uploaded at 2x (MMPX)", t.ui2x_textures);
+         line("... microseconds spent on them", t.ui2x_us);
+         line("... passes put off by the budget", t.ui2x_deferred);
++        line("vertices written in a compact layout", t.vertices_compact);
++        line("... vertex bytes not written", t.vertex_bytes_saved);
+         line("full-screen pictures sharpened", t.sharp_draws);
+         line("3D draws sampled with mips", t.mip_draws);
+         line("textures given mips", t.mip_textures);

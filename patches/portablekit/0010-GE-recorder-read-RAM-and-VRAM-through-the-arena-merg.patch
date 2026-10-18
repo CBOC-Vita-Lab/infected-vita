@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 00:24:39 +0000
+Subject: [PATCH] GE recorder: read RAM and VRAM through the arena (merge fix)
+
+The frame recorder used GuestMemory::bytes()/vram_bytes(), which the arena-backed GuestMemory of
+the coroutine kernel no longer has. The merge of the two lines compiled nowhere else; ctest 34/34
+(portablekit_adhoc_tests is timing sensitive and fails under load).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7f0b9d6bc6877a16b42db439325c8a24bac8b265)
+
+diff --git a/host/gpu/ge_dump.cpp b/host/gpu/ge_dump.cpp
+index 342751e..a312d26 100644
+--- a/host/gpu/ge_dump.cpp
++++ b/host/gpu/ge_dump.cpp
+@@ -147,10 +147,12 @@ PageRef store_page(Recorder &r, const std::uint8_t *page) {
+     return ref;
+ }
+ 
++// RAM and VRAM are views into the arena (GuestMemory::kArenaVramOffset); the recorder keeps the two
++// as one run of pages, RAM first, as before the arena existed.
+ const std::uint8_t *memory_page(const GuestMemory &memory, std::uint32_t page) {
+-    const std::uint32_t ram_pages = static_cast<std::uint32_t>(memory.bytes().size() / kPageSize);
+-    if (page < ram_pages) return memory.bytes().data() + static_cast<std::size_t>(page) * kPageSize;
+-    return memory.vram_bytes().data() + static_cast<std::size_t>(page - ram_pages) * kPageSize;
++    const std::uint32_t ram_pages = memory.size() / kPageSize;
++    if (page < ram_pages) return memory.arena() + static_cast<std::size_t>(page) * kPageSize;
++    return memory.arena() + GuestMemory::kArenaVramOffset + static_cast<std::size_t>(page - ram_pages) * kPageSize;
+ }
+ 
+ // Brings the shadow up to the memory's present state; `out` gets the pages that changed.
+@@ -173,10 +175,10 @@ void begin_flip(Recorder &r, const GuestMemory &memory) {
+     r.current.flip = r.flip + 1u;
+     r.flip_new_bytes = 0;
+     r.flip_new_pages = 0;
+-    r.ram_pages = static_cast<std::uint32_t>(memory.bytes().size() / kPageSize);
+-    r.vram_pages = static_cast<std::uint32_t>(memory.vram_bytes().size() / kPageSize);
+-    r.current.ram_size = static_cast<std::uint32_t>(memory.bytes().size());
+-    r.current.vram_size = static_cast<std::uint32_t>(memory.vram_bytes().size());
++    r.ram_pages = memory.size() / kPageSize;
++    r.vram_pages = memory.vram_size() / kPageSize;
++    r.current.ram_size = memory.size();
++    r.current.vram_size = memory.vram_size();
+     const std::uint32_t pages = r.ram_pages + r.vram_pages;
+     r.shadow.assign(static_cast<std::size_t>(pages) * kPageSize, 0u);
+     r.refs.assign(pages, PageRef{});

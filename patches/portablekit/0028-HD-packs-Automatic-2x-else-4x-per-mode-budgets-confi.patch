@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 09:51:16 +0000
+Subject: [PATCH] HD packs: Automatic = 2x else 4x, per-mode budgets (config
+ keys), per-slot palette guard, tuning rows; frame_hook call after the flip
+
+- port_settings: hd_textures "Automatic" (2x if installed, else 4x), enemy density cost hints {None, Medium, High, High}, view distance {None, Medium, Medium}
+- hd_texture_pack / gl_hd_textures: default budget per mode (2x 32 MB, 4x 48 MB) with hd_budget_mb / hd_budget_2x_mb / hd_budget_4x_mb;
+  palette-slot guard (slot = canonical texel + clut address + size; 3 quick changes, then the original until 600 quiet frames);
+  warning when the Vita's texpack_4x.bin is bigger than 160 MB
+- hle_media: the profile frame_hook runs after each flip
+- tests: port_settings_tests cover the rows and hints
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 91a06a8..ec33579 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -339,7 +339,7 @@ if(PSPRECOMP_BUILD_TESTS)
+         "${PORTABLEKIT_ROOT}/tests/port_settings_tests.cpp"
+         "${PORTABLEKIT_ROOT}/host/settings/port_settings.cpp")
+     target_compile_features(portablekit_port_settings_tests PRIVATE cxx_std_20)
+-    target_include_directories(portablekit_port_settings_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    target_include_directories(portablekit_port_settings_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/include")
+     set_target_properties(portablekit_port_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+     add_test(NAME portablekit_port_settings_tests COMMAND portablekit_port_settings_tests)
+ endif()
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 9b3c87d..4cdc004 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -111,7 +111,7 @@ void GlHdTextures::configure(const HdConfig &config) {
+     if (!config_.dump_dir.empty() && !dump_.active()) dump_.open(config_.dump_dir, config_.dump_raw);
+     open_pack();
+     if (config_.log && (pack_.is_open() || dump_.active()))
+-        std::cout << "[hdtex] mode " << hd_mode_name(config_.mode) << ", budget " << config_.budget_bytes / (1024u * 1024u)
++        std::cout << "[hdtex] mode " << hd_mode_name(config_.mode) << ", budget " << config_.budget_for(config_.mode) / (1024u * 1024u)
+                   << " MB" << (pack_.is_open() ? ", pack of " + std::to_string(pack_.count()) + " textures (index " +
+                                                        std::to_string(pack_.index_ram_bytes()) + " bytes in RAM)"
+                                                  : std::string())
+@@ -129,6 +129,13 @@ void GlHdTextures::open_pack() {
+         if (config_.log) std::cerr << "[hdtex] " << error << "; the original textures are used\n";
+         missing_logged_ = true;
+     }
++#if defined(__vita__)
++    // The Vita's 4x pack is the MIXED one (4x world and effects, 2x characters and UI, about 98 MB), installed as texpack_4x.bin. The full
++    // 4x pack (about 261 MB) needs ~90 MB of texture memory for what mission 1 draws: past the budget its textures fall back to the originals.
++    if (pack_.is_open() && config_.mode == HdMode::X4 && pack_.file_bytes() > 160ull * 1024ull * 1024ull && config_.log)
++        std::cerr << "[hdtex] texpack_4x.bin is " << pack_.file_bytes() / (1024u * 1024u) << " MB: that is the full 4x pack, which does not fit the Vita; "
++                  << "install texpack_4x_mixed.bin under the name texpack_4x.bin (about 98 MB)\n";
++#endif
+ }
+ 
+ void GlHdTextures::set_mode(HdMode mode) {
+@@ -137,8 +144,10 @@ void GlHdTextures::set_mode(HdMode mode) {
+     open_pack();
+     exhausted_ = false;
+     mode_changed_ = true;
++    logged_exhausted_ = false;   // the budget of the new mode gets its own first line
++    palette_slots_.clear();
+     ++stats_.flushes;
+-    if (config_.log) std::cout << "[hdtex] gfx.hd_textures is now " << hd_mode_name(mode) << "\n";
++    if (config_.log) std::cout << "[hdtex] gfx.hd_textures is now " << hd_mode_name(mode) << ", budget " << config_.budget_for(mode) / (1024u * 1024u) << " MB\n";
+ }
+ 
+ bool GlHdTextures::tick(std::uint64_t frame) {
+@@ -235,13 +244,14 @@ bool GlHdTextures::upload_blob(std::uint32_t texture, const HdRecord &record, co
+ }
+ 
+ bool GlHdTextures::admit(std::uint64_t needed) {
+-    if (exhausted_ && stats_.resident_bytes < config_.budget_bytes / 10u * 9u) exhausted_ = false;
+-    if (exhausted_ || stats_.resident_bytes + needed > config_.budget_bytes) {
++    const std::uint64_t budget = config_.budget_for(config_.mode);
++    if (exhausted_ && stats_.resident_bytes < budget / 10u * 9u) exhausted_ = false;
++    if (exhausted_ || stats_.resident_bytes + needed > budget) {
+         exhausted_ = true;
+         ++stats_.skipped_budget;
+         if (!logged_exhausted_ && config_.log) {
+             logged_exhausted_ = true;
+-            std::cerr << "[hdtex] replacement textures reached the budget of " << config_.budget_bytes / (1024u * 1024u)
++            std::cerr << "[hdtex] replacement textures reached the budget of " << budget / (1024u * 1024u)
+                       << " MB; the remaining textures use the originals (this is logged once)\n";
+         }
+         return false;
+@@ -291,39 +301,57 @@ void halve(const std::vector<std::uint32_t> &in, std::uint32_t w, std::uint32_t
+         }
+ }
+ 
+-constexpr std::uint64_t kRecolourWindowFrames = 120u;   // a texture whose palette changes this often is left alone
+-constexpr std::uint32_t kRecoloursPerWindow = 6u;
+-constexpr std::uint64_t kRecolourPenaltyFrames = 1800u;
++// A recolourable texture whose palette the game rewrites again and again (the minimap) would be rebuilt at every change: 4-6 ms at 2x
++// and 19-43 ms at 4x on a desktop core, far more on a Vita, and every rebuild leaves a new GPU texture (the renderer's cache key
++// includes the palette) that holds replacement budget until it is evicted. A palette slot may change kRecolourFree times in a row,
++// each within kRecolourQuickGap frames of the one before (the first look at a character, a hit flash); the next change makes it an
++// animation, and from then on it keeps its original (the renderer's own palette path, which costs a decode and an upload of the
++// original size) for as long as its palette keeps changing: it is rebuilt again only after kRecolourHoldFrames without a change.
++constexpr std::uint64_t kRecolourQuickGap = 24u;
++constexpr std::uint32_t kRecolourFree = 3u;
++constexpr std::uint64_t kRecolourHoldFrames = 600u;
++constexpr std::size_t kMaxPaletteSlots = 4096u;
++
++std::uint64_t palette_slot_key(const TextureState &state) {
++    std::uint64_t h = 0x9E3779B97F4A7C15ull;
++    for (const std::uint64_t part : {static_cast<std::uint64_t>(GuestMemory::canonical(state.address)),
++                                     static_cast<std::uint64_t>(GuestMemory::canonical(state.clut_address)),
++                                     static_cast<std::uint64_t>(state.width) << 16u | state.height})
++        h = (h ^ part) * 0x100000001B3ull + (h >> 29u);
++    return h;
++}
+ 
+ } // namespace
+ 
+ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory, const TextureState &state,
+                                 HdTextureInfo &info) {
+-    const std::uint64_t image_key = texture_image_key(memory, state);
+-    if (image_key == 0u) return false;
+-    HdRecord record;
+-    if (!pack_.find(image_key, record) || (record.flags & kHdFlagRecolour) == 0u) return false;
+-    // A palette that changes every few frames (a colour animation of a recolourable image) would cost a rebuild
+-    // each time: such a texture keeps its original.
+-    Thrash &thrash = thrash_[image_key];
+-    if (frame_ < thrash.refuse_until) {
++    // The animation guard comes first: a slot that is held costs neither the image hash nor a read of the pack.
++    if (palette_slots_.size() >= kMaxPaletteSlots) palette_slots_.clear();
++    PaletteSlot guard_off;
++    PaletteSlot &slot = config_.recolour_guard ? palette_slots_[palette_slot_key(state)] : guard_off;
++    if (frame_ < slot.hold_until) {
++        slot.hold_until = frame_ + kRecolourHoldFrames;   // the palette changed again: the hold goes on
++        slot.last_event = frame_;
+         ++stats_.recolour_refused;
+         return false;
+     }
+-    if (frame_ >= thrash.window_start + kRecolourWindowFrames || frame_ < thrash.window_start) {
+-        thrash.window_start = frame_;
+-        thrash.count = 0u;
+-    }
+-    if (++thrash.count > kRecoloursPerWindow) {
+-        thrash.refuse_until = frame_ + kRecolourPenaltyFrames;
++    slot.run = (slot.seen && frame_ >= slot.last_event && frame_ - slot.last_event <= kRecolourQuickGap) ? slot.run + 1u : 1u;
++    slot.seen = true;
++    slot.last_event = frame_;
++    if (slot.run > kRecolourFree) {
++        slot.hold_until = frame_ + kRecolourHoldFrames;
+         ++stats_.recolour_refused;
+-        if (!thrash.logged && config_.log) {
+-            thrash.logged = true;
+-            std::cerr << "[hdtex] the palette of image " << std::hex << image_key << std::dec
+-                      << " changes too often to recolour: its original is used for a while (logged once per image)\n";
++        if (!slot.logged && config_.log) {
++            slot.logged = true;
++            std::cerr << "[hdtex] the palette of the texture at " << std::hex << state.address << " (palette memory " << state.clut_address
++                      << std::dec << ") changes every few frames: its original is used while it does (logged once per texture)\n";
+         }
+         return false;
+     }
++    const std::uint64_t image_key = texture_image_key(memory, state);
++    if (image_key == 0u) return false;
++    HdRecord record;
++    if (!pack_.find(image_key, record) || (record.flags & kHdFlagRecolour) == 0u) return false;
+     const std::uint64_t needed = static_cast<std::uint64_t>(record.width) * record.height * 4u * 4u / 3u;
+     if (!admit(needed)) return false;
+ 
+@@ -384,7 +412,15 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+     ++stats_.resident_textures;
+     stats_.resident_bytes += gpu_bytes;
+     stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
+-    stats_.recolour_ns += nanoseconds_since(start);
++    const std::uint64_t spent = nanoseconds_since(start);
++    stats_.recolour_ns += spent;
++    if (config_.trace) {
++        char text[200];
++        std::snprintf(text, sizeof text, "[hdtex] recolour frame %llu image %016llx %ux%u texels@%08x clut@%08x %u entries, %.2f ms\n",
++                      static_cast<unsigned long long>(frame_), static_cast<unsigned long long>(image_key), width, height, state.address,
++                      state.clut_address, recolour.palette_entries, static_cast<double>(spent) / 1.0e6);
++        std::cerr << text;
++    }
+     return true;
+ }
+ 
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index 0673b19..b9f4477 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -42,6 +42,8 @@ public:
+     // Switches the pack at run time. The renderer must drop every texture it holds (see tick).
+     void set_mode(HdMode mode);
+     [[nodiscard]] HdMode mode() const noexcept { return config_.mode; }
++    // GPU bytes the replacements of the present mode may use (HdConfig::budget_for).
++    [[nodiscard]] std::uint64_t budget_bytes() const noexcept { return config_.budget_for(config_.mode); }
+     [[nodiscard]] bool has_pack() const noexcept { return pack_.is_open(); }
+     [[nodiscard]] std::uint32_t scale() const noexcept { return pack_.is_open() ? pack_.scale() : 1u; }
+     // Once per display list: looks at gfx.hd_textures when the port settings changed (HdConfig::follow_settings); true
+@@ -87,13 +89,17 @@ private:
+     bool mode_changed_{};
+     std::uint32_t settings_generation_{};   // of the port settings when the mode was last derived from them
+     std::uint64_t frame_{};
+-    struct Thrash {
+-        std::uint64_t window_start{};
+-        std::uint32_t count{};
+-        std::uint64_t refuse_until{};
++    // Palette animation guard (see try_recolour). One record per palette slot: the texels and the palette memory a recolourable
++    // texture is drawn from. The minimap is ONE slot whose palette the game rewrites every few frames; the characters of a wave
++    // share the texels but each has its own palette memory, so each is a slot of its own and a crowd is not an animation.
++    struct PaletteSlot {
++        bool seen{};                  // a palette change has been seen in this slot
++        std::uint64_t last_event{};   // frame of the last palette change seen in this slot
++        std::uint32_t run{};          // changes in a row, each within kRecolourQuickGap frames of the one before
++        std::uint64_t hold_until{};   // while the frame is before this the slot keeps its original (each change extends it)
+         bool logged{};
+     };
+-    std::unordered_map<std::uint64_t, Thrash> thrash_;   // image key -> recolours in the current window
++    std::unordered_map<std::uint64_t, PaletteSlot> palette_slots_;
+     std::vector<std::uint8_t> blob_;
+     std::vector<std::uint32_t> decode_;
+     std::vector<std::uint32_t> recolour_base_, recolour_level_, recolour_mip_;
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 9765b6f..fd1189c 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2285,7 +2285,7 @@ void GlRenderer::begin_display_list() {
+             std::cout << "[gl] textures: " << impl.textures.size() << " cached " << (impl.texture_bytes >> 10u) << " KiB of "
+                       << (impl.settings.texture_budget >> 20u) << " MB | hd " << hd_mode_name(impl.hd.mode()) << ": resident "
+                       << h.resident_textures << " tex " << (h.resident_bytes >> 10u) << " KiB (peak " << (h.peak_bytes >> 10u)
+-                      << " KiB), hits " << h.hits << ", misses " << h.misses << ", over budget " << h.skipped_budget
++                      << " KiB of " << (impl.hd.budget_bytes() >> 20u) << " MB), hits " << h.hits << ", misses " << h.misses << ", over budget " << h.skipped_budget
+                       << ", failed " << h.upload_failed << ", read " << (h.blob_bytes >> 10u) << " KiB" << std::endl;
+         }
+     }
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index 8d1f479..e4e1b4a 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -297,7 +297,7 @@ std::filesystem::path hd_data_root() {
+ }
+ 
+ namespace {
+-// The best pack present in the data root: 4x, else 2x, else none (what gfx.hd_textures=auto means).
++// What gfx.hd_textures=auto means for the packs in the data root (hd_auto_mode).
+ HdMode best_pack_present(const std::filesystem::path &data_root) {
+     // Plain stdio, not std::filesystem::exists: a path like ux0:data/infected/ is the Vita's, and stdio is what the pack
+     // itself is read with.
+@@ -307,9 +307,7 @@ HdMode best_pack_present(const std::filesystem::path &data_root) {
+         std::fclose(file);
+         return true;
+     };
+-    if (exists("texpack_4x.bin")) return HdMode::X4;
+-    if (exists("texpack_2x.bin")) return HdMode::X2;
+-    return HdMode::Off;
++    return hd_auto_mode(exists("texpack_2x.bin"), exists("texpack_4x.bin"));
+ }
+ } // namespace
+ 
+@@ -346,7 +344,12 @@ HdConfig hd_config_from_environment() {
+     config.mode = hd_textures_setting(config.data_root);
+     config.follow_settings = true;
+     config.trace = env_any("HD_TRACE") != nullptr;
+-    if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = std::strtoull(text, nullptr, 10) * 1024ull * 1024ull;
++    if (const char *text = env_any("HD_RECOLOUR_GUARD")) config.recolour_guard = !(std::strcmp(text, "off") == 0 || std::strcmp(text, "0") == 0);
++    // Budgets in MB: one for every mode, or one per mode (the per-mode keys win for their mode). Without any, 2x gets 32 MB and 4x 48 MB.
++    const auto megabytes = [](const char *text) { return std::strtoull(text, nullptr, 10) * 1024ull * 1024ull; };
++    if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = megabytes(text);
++    if (const char *text = env_any("HD_BUDGET_2X_MB")) config.budget_2x_bytes = megabytes(text);
++    if (const char *text = env_any("HD_BUDGET_4X_MB")) config.budget_4x_bytes = megabytes(text);
+     if (const char *text = env_any("TEX_DUMP")) config.dump_dir = text;
+     config.dump_raw = env_any("TEX_DUMP_RAW") != nullptr;
+     return config;
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index c7c4d2e..9874673 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -116,10 +116,22 @@ void hd_apply_recolour(const HdRecolour &recolour, const std::uint32_t *base_rgb
+ struct HdConfig {
+     HdMode mode{HdMode::Off};
+     std::filesystem::path data_root;   // where texpack_<n>x.bin lives
+-    std::uint64_t budget_bytes{64ull * 1024ull * 1024ull};  // GPU memory the replacements may use
++    // GPU memory the replacements may use. `budget_bytes` is one budget for every mode (--hd-budget-mb of the replayer, the key
++    // hd_budget_mb of config.txt / <PREFIX>_HD_BUDGET_MB); 0 = each mode's own: 32 MB for the 2x pack, 48 MB for the 4x pack. The
++    // 48 MB are sized for the MIXED 4x pack (4x world and effects, 2x characters and UI: 26-37 MB for a whole level); the full 4x
++    // pack needs about 90 MB for what mission 1 draws and wants hd_budget_4x_mb=256 (or more) on a machine that has the memory.
++    std::uint64_t budget_bytes{0};
++    std::uint64_t budget_2x_bytes{32ull * 1024ull * 1024ull};
++    std::uint64_t budget_4x_bytes{48ull * 1024ull * 1024ull};
++    [[nodiscard]] std::uint64_t budget_for(HdMode m) const noexcept {
++        return budget_bytes != 0u ? budget_bytes : (m == HdMode::X4 ? budget_4x_bytes : budget_2x_bytes);
++    }
+     std::filesystem::path dump_dir;    // INFECTED_TEX_DUMP: write every distinct texture seen, empty for none
+     bool dump_raw{};                   // also write <key>.raw (state, texel bytes, palette) for the pack tools
+     bool log{true};
++    // The palette animation guard of the recolour records (gl_hd_textures.cpp). <PREFIX>_HD_RECOLOUR_GUARD=off turns it off, to measure
++    // what a texture whose palette changes every frame costs without it.
++    bool recolour_guard{true};
+     // The mode follows gfx.hd_textures (host/settings/port_settings.hpp) while the program runs: GlHdTextures::tick() looks
+     // at the setting's generation and switches (every texture is uploaded again). A replayer that names the mode itself
+     // leaves this off.
+@@ -130,13 +142,21 @@ struct HdConfig {
+ };
+ 
+ // THE place gfx.hd_textures is read from: the port settings (host/settings/port_settings.hpp). `auto` (the setting's
+-// default) is the largest pack present in the data root.
++// default) is the 2x pack when it is in the data root (the safe one: a whole level needs about 20 MB of texture memory),
++// else the 4x pack, else none. The 4x pack is always the player's explicit choice.
+ [[nodiscard]] HdMode hd_textures_setting(const std::filesystem::path &data_root);
+ // The port data root ($<PREFIX>_DATA_DIR).
+ [[nodiscard]] std::filesystem::path hd_data_root();
++// What `auto` picks when the data root holds the 2x pack and/or the 4x pack.
++[[nodiscard]] inline HdMode hd_auto_mode(bool has_2x, bool has_4x) noexcept {
++    if (has_2x) return HdMode::X2;
++    return has_4x ? HdMode::X4 : HdMode::Off;
++}
+ // Whether texpack_2x.bin or texpack_4x.bin is in the data root.
+ [[nodiscard]] bool hd_pack_present(const std::filesystem::path &data_root);
+-// Mode, data root, budget (<PREFIX>_HD_BUDGET_MB), dump directory (<PREFIX>_TEX_DUMP) from the environment and the port settings.
++// Mode, data root, budgets (<PREFIX>_HD_BUDGET_MB for every mode, _HD_BUDGET_2X_MB / _HD_BUDGET_4X_MB per mode; on the Vita the
++// config.txt keys hd_budget_mb, hd_budget_2x_mb, hd_budget_4x_mb), dump directory (<PREFIX>_TEX_DUMP) from the environment and
++// the port settings.
+ [[nodiscard]] HdConfig hd_config_from_environment();
+ [[nodiscard]] const char *hd_mode_name(HdMode mode);
+ [[nodiscard]] bool hd_parse_mode(const std::string &text, HdMode &mode);
+diff --git a/host/overlay/overlay_menu.cpp b/host/overlay/overlay_menu.cpp
+index 39632ae..6800ed1 100644
+--- a/host/overlay/overlay_menu.cpp
++++ b/host/overlay/overlay_menu.cpp
+@@ -195,6 +195,11 @@ void Menu::draw(Canvas &canvas) const {
+                         std::string(1, kArrowRight));
+         // Cost of the value shown; nothing for a row that cannot be used.
+         if (usable) canvas.text(cost_x, text_y, big, cost_color(settings_.cost(key)), port::cost_name(settings_.cost(key)));
++        // "next mission": a gameplay value that the game takes when it loads a level.
++        if (usable && info.next_mission) {
++            canvas.text(tag_x, y + 1 * unit / 3, small, kDim, "next");
++            canvas.text(tag_x, y + 1 * unit / 3 + kGlyphHeight * small, small, kDim, "mission");
++        }
+         // "restart needed": pending after a change, or always for a setting that is read once at start.
+         if (usable && (settings_.restart_pending(key) || info.restart_always)) {
+             const bool pending = settings_.restart_pending(key);
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 07688cc..47a8aa3 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -23,8 +23,8 @@ constexpr Cost N = Cost::None, L = Cost::Low, M = Cost::Medium, H = Cost::High;
+ // "Not available: " when the row is greyed (reasons are at most 31).
+ const KeyInfo kTable[kKeyCount] = {
+     {Key::GfxHdTextures, "gfx.hd_textures", Page::Graphics, "HD textures",
+-     "Sharper textures from an installed pack.", 4, 0,
+-     {"auto", "off", "2x", "4x"}, {"Best available", "Off", "2x pack", "4x pack"}, {L, N, L, M}, 0, false},
++     "Sharper textures. Automatic = 2x if installed.", 4, 0,
++     {"auto", "off", "2x", "4x"}, {"Automatic", "Off", "2x pack", "4x pack"}, {L, N, L, M}, 0, false},
+     {Key::GfxTextureFilter, "gfx.texture_filter", Page::Graphics, "Texture filter",
+      "Smooths 3D textures. HUD and text unchanged.", 2, 0,
+      {"smooth", "original"}, {"Smooth", "Original"}, {L, N}, 0, false},
+@@ -58,12 +58,16 @@ const KeyInfo kTable[kKeyCount] = {
+     {Key::PerfCpuClock, "perf.cpu_clock", Page::Performance, "CPU clock",
+      "Vita CPU speed in MHz. Higher runs hotter.", 2, 0,
+      {"444", "500"}, {"444 MHz", "500 MHz", }, {N, L}, 0, false},
++    // Enemy density: measured as +14..41 % draws (150 %) and +25..111 % (200 %) of skinned geometry plus the guest code of the extra
++    // enemies (docs/GAMEPLAY_TUNING.md section 3.3); 125 % lies between. The cap is read when a mission loads: a change applies then.
+     {Key::PerfEnemyDensity, "perf.enemy_density", Page::Performance, "Enemy density",
+-     "How many enemies a level spawns, in percent.", 4, 0,
+-     {"100", "125", "150", "200"}, {"100%", "125%", "150%", "200%"}, {N, L, M, H}, 0, false},
++     "More enemies at once. Applies at next mission.", 4, 0,
++     {"100", "125", "150", "200"}, {"100%", "125%", "150%", "200%"}, {N, M, H, H}, 0, false, true},
++    // View distance: the engine does not cull by the far plane, so the CPU and the draw count do not change; the price is GPU clipping and
++    // fill of what used to be cut off (only where the level has content out there). NOT measured on a GPU.
+     {Key::PerfViewDistance, "perf.view_distance", Page::Performance, "View distance",
+-     "How far the world is drawn, in percent.", 3, 0,
+-     {"100", "150", "200"}, {"100%", "150%", "200%"}, {N, M, H}, 0, false},
++     "Fog and clip distance. GPU cost not measured.", 3, 0,
++     {"100", "150", "200"}, {"100%", "150%", "200%"}, {N, M, M}, 0, false},
+ };
+ 
+ // What the build or the device cannot do yet; set_unavailable() changes this at run time.
+@@ -207,8 +211,9 @@ Settings::Settings() {
+     unavailable_[static_cast<std::size_t>(Key::GfxHdTextures)] = "No texture pack installed.";
+     unavailable_[static_cast<std::size_t>(Key::GfxHdMovies)] = "No replacement movies yet.";
+     unavailable_[static_cast<std::size_t>(Key::PerfThreadedRenderer)] = "Renderer thread not built yet.";
+-    unavailable_[static_cast<std::size_t>(Key::PerfEnemyDensity)] = "Not available yet.";
+-    unavailable_[static_cast<std::size_t>(Key::PerfViewDistance)] = "Not available yet.";
++    // The two gameplay rows belong to a game's profile (infected_tuning.cpp makes them usable); a program without one keeps them greyed.
++    unavailable_[static_cast<std::size_t>(Key::PerfEnemyDensity)] = "Only while the game runs.";
++    unavailable_[static_cast<std::size_t>(Key::PerfViewDistance)] = "Only while the game runs.";
+ #if !defined(__vita__)
+     unavailable_[static_cast<std::size_t>(Key::PerfCpuClock)] = "Only on the Vita.";
+ #endif
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index 405f138..3bf4bc5 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -75,6 +75,8 @@ struct KeyInfo {
+     std::uint8_t restart_values;
+     // Every change takes a restart, whatever the values (a thread that is created once).
+     bool restart_always;
++    // A change applies when the next mission loads, not at once and not at a restart (the overlay tags the row "next mission").
++    bool next_mission{false};
+ };
+ 
+ [[nodiscard]] const KeyInfo &info(Key key) noexcept;
+diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
+index a994904..0744241 100644
+--- a/tests/port_settings_tests.cpp
++++ b/tests/port_settings_tests.cpp
+@@ -1,6 +1,7 @@
+ // The port settings (host/settings/port_settings.hpp): the key table, settings.txt round trips with unknown lines
+ // kept, developer overrides, availability, the restart rule and the change counter. No game, no renderer.
+ 
++#include "gpu/hd_texture_pack.hpp"
+ #include "settings/port_settings.hpp"
+ 
+ #include <cstdio>
+@@ -219,6 +220,42 @@ int main() {
+     settings().mark_started();
+     check(msaa_samples() == 0u, "off at start is no multisampling");
+ 
++    // The gameplay rows are the game profile's to enable; a program without one keeps them greyed, and their hints are honest.
++    {
++        Settings fresh;
++        check(!fresh.available(Key::PerfEnemyDensity) && !fresh.available(Key::PerfViewDistance), "enemy density and view distance are greyed until a game enables them");
++        fresh.set_unavailable(Key::PerfEnemyDensity, nullptr);
++        fresh.set_unavailable(Key::PerfViewDistance, nullptr);
++        fresh.set(Key::PerfEnemyDensity, "200");
++        fresh.set(Key::PerfViewDistance, "150");
++        check(fresh.available(Key::PerfEnemyDensity) && fresh.index(Key::PerfEnemyDensity) == 3u && fresh.index(Key::PerfViewDistance) == 1u,
++              "an enabled gameplay row takes the player's value");
++        check(fresh.cost(Key::PerfEnemyDensity) == Cost::High && info(Key::PerfEnemyDensity).costs[1] == Cost::Medium && info(Key::PerfEnemyDensity).costs[0] == Cost::None,
++              "enemy density: None at 100, Medium at 125, High at 150 and 200");
++        check(info(Key::PerfViewDistance).costs[1] == Cost::Medium && info(Key::PerfViewDistance).costs[2] == Cost::Medium, "view distance: Medium");
++        check(std::strstr(info(Key::PerfEnemyDensity).description, "next mission") != nullptr && info(Key::PerfEnemyDensity).next_mission &&
++                  !info(Key::PerfViewDistance).next_mission,
++              "the enemy density row says it applies at the next mission; the view distance is live");
++        check(!restart_for_change(Key::PerfEnemyDensity, 0u, 3u) && !restart_for_change(Key::PerfViewDistance, 0u, 2u), "neither gameplay row needs a restart");
++        for (std::size_t i = 0; i < kKeyCount; ++i)
++            check(std::strlen(info(static_cast<Key>(i)).description) <= 46u, info(static_cast<Key>(i)).name);
++    }
++
++    // The HD pack policy: what "Automatic" picks and the budgets of the modes (host/gpu/hd_texture_pack.hpp, header-only part).
++    {
++        using namespace portablekit::gpu;
++        check(hd_auto_mode(true, true) == HdMode::X2, "automatic: the 2x pack when both are installed");
++        check(hd_auto_mode(true, false) == HdMode::X2 && hd_auto_mode(false, true) == HdMode::X4 && hd_auto_mode(false, false) == HdMode::Off,
++              "automatic: 2x, else 4x, else none");
++        HdConfig config;
++        check(config.budget_for(HdMode::X2) == 32ull << 20u && config.budget_for(HdMode::X4) == 48ull << 20u, "default HD budgets: 2x 32 MB, 4x 48 MB");
++        config.budget_4x_bytes = 256ull << 20u;
++        check(config.budget_for(HdMode::X4) == 256ull << 20u && config.budget_for(HdMode::X2) == 32ull << 20u, "a per-mode budget changes its mode only");
++        config.budget_bytes = 16ull << 20u;
++        check(config.budget_for(HdMode::X4) == 16ull << 20u && config.budget_for(HdMode::X2) == 16ull << 20u, "one budget for every mode wins");
++        check(settings().label(Key::GfxHdTextures) != nullptr && std::strcmp(info(Key::GfxHdTextures).labels[0], "Automatic") == 0, "the default HD row reads Automatic");
++    }
++
+     std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILURES");
+     return g_failures == 0 ? 0 : 1;
+ }

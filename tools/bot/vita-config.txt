@@ -1,0 +1,12 @@
+# Vita config.txt for the end-to-end regression run (copy mission1_win.pad to the app data directory as pad.script)
+# Every key is also the environment variable INFECTED_<KEY>; these are the desktop settings of tools/bot/run.sh.
+clock=virtual
+no_busy_clock=1
+spin_insns=0
+frame_limit_us=16683
+pad_script_file=pad.script
+# read-only observer, prints the "[bot] event ..." lines of the outcome into log.txt
+bot_observe=1
+max_frames=9800
+# optional, run as fast as the device allows instead of 60 flips per second of wall time
+# unthrottled=1

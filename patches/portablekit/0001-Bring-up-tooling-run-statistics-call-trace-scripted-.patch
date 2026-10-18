@@ -1,0 +1,1737 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 15:56:46 +0000
+Subject: [PATCH] Bring-up tooling: run statistics, call trace, scripted pad,
+ debug rasteriser
+
+For the first headless run of a new game under the interpreter, with no
+window, no renderer and no GPU. Every switch is off unless its environment
+variable is set, and none changes what the guest sees except where noted.
+
+* host/perf/bringup_stats.*: <prefix>_STATS=<dir> writes per-flip and
+  per-phase CSVs (instructions, HLE calls, lists, draws), calls per import
+  and thread, per-address instruction counts, and a GE aggregate (vertex
+  types, texture formats, blends, depth/alpha functions, lights, render
+  targets, command histogram). _MAX_FRAMES/_MAX_WALL/_MAX_EMU stop a run
+  cleanly so the end-of-run report prints; _PAD_SCRIPT drives the pad by flip
+  or emulated time; _TRACE_CALLS (and _TRACE_FROM_FLIP) prints the first N
+  calls to matching imports, with file names for sceIoOpen.
+* host/perf/debug_raster.*: a small software rasteriser behind
+  <prefix>_SHOT_DIR/_SHOT_FLIPS/_SHOT_EVERY that writes the displayed frame as
+  a PNG, so a headless run can be looked at and a menu navigated. Not a
+  renderer: no lighting or fog, nearest sampling, nothing written back.
+* interpreter: per-address instruction counts (set_interpreter_pc_profile)
+  and interpreter_account_native() so a native replacement of a guest
+  function keeps instruction counts and profiles comparable.
+* runtime: set_runtime_pre_import_hook(), called before every import.
+* GeState: per-opcode command counters.
+* kernel: <prefix>_CPU_NS_PER_INSN charges emulated time per interpreted
+  instruction (guest compute otherwise costs none), and
+  <prefix>_FRAME_LIMIT_US keeps flips at least that far apart in emulated time.
+* sceKernelReferThreadProfiler / ReferGlobalProfiler return NULL and write
+  nothing (UNVERIFIED: logged as such); before, they wrote through whatever
+  pointer the guest had in a0.
+
+Verified: builds with the framework's own targets and with a port, on x86_64
+Linux, without a renderer. Not verified: the renderer build (SDL3/Vulkan are
+not available here), any other game, the CPU time model against hardware.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index 90147fb..be6bfd4 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -42,6 +42,8 @@ set(PORTABLEKIT_HOST_SOURCES
+     host/gpu/texture_pack.cpp
+     host/gpu/texture_pack_import.cpp
+     host/perf/frame_stats.cpp
++    host/perf/bringup_stats.cpp
++    host/perf/debug_raster.cpp
+     host/perf/perf_overlay.cpp
+     host/overlays.cpp
+     host/system.cpp
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index 48af218..ce1a836 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -1381,6 +1381,7 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
+             std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
+         const std::uint32_t command = word >> 24u;
+         const std::uint32_t data = word & 0x00FFFFFFu;
++        ++command_counts_[command];
+         // Where the camera came from: the display list the game built holds the
+         // view matrix as commands, and that address is the one thing about the
+         // camera the host can always point at.
+diff --git a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+index a187ab4..d4e7625 100644
+--- a/host/gpu/ge_state.hpp
++++ b/host/gpu/ge_state.hpp
+@@ -264,6 +264,10 @@ public:
+     [[nodiscard]] std::uint32_t view_matrix_source() const noexcept { return view_matrix_source_; }
+     [[nodiscard]] std::uint64_t vertex_count() const noexcept { return vertex_count_; }
+     [[nodiscard]] std::uint64_t unhandled_command_count() const noexcept { return unhandled_commands_; }
++    // How often each command byte has been executed, counting jumps and calls;
++    // for summarising what a game asks of the GE (<prefix>_STATS).
++    [[nodiscard]] const std::array<std::uint64_t, 256> &command_counts() const noexcept { return command_counts_; }
++    void reset_command_counts() noexcept { command_counts_.fill(0u); }
+     // Every GE command the state machine ignored, with how often and the first
+     // value seen, printed once at the end of a run. This is the answer to
+     // "what does this game ask of the hardware that the renderer does not
+@@ -329,6 +333,7 @@ private:
+     std::uint64_t draw_count_{};
+     std::uint64_t vertex_count_{};
+     std::uint64_t unhandled_commands_{};
++    std::array<std::uint64_t, 256> command_counts_{};
+     bool raw_vertices_{};
+     bool raw_also_decoded_{};
+ };
+diff --git a/host/hle/hle_common.hpp b/host/hle/hle_common.hpp
+index 5b0127c..4f714de 100644
+--- a/host/hle/hle_common.hpp
++++ b/host/hle/hle_common.hpp
+@@ -49,6 +49,7 @@ public:
+     [[nodiscard]] HleFunction bound_function(const std::string &library, std::uint32_t nid) const;
+     [[nodiscard]] bool bound(const std::string &library, std::uint32_t nid) const;
+     [[nodiscard]] std::size_t count() const noexcept { return bound_.size(); }
++    [[nodiscard]] Runtime &runtime() const noexcept { return runtime_; }
+ 
+ private:
+     Runtime &runtime_;
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index d983fe6..860d23b 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -22,6 +22,7 @@
+ #include "settings/settings.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "perf/frame_stats.hpp"
++#include "perf/bringup_stats.hpp"
+ #if defined(PORTABLEKIT_HAS_RENDERER)
+ #include "gpu/vulkan_renderer.hpp"
+ #include "ui/ui.hpp"
+@@ -139,6 +140,7 @@ MediaState &media() {
+ // is written back to guest memory first: the game copies the last frame of a
+ // hunt this way and textures the quest reward screen's background from it.
+ void block_transfer(Runtime &rt, const gpu::BlockTransfer &transfer) {
++    bringup::on_transfer(transfer);
+     psprecomp::GuestMemory &memory = rt.memory();
+ #if defined(PORTABLEKIT_HAS_RENDERER)
+     if (media().renderer && media().renderer->available())
+@@ -191,9 +193,18 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
+         const psprecomp::GuestMemory &memory = rt.memory();
+         renderer.begin_display_list();
+         media().ge.set_raw_vertices(renderer.gpu_decode(), renderer.check_gpu_decode());
+-        media().ge.set_draw_sink([&renderer, &memory](const gpu::DrawCall &call) { renderer.submit(call, memory); });
++        const bool statistics = bringup::wants_draws();
++        media().ge.set_draw_sink([&renderer, &memory, statistics](const gpu::DrawCall &call) {
++            renderer.submit(call, memory);
++            if (statistics) bringup::on_draw(call);
++        });
++    } else if (bringup::wants_draws()) {
++        media().ge.set_draw_sink([](const gpu::DrawCall &call) { bringup::on_draw(call); });
+     }
++#else
++    if (bringup::wants_draws()) media().ge.set_draw_sink([](const gpu::DrawCall &call) { bringup::on_draw(call); });
+ #endif
++    bringup::on_list_run();
+     media().ge.set_transfer_sink([&rt](const gpu::BlockTransfer &transfer) { block_transfer(rt, transfer); });
+ 
+     bool finished = false;
+@@ -441,6 +452,8 @@ CtrlSample sample_ctrl() {
+         }
+     }
+ #endif
++    // A scripted pad (<prefix>_PAD_SCRIPT) is for runs without a window, and adds to a real one.
++    if (const auto scripted = bringup::scripted_buttons(kernel().now_us())) sample.buttons |= *scripted;
+     return sample;
+ }
+ 
+@@ -562,6 +575,27 @@ void register_display_ctrl(HleRegistrar &hle) {
+         trace_pacing("sceDisplaySetFrameBuf");
+         stall_watchdog::note_frame();
+         present_frame(rt);
++        bringup::on_flip(rt, media().display.framebuffer, media().display.pixel_format);
++        // <prefix>_FRAME_LIMIT_US=N: a flip comes at least N microseconds of
++        // emulated time after the one before, as with a frame limiter. A game
++        // that does not wait for the vblank then runs at the pace a display
++        // would give it (16683 for 60 Hz), where it otherwise measures frames
++        // that cost no emulated time at all.
++        static const std::uint64_t limit_us = [] {
++            const char *text = portablekit::env("FRAME_LIMIT_US");
++            return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
++        }();
++        if (limit_us != 0u) {
++            static std::uint64_t last_flip_us = 0u;
++            const std::uint64_t now = kernel().now_us();
++            const std::uint64_t due = last_flip_us + limit_us;
++            if (now < due && !rt.stopped()) {
++                last_flip_us = due;
++                kernel().delay_current(ctx, due - now, 0u);
++                return;
++            }
++            last_flip_us = now;
++        }
+         kernel().finish(ctx, 0u);
+     });
+ 
+@@ -1136,6 +1170,7 @@ void show_cpu_picture_in_vram(Runtime &rt, std::uint32_t address, std::uint32_t
+ }
+ 
+ void register_media(HleRegistrar &hle) {
++    bringup::install(hle.runtime(), media().ge);
+     initialize_renderer();
+     register_display_ctrl(hle);
+     register_vblank_waits(hle);
+diff --git a/host/hle/hle_threadman.cpp b/host/hle/hle_threadman.cpp
+index f4ec4b2..7bd3d08 100644
+--- a/host/hle/hle_threadman.cpp
++++ b/host/hle/hle_threadman.cpp
+@@ -971,17 +971,17 @@ void register_kernel_library(HleRegistrar &hle) {
+         const std::uint32_t sp = thread->uid == kernel().current_uid() ? ctx.gpr[29] : thread->context.gpr[29];
+         kernel().finish(ctx, sp > thread->stack_bottom ? sp - thread->stack_bottom : 0u);
+     });
+-    // sceKernelReferThreadProfiler(regs) and sceKernelReferGlobalProfiler(regs):
+-    // the hardware profiler's counters, PspDebugProfilerRegs in pspsdk's
+-    // pspdebug.h (20 words, `enable` first). A retail PSP has the profiler
+-    // off; here it reads as off with every counter 0. Vice City Stories and
+-    // PSP2i import them.
++    // sceKernelReferThreadProfiler() and sceKernelReferGlobalProfiler(): take no
++    // arguments and return a pointer to the hardware profiler's counters
++    // (PspDebugProfilerRegs in pspsdk's pspdebug.h), or NULL where there are
++    // none. A retail PSP has no profiler, so both return NULL and write
++    // nothing. Registers a0/a1 are whatever the caller last left in them, so
++    // reading them as a buffer pointer wrote through garbage (Infected passes
++    // a0 = 0x20 and stores the result as a pointer it checks for NULL).
++    // Vice City Stories and PSP2i import them.
+     for (const char *name : {"sceKernelReferThreadProfiler", "sceKernelReferGlobalProfiler"}) {
+-        hle.add("ThreadManForUser", name, [name](Runtime &rt, AllegrexContext &ctx) {
+-            log_once(std::string("profiler-") + name, std::string("[kernel] ") + name + " (UNVERIFIED: no game traced yet)");
+-            constexpr std::uint32_t kProfilerRegsBytes = 20u * 4u;
+-            if (const std::uint32_t regs = arg(ctx, 0); regs != 0u)
+-                for (std::uint32_t at = 0; at < kProfilerRegsBytes; at += 4u) rt.memory().store32(regs + at, 0u);
++        hle.add("ThreadManForUser", name, [name](Runtime &, AllegrexContext &ctx) {
++            log_once(std::string("profiler-") + name, std::string("[kernel] ") + name + " (UNVERIFIED: returns NULL, no profiler)");
+             kernel().finish(ctx, 0u);
+         });
+     }
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index a901f3a..e9c1be1 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -5,8 +5,10 @@
+ #include "kernel/stall_watchdog.hpp"
+ #include "kernel/load_trace.hpp"
+ #include "perf/frame_stats.hpp"
++#include "perf/bringup_stats.hpp"
+ #include "settings/settings.hpp"
+ #include "psprecomp/common.hpp"
++#include "psprecomp/interpreter.hpp"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -324,6 +326,7 @@ void Kernel::switch_to(AllegrexContext &ctx, Thread &thread) {
+ void Kernel::finish(AllegrexContext &ctx, std::uint32_t result) {
+     ctx.set_gpr(2, result);
+     if (interrupt_active_ || current_thread() == nullptr) return;
++    charge_instruction_time();
+     charge_busy_time();
+ 
+     if (interrupts_enabled_ && !pending_interrupts_.empty()) {
+@@ -405,6 +408,7 @@ void Kernel::wait_host(AllegrexContext &ctx, std::optional<std::uint64_t> timeou
+ }
+ 
+ void Kernel::schedule(AllegrexContext &ctx) {
++    bringup::check_limits(*runtime_);
+     if (poll_hook_) poll_hook_();
+     load_trace::run_as("idle");
+     for (;;) {
+@@ -697,6 +701,28 @@ std::string Kernel::describe_threads() const {
+     return report;
+ }
+ 
++// The guest's own computing takes no emulated time, which suits a game that
++// waits for the vblank each frame and does not suit one that measures its
++// frames. <prefix>_CPU_NS_PER_INSN=N charges N nanoseconds (fractions allowed)
++// for each instruction the interpreter has run since the last charge, at the
++// next system call that returns at once. The PSP's CPU runs at up to 333 MHz.
++void Kernel::charge_instruction_time() {
++    static const double ns_per_instruction = [] {
++        const char *text = portablekit::env("CPU_NS_PER_INSN");
++        return text != nullptr ? std::strtod(text, nullptr) : 0.0;
++    }();
++    if (ns_per_instruction <= 0.0) return;
++    const std::uint64_t total = psprecomp::interpreter_stats().instructions;
++    const std::uint64_t delta = total - charged_instructions_;
++    charged_instructions_ = total;
++    charged_remainder_ns_ += static_cast<std::uint64_t>(static_cast<double>(delta) * ns_per_instruction);
++    const std::uint64_t us = charged_remainder_ns_ / 1000u;
++    charged_remainder_ns_ %= 1000u;
++    if (us == 0u) return;
++    advance_clock(now_us_ + us);
++    process_timers();
++}
++
+ void Kernel::charge_busy_time() {
+     static const bool off = portablekit::env("NO_BUSY_CLOCK") != nullptr;
+     if (off || interrupt_active_ || current_thread() == nullptr) return;
+diff --git a/host/kernel/kernel.hpp b/host/kernel/kernel.hpp
+index d49fecc..bd502e9 100644
+--- a/host/kernel/kernel.hpp
++++ b/host/kernel/kernel.hpp
+@@ -375,6 +375,8 @@ public:
+     // (100 ms: longer than any frame of a game that waits for the vblank).
+     // <prefix>_NO_BUSY_CLOCK turns it off.
+     void charge_busy_time();
++    // <prefix>_CPU_NS_PER_INSN: emulated time passes with the instructions the interpreter runs.
++    void charge_instruction_time();
+ 
+     // Guest entry stubs.
+     void thread_exit_stub(AllegrexContext &ctx);
+@@ -416,6 +418,8 @@ private:
+     std::map<SceUID, std::unique_ptr<Thread>> threads_;
+     std::uint64_t now_us_{};
+     std::uint64_t waits_begun_{};  // waits begun, so a busy thread can tell it has not waited
++    std::uint64_t charged_instructions_{};
++    std::uint64_t charged_remainder_ns_{};
+     SceUID busy_thread_{};
+     std::uint64_t busy_waits_{};
+     std::chrono::steady_clock::time_point busy_since_{};
+diff --git a/host/main.cpp b/host/main.cpp
+index ebeb54d..4b5d74b 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -14,6 +14,7 @@
+ #include "install/user_data.hpp"
+ #include "gpu/ge_state.hpp"
+ #include "kernel/kernel.hpp"
++#include "perf/bringup_stats.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ #include "psprecomp/elf32.hpp"
+@@ -421,6 +422,7 @@ int main(int argc, char **argv) {
+ 
+         runtime.run(elf.runtime_entry(load_base), configured_max_dispatches());
+         std::cout << "Runtime stopped: " << runtime.stop_reason() << "\n";
++        portablekit::bringup::finish();
+         // Quit from the menu, a closed window or the game ending: the network
+         // threads stop here, while everything they use still exists.
+         portablekit::adhoc_shutdown();
+diff --git a/host/perf/bringup_stats.cpp b/host/perf/bringup_stats.cpp
+new file mode 100644
+index 0000000..6f4e428
+--- /dev/null
++++ b/host/perf/bringup_stats.cpp
+@@ -0,0 +1,626 @@
++#include "perf/bringup_stats.hpp"
++
++#include "perf/debug_raster.hpp"
++#include "profile.hpp"
++#include "kernel/kernel.hpp"
++
++#include "psprecomp/common.hpp"
++#include "psprecomp/interpreter.hpp"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <set>
++#include <sstream>
++#include <string>
++#include <tuple>
++#include <unordered_map>
++#include <vector>
++
++namespace portablekit::bringup {
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++struct PadStep {
++    bool in_flips{true};
++    std::uint64_t at{};
++    std::uint32_t buttons{};
++};
++
++struct FrameRow {
++    std::uint64_t flip{};
++    std::int64_t wall_ms{};
++    std::uint64_t emu_us{};
++    std::uint64_t vblank{};
++    std::uint64_t instructions{};
++    std::uint64_t calls{};
++    std::uint64_t lists{};
++    std::uint64_t draws{};
++    std::uint64_t vertices{};
++    std::uint32_t framebuffer{};
++    std::uint32_t format{};
++};
++
++// What the display lists of one phase asked of the GE.
++struct GeAggregate {
++    std::uint64_t lists{};
++    std::uint64_t draws{};
++    std::uint64_t vertices{};
++    std::uint64_t primitives{};
++    std::uint64_t through_draws{};
++    std::uint64_t skinned_draws{};
++    std::uint64_t morph_draws{};
++    std::uint64_t indexed_draws{};
++    std::uint64_t clear_draws{};
++    std::uint64_t textured_draws{};
++    std::uint64_t texture_from_vram{};
++    std::uint64_t uv_transform_draws{};
++    std::uint64_t blend_draws{};
++    std::uint64_t alpha_test_draws{};
++    std::uint64_t depth_test_draws{};
++    std::uint64_t depth_write_draws{};
++    std::uint64_t cull_draws{};
++    std::uint64_t lit_draws{};
++    std::uint64_t fog_draws{};
++    std::uint64_t transfers{};
++    std::uint64_t transfer_pixels{};
++    std::uint64_t transfers_from_vram{};
++    std::uint64_t transfers_to_vram{};
++    struct Format {
++        std::uint64_t draws{};
++        std::uint64_t vertices{};
++        std::uint32_t weights{};
++        std::uint32_t morphs{};
++        bool through{};
++    };
++    std::map<std::uint32_t, Format> vertex_types;
++    std::map<int, std::uint64_t> primitive_kinds;
++    std::map<std::string, std::uint64_t> texture_formats;
++    std::map<std::string, std::uint64_t> texture_sizes;
++    std::map<std::string, std::uint64_t> blend_modes;
++    std::map<std::string, std::uint64_t> targets;
++    std::map<std::string, std::uint64_t> clear_flags;
++    std::map<std::string, std::uint64_t> depth_functions;
++    std::map<std::string, std::uint64_t> alpha_functions;
++    std::map<std::string, std::uint64_t> texture_functions;
++    std::map<std::uint32_t, std::uint64_t> lights_enabled;
++    std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>> unique_textures;
++    std::array<std::uint64_t, 256> commands_at_start{};
++};
++
++struct State {
++    bool stats{};
++    bool hooked{};
++    std::filesystem::path dir;
++    std::vector<std::pair<std::string, std::uint64_t>> phases;
++    std::string final_name{"end"};
++    std::size_t phase_index{};
++    std::uint64_t flip{};
++    std::uint64_t max_frames{};
++    std::int64_t max_wall_ms{};
++    std::uint64_t max_emu_us{};
++    Clock::time_point start{Clock::now()};
++    std::uint64_t hook_calls{};
++    std::vector<PadStep> pad_script;
++    // <prefix>_TRACE_CALLS=name,name:N prints the first N calls (50 by default) to each import
++    // whose name contains one of those words, with the thread, time and arguments.
++    std::vector<std::string> trace_words;
++    std::uint64_t trace_limit{50};
++    std::uint64_t trace_from_flip{};
++    std::unordered_map<std::string, std::uint64_t> trace_seen;
++    std::unordered_map<std::string, std::string> names;
++    psprecomp::Runtime *runtime{};
++    const gpu::GeState *ge{};
++    bool finished{};
++
++    // Per phase.
++    std::vector<FrameRow> rows;
++    std::unordered_map<std::string, std::uint64_t> calls;
++    std::vector<std::pair<std::uint64_t, std::unordered_map<std::string, std::uint32_t>>> per_frame_calls;
++    std::unordered_map<std::string, std::uint32_t> frame_calls;
++    GeAggregate ge_total;
++    std::uint64_t phase_first_flip{1};
++
++    // Running totals the rows are differences of.
++    std::uint64_t last_instructions{};
++    std::uint64_t last_calls{};
++    std::uint64_t total_calls{};
++    std::uint64_t last_lists{};
++    std::uint64_t last_draws{};
++    std::uint64_t last_vertices{};
++    std::uint64_t all_lists{};
++    std::uint64_t all_draws{};
++    std::uint64_t all_vertices{};
++};
++
++State &state() {
++    static State value;
++    return value;
++}
++
++std::uint64_t env_number(const char *name, std::uint64_t fallback = 0u) {
++    const char *text = portablekit::env(name);
++    if (text == nullptr || *text == '\0') return fallback;
++    return std::strtoull(text, nullptr, 0);
++}
++
++std::vector<std::string> split(const std::string &text, char separator) {
++    std::vector<std::string> out;
++    std::string item;
++    std::istringstream stream(text);
++    while (std::getline(stream, item, separator))
++        if (!item.empty()) out.push_back(item);
++    return out;
++}
++
++std::uint32_t button_by_name(const std::string &name) {
++    static const std::map<std::string, std::uint32_t> names = {
++        {"SELECT", 0x0001u}, {"START", 0x0008u},   {"UP", 0x0010u},        {"RIGHT", 0x0020u},
++        {"DOWN", 0x0040u},   {"LEFT", 0x0080u},    {"L", 0x0100u},         {"LTRIGGER", 0x0100u},
++        {"R", 0x0200u},      {"RTRIGGER", 0x0200u}, {"TRIANGLE", 0x1000u}, {"CIRCLE", 0x2000u},
++        {"CROSS", 0x4000u},  {"SQUARE", 0x8000u},   {"HOME", 0x10000u},    {"NONE", 0u},
++        {"-", 0u}};
++    std::string upper = name;
++    for (char &c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++    if (const auto found = names.find(upper); found != names.end()) return found->second;
++    return static_cast<std::uint32_t>(std::strtoul(name.c_str(), nullptr, 0));
++}
++
++void parse_pad_script(State &s, const char *text) {
++    for (const std::string &entry : split(text, ',')) {
++        const std::size_t colon = entry.find(':');
++        if (colon == std::string::npos) continue;
++        PadStep step;
++        std::string at = entry.substr(0, colon);
++        if (at.size() > 2 && at.compare(at.size() - 2, 2, "ms") == 0) {
++            step.in_flips = false;
++            step.at = std::strtoull(at.c_str(), nullptr, 10) * 1000u;
++        } else if (!at.empty() && at.back() == 's') {
++            step.in_flips = false;
++            step.at = static_cast<std::uint64_t>(std::strtod(at.c_str(), nullptr) * 1'000'000.0);
++        } else {
++            step.at = std::strtoull(at.c_str(), nullptr, 10);
++        }
++        for (const std::string &name : split(entry.substr(colon + 1u), '+')) step.buttons |= button_by_name(name);
++        s.pad_script.push_back(step);
++    }
++}
++
++std::string hex(std::uint32_t value) {
++    char text[16];
++    std::snprintf(text, sizeof(text), "0x%08X", value);
++    return text;
++}
++
++// ---------------------------------------------------------------------------
++// Import calls
++
++void pre_import(psprecomp::Runtime &runtime, std::string_view library, std::uint32_t nid, psprecomp::AllegrexContext &ctx) {
++    State &s = state();
++    if ((++s.hook_calls & 0x3FFu) == 0u) check_limits(runtime);
++    if (!s.trace_words.empty()) {
++        std::string id(library);
++        id += '|';
++        id += std::to_string(nid);
++        auto found = s.names.find(id);
++        if (found == s.names.end()) {
++            const auto resolved = runtime.nids().resolve(std::string(library), nid);
++            found = s.names.emplace(id, std::string(library) + "::" + resolved.value_or(hex(nid))).first;
++        }
++        const std::string &name = found->second;
++        for (const std::string &word : s.trace_words) {
++            if (name.find(word) == std::string::npos) continue;
++            if (s.flip < s.trace_from_flip) break;
++            if (++s.trace_seen[name] > s.trace_limit) break;
++            const psprecomp::AllegrexContext &c = ctx;
++            // File names are what tell a level load from a menu; show them.
++            if (name.find("sceIoOpen") != std::string::npos || name.find("sceIoGetstat") != std::string::npos ||
++                name.find("sceIoDopen") != std::string::npos)
++                std::printf("[path] \"%s\"\n", runtime.memory().read_c_string(c.gpr[4], 200u).c_str());
++            std::printf("[call] %10llu us v%-6llu f%-5llu %-14s %s a0=%08X a1=%08X a2=%08X a3=%08X ra=%08X\n",
++                        static_cast<unsigned long long>(kernel().now_us()),
++                        static_cast<unsigned long long>(kernel().vblank_count()),
++                        static_cast<unsigned long long>(s.flip), psprecomp::runtime_thread_name(), name.c_str(),
++                        c.gpr[4], c.gpr[5], c.gpr[6], c.gpr[7], c.gpr[31]);
++            break;
++        }
++    }
++    if (!s.stats) return;
++    std::string key = psprecomp::runtime_thread_name();
++    key += '\t';
++    key += library;
++    key += '\t';
++    key += hex(nid);
++    ++s.calls[key];
++    ++s.frame_calls[key];
++    ++s.total_calls;
++}
++
++// ---------------------------------------------------------------------------
++// Writing a phase
++
++std::string library_of(const std::string &key) {
++    const std::size_t a = key.find('\t');
++    const std::size_t b = key.find('\t', a + 1u);
++    return key.substr(a + 1u, b - a - 1u);
++}
++std::string thread_of(const std::string &key) { return key.substr(0, key.find('\t')); }
++std::uint32_t nid_of(const std::string &key) {
++    return static_cast<std::uint32_t>(std::strtoul(key.substr(key.rfind('\t') + 1u).c_str(), nullptr, 16));
++}
++std::string name_of(const State &s, const std::string &key) {
++    const std::string library = library_of(key);
++    const std::uint32_t nid = nid_of(key);
++    const auto resolved = s.runtime != nullptr ? s.runtime->nids().resolve(library, nid) : std::nullopt;
++    return library + "::" + resolved.value_or(hex(nid));
++}
++
++const char *texture_format_name(gpu::TextureFormat format) {
++    switch (format) {
++    case gpu::TextureFormat::Rgba5650: return "5650";
++    case gpu::TextureFormat::Rgba5551: return "5551";
++    case gpu::TextureFormat::Rgba4444: return "4444";
++    case gpu::TextureFormat::Rgba8888: return "8888";
++    case gpu::TextureFormat::Clut4: return "CLUT4";
++    case gpu::TextureFormat::Clut8: return "CLUT8";
++    case gpu::TextureFormat::Clut16: return "CLUT16";
++    case gpu::TextureFormat::Clut32: return "CLUT32";
++    case gpu::TextureFormat::Dxt1: return "DXT1";
++    case gpu::TextureFormat::Dxt3: return "DXT3";
++    case gpu::TextureFormat::Dxt5: return "DXT5";
++    }
++    return "?";
++}
++
++const char *primitive_name(int kind) {
++    static const char *names[] = {"points", "lines", "line_strip", "triangles", "triangle_strip", "triangle_fan", "sprites"};
++    return kind >= 0 && kind < 7 ? names[kind] : "?";
++}
++
++bool in_vram(std::uint32_t address) {
++    const std::uint32_t masked = address & 0x1FFFFFFFu;
++    return masked >= 0x04000000u && masked < 0x04200000u;
++}
++
++std::string describe_vertex_type(std::uint32_t vt) {
++    static const char *texcoord[] = {"-", "u8", "s16", "f32"};
++    static const char *color[] = {"-", "?", "?", "?", "5650", "5551", "4444", "8888"};
++    static const char *normal[] = {"-", "s8", "s16", "f32"};
++    static const char *position[] = {"-", "s8", "s16", "f32"};
++    static const char *weight[] = {"-", "u8", "u16", "f32"};
++    static const char *index[] = {"-", "u8", "u16", "?"};
++    std::ostringstream out;
++    out << "tex=" << texcoord[vt & 3u] << " col=" << color[(vt >> 2u) & 7u] << " nrm=" << normal[(vt >> 5u) & 3u]
++        << " pos=" << position[(vt >> 7u) & 3u] << " wgt=" << weight[(vt >> 9u) & 3u] << " idx=" << index[(vt >> 11u) & 3u];
++    if (((vt >> 9u) & 3u) != 0u) out << " bones=" << (((vt >> 14u) & 7u) + 1u);
++    if (((vt >> 18u) & 7u) != 0u) out << " morph=" << (((vt >> 18u) & 7u) + 1u);
++    out << (((vt >> 23u) & 1u) != 0u ? " THROUGH" : " transformed");
++    return out.str();
++}
++
++void write_ge(const State &s, const std::string &phase, std::uint64_t flips) {
++    const GeAggregate &g = s.ge_total;
++    std::ofstream out(s.dir / ("ge_" + phase + ".txt"));
++    const double per = flips != 0u ? 1.0 / static_cast<double>(flips) : 0.0;
++    out << "phase " << phase << ": " << flips << " flips\n";
++    out << "display list runs " << g.lists << " (" << g.lists * per << " per flip)\n";
++    out << "draws " << g.draws << " (" << g.draws * per << " per flip), vertices decoded " << g.vertices << " ("
++        << g.vertices * per << " per flip), primitives " << g.primitives << " (" << g.primitives * per << " per flip)\n";
++    out << "draws: through-mode " << g.through_draws << ", skinned " << g.skinned_draws << ", morph " << g.morph_draws
++        << ", indexed " << g.indexed_draws << ", clear-mode " << g.clear_draws << "\n";
++    out << "draws: textured " << g.textured_draws << " (texture in VRAM " << g.texture_from_vram << ", UV transform "
++        << g.uv_transform_draws << "), blended " << g.blend_draws << ", alpha-tested " << g.alpha_test_draws
++        << ", depth-tested " << g.depth_test_draws << ", depth-writing " << g.depth_write_draws << ", culled "
++        << g.cull_draws << ", lit " << g.lit_draws << ", fogged " << g.fog_draws << "\n";
++    out << "unique textures (address, size, format, clut) " << g.unique_textures.size() << "\n";
++    out << "block transfers " << g.transfers << " (" << g.transfer_pixels << " pixels; from VRAM " << g.transfers_from_vram
++        << ", to VRAM " << g.transfers_to_vram << ")\n";
++    const auto dump_map = [&](const char *title, const std::map<std::string, std::uint64_t> &values) {
++        out << title << "\n";
++        std::vector<std::pair<std::string, std::uint64_t>> sorted(values.begin(), values.end());
++        std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        for (const auto &[name, count] : sorted) out << "  " << count << "  " << name << "\n";
++    };
++    out << "primitive kinds\n";
++    for (const auto &[kind, count] : g.primitive_kinds) out << "  " << count << "  " << primitive_name(kind) << "\n";
++    dump_map("texture formats (draws)", g.texture_formats);
++    dump_map("texture sizes (draws)", g.texture_sizes);
++    dump_map("texture functions (draws)", g.texture_functions);
++    dump_map("blend (equation src dst, draws)", g.blend_modes);
++    dump_map("alpha test functions (draws)", g.alpha_functions);
++    dump_map("depth functions (draws)", g.depth_functions);
++    dump_map("clear flags (draws)", g.clear_flags);
++    dump_map("render targets (color address, format, stride; draws)", g.targets);
++    out << "lights enabled (draws)\n";
++    for (const auto &[count, draws] : g.lights_enabled) out << "  " << draws << "  " << count << " lights\n";
++    out << "vertex types (draws, vertices)\n";
++    std::vector<std::pair<std::uint32_t, GeAggregate::Format>> types(g.vertex_types.begin(), g.vertex_types.end());
++    std::sort(types.begin(), types.end(), [](const auto &a, const auto &b) { return a.second.vertices > b.second.vertices; });
++    for (const auto &[vt, format] : types)
++        out << "  " << hex(vt) << "  " << format.draws << " draws " << format.vertices << " vertices  " << describe_vertex_type(vt) << "\n";
++    out << "GE commands (byte, count over the phase)\n";
++    if (s.ge != nullptr) {
++        const auto &now = s.ge->command_counts();
++        for (std::size_t command = 0; command < 256u; ++command) {
++            const std::uint64_t count = now[command] - g.commands_at_start[command];
++            if (count != 0u) {
++                char line[64];
++                std::snprintf(line, sizeof(line), "  0x%02zX  %llu\n", command, static_cast<unsigned long long>(count));
++                out << line;
++            }
++        }
++    }
++}
++
++void flush_phase(const std::string &phase) {
++    State &s = state();
++    if (!s.stats) return;
++    std::error_code ec;
++    std::filesystem::create_directories(s.dir, ec);
++    const std::uint64_t flips = s.rows.size();
++    {
++        std::ofstream out(s.dir / ("frames_" + phase + ".csv"));
++        out << "flip,wall_ms,emu_us,vblank,instructions,hle_calls,lists,draws,vertices,framebuffer,format\n";
++        for (const FrameRow &row : s.rows)
++            out << row.flip << ',' << row.wall_ms << ',' << row.emu_us << ',' << row.vblank << ',' << row.instructions << ','
++                << row.calls << ',' << row.lists << ',' << row.draws << ',' << row.vertices << ',' << hex(row.framebuffer)
++                << ',' << row.format << '\n';
++    }
++    {
++        std::vector<std::pair<std::string, std::uint64_t>> sorted(s.calls.begin(), s.calls.end());
++        std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        std::ofstream out(s.dir / ("calls_" + phase + ".csv"));
++        out << "thread,import,count\n";
++        for (const auto &[key, count] : sorted) out << thread_of(key) << ',' << name_of(s, key) << ',' << count << '\n';
++    }
++    {
++        std::ofstream out(s.dir / ("calls_per_frame_" + phase + ".txt"));
++        for (const auto &[flip, calls] : s.per_frame_calls) {
++            std::vector<std::pair<std::string, std::uint32_t>> sorted(calls.begin(), calls.end());
++            std::sort(sorted.begin(), sorted.end());
++            out << flip << ':';
++            for (const auto &[key, count] : sorted) out << ' ' << thread_of(key) << '|' << name_of(s, key) << '=' << count;
++            out << '\n';
++        }
++    }
++    if (psprecomp::interpreter_pc_profile_enabled()) {
++        auto counts = psprecomp::interpreter_pc_profile(true);
++        std::sort(counts.begin(), counts.end());
++        std::ofstream out(s.dir / ("pc_" + phase + ".csv"));
++        for (const auto &[pc, count] : counts) {
++            char line[48];
++            std::snprintf(line, sizeof(line), "%08x,%llu\n", pc, static_cast<unsigned long long>(count));
++            out << line;
++        }
++    }
++    write_ge(s, phase, flips);
++    std::cerr << "[stats] phase '" << phase << "': " << flips << " flips -> " << s.dir.string() << "\n";
++    // The next phase starts here.
++    s.rows.clear();
++    s.calls.clear();
++    s.per_frame_calls.clear();
++    s.ge_total = GeAggregate{};
++    if (s.ge != nullptr) s.ge_total.commands_at_start = s.ge->command_counts();
++}
++
++} // namespace
++
++bool enabled() { return state().stats; }
++
++std::uint64_t flip_count() { return state().flip; }
++
++void install(psprecomp::Runtime &runtime, const gpu::GeState &ge) {
++    State &s = state();
++    s.runtime = &runtime;
++    s.ge = &ge;
++    raster::install(runtime.memory());
++    s.start = Clock::now();
++    if (const char *dir = portablekit::env("STATS"); dir != nullptr && *dir != '\0') {
++        s.stats = true;
++        s.dir = dir;
++        if (const char *phases = portablekit::env("STATS_PHASES"); phases != nullptr)
++            for (const std::string &item : split(phases, ',')) {
++                const std::size_t at = item.find('@');
++                if (at == std::string::npos) continue;
++                s.phases.emplace_back(item.substr(0, at), std::strtoull(item.c_str() + at + 1u, nullptr, 10));
++            }
++        if (const char *name = portablekit::env("STATS_FINAL"); name != nullptr && *name != '\0') s.final_name = name;
++        s.ge_total.commands_at_start = ge.command_counts();
++        // Instructions per address is what makes the hot-function list.
++        psprecomp::set_interpreter_pc_profile(true);
++    }
++    s.max_frames = env_number("MAX_FRAMES");
++    s.max_wall_ms = static_cast<std::int64_t>(env_number("MAX_WALL")) * 1000;
++    s.max_emu_us = env_number("MAX_EMU") * 1'000'000u;
++    if (const char *script = portablekit::env("PAD_SCRIPT"); script != nullptr) parse_pad_script(s, script);
++    if (const char *calls = portablekit::env("TRACE_CALLS"); calls != nullptr && *calls != '\0') {
++        std::string list = calls;
++        if (const std::size_t colon = list.find(':'); colon != std::string::npos) {
++            s.trace_limit = std::strtoull(list.c_str() + colon + 1u, nullptr, 10);
++            list.resize(colon);
++        }
++        s.trace_words = split(list, ',');
++        s.trace_from_flip = env_number("TRACE_FROM_FLIP");
++    }
++    if (s.stats || !s.trace_words.empty() || s.max_frames != 0u || s.max_wall_ms != 0 || s.max_emu_us != 0u) {
++        psprecomp::set_runtime_pre_import_hook(&pre_import);
++        s.hooked = true;
++    }
++    if (s.stats)
++        std::cout << "Bring-up statistics: " << s.dir.string() << " (" << s.phases.size() << " phases before '"
++                  << s.final_name << "')\n";
++}
++
++void check_limits(psprecomp::Runtime &runtime) {
++    State &s = state();
++    if (!s.hooked || runtime.stopped()) return;
++    if (s.max_wall_ms != 0) {
++        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - s.start).count();
++        if (ms >= s.max_wall_ms) {
++            runtime.stop("wall-clock limit (" + portablekit::env_name("MAX_WALL") + ")");
++            return;
++        }
++    }
++    if (s.max_emu_us != 0u && kernel().now_us() >= s.max_emu_us)
++        runtime.stop("emulated-time limit (" + portablekit::env_name("MAX_EMU") + ")");
++}
++
++void on_flip(psprecomp::Runtime &runtime, std::uint32_t framebuffer, std::uint32_t pixel_format) {
++    State &s = state();
++    ++s.flip;
++    raster::flip(s.flip, framebuffer, pixel_format);
++    if (!s.hooked) return;
++    if (s.stats) {
++        FrameRow row;
++        row.flip = s.flip;
++        row.wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - s.start).count();
++        row.emu_us = kernel().now_us();
++        row.vblank = kernel().vblank_count();
++        const std::uint64_t instructions = psprecomp::interpreter_stats().instructions;
++        row.instructions = instructions - s.last_instructions;
++        s.last_instructions = instructions;
++        row.calls = s.total_calls - s.last_calls;
++        s.last_calls = s.total_calls;
++        row.lists = s.all_lists - s.last_lists;
++        s.last_lists = s.all_lists;
++        row.draws = s.all_draws - s.last_draws;
++        s.last_draws = s.all_draws;
++        row.vertices = s.all_vertices - s.last_vertices;
++        s.last_vertices = s.all_vertices;
++        row.framebuffer = framebuffer;
++        row.format = pixel_format;
++        s.rows.push_back(row);
++        s.per_frame_calls.emplace_back(s.flip, std::move(s.frame_calls));
++        s.frame_calls.clear();
++        if (s.phase_index < s.phases.size() && s.flip >= s.phases[s.phase_index].second) {
++            flush_phase(s.phases[s.phase_index].first);
++            ++s.phase_index;
++        }
++    }
++    if (s.max_frames != 0u && s.flip >= s.max_frames && !runtime.stopped())
++        runtime.stop("frame limit (" + portablekit::env_name("MAX_FRAMES") + ")");
++    check_limits(runtime);
++}
++
++bool wants_draws() { return state().stats || raster::enabled(); }
++
++void on_list_run() {
++    State &s = state();
++    if (!s.stats) return;
++    ++s.ge_total.lists;
++    ++s.all_lists;
++}
++
++void on_transfer(const gpu::BlockTransfer &transfer) {
++    State &s = state();
++    raster::transfer(transfer);
++    if (!s.stats) return;
++    GeAggregate &g = s.ge_total;
++    ++g.transfers;
++    g.transfer_pixels += static_cast<std::uint64_t>(transfer.width) * transfer.height;
++    if (in_vram(transfer.source)) ++g.transfers_from_vram;
++    if (in_vram(transfer.destination)) ++g.transfers_to_vram;
++}
++
++void on_draw(const gpu::DrawCall &call) {
++    State &s = state();
++    raster::draw(call);
++    if (!s.stats) return;
++    GeAggregate &g = s.ge_total;
++    ++g.draws;
++    ++s.all_draws;
++    const std::uint64_t vertices = call.vertices.size() + call.raw_count;
++    g.vertices += vertices;
++    s.all_vertices += vertices;
++    g.primitives += call.primitive_count;
++    ++g.primitive_kinds[static_cast<int>(call.primitive)];
++    const std::uint32_t vt = call.vertex_type;
++    GeAggregate::Format &format = g.vertex_types[vt];
++    ++format.draws;
++    format.vertices += vertices;
++    if (call.through) ++g.through_draws;
++    if (((vt >> 9u) & 3u) != 0u) ++g.skinned_draws;
++    if (((vt >> 18u) & 7u) != 0u) ++g.morph_draws;
++    if (!call.indices.empty() || ((vt >> 11u) & 3u) != 0u) ++g.indexed_draws;
++    if (call.clear_mode) {
++        ++g.clear_draws;
++        ++g.clear_flags["0x" + std::to_string(call.clear_flags)];
++    }
++    char buffer[96];
++    std::snprintf(buffer, sizeof(buffer), "%08X fmt=%u stride=%u depth=%08X", call.target.color_address,
++                  call.target.color_format, call.target.color_stride, call.target.depth_address);
++    ++g.targets[buffer];
++    if (call.texture.enabled && !call.clear_mode) {
++        ++g.textured_draws;
++        const std::string name = std::string(texture_format_name(call.texture.format)) +
++                                 (call.texture.swizzled ? " swizzled" : " linear");
++        ++g.texture_formats[name];
++        std::snprintf(buffer, sizeof(buffer), "%ux%u", call.texture.width, call.texture.height);
++        ++g.texture_sizes[buffer];
++        std::snprintf(buffer, sizeof(buffer), "TFX=%u TCC=%u", call.texture.function, call.texture.alpha_from_texture ? 1u : 0u);
++        ++g.texture_functions[buffer];
++        if (in_vram(call.texture.address)) ++g.texture_from_vram;
++        g.unique_textures.insert({call.texture.address, call.texture.width, call.texture.height,
++                                  static_cast<std::uint32_t>(call.texture.format), call.texture.clut_address});
++        static constexpr std::array<float, 16> identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++        if (call.texture_matrix != identity || call.texture.scale_u != 1.0f || call.texture.scale_v != 1.0f ||
++            call.texture.offset_u != 0.0f || call.texture.offset_v != 0.0f)
++            ++g.uv_transform_draws;
++    }
++    if (call.blend.enabled && !call.clear_mode) {
++        ++g.blend_draws;
++        std::snprintf(buffer, sizeof(buffer), "eq=%u src=%u dst=%u fixed=%06X/%06X", call.blend.equation,
++                      call.blend.source_factor, call.blend.destination_factor, call.blend.fixed_source,
++                      call.blend.fixed_destination);
++        ++g.blend_modes[buffer];
++    }
++    if (call.alpha_test.enabled && !call.clear_mode) {
++        ++g.alpha_test_draws;
++        std::snprintf(buffer, sizeof(buffer), "func=%u ref=%u", call.alpha_test.function, call.alpha_test.reference);
++        ++g.alpha_functions[buffer];
++    }
++    if (call.depth.test_enabled && !call.clear_mode) {
++        ++g.depth_test_draws;
++        std::snprintf(buffer, sizeof(buffer), "func=%u", call.depth.function);
++        ++g.depth_functions[buffer];
++    }
++    if (call.depth.write_enabled && !call.clear_mode) ++g.depth_write_draws;
++    if (call.culling_enabled) ++g.cull_draws;
++    if (call.lighting_enabled && !call.through) {
++        ++g.lit_draws;
++        std::uint32_t lights = 0u;
++        for (const gpu::LightState &light : call.lighting.lights)
++            if (light.enabled) ++lights;
++        ++g.lights_enabled[lights];
++    }
++    if (call.fog.enabled) ++g.fog_draws;
++}
++
++std::optional<std::uint32_t> scripted_buttons(std::uint64_t emulated_us) {
++    const State &s = state();
++    if (s.pad_script.empty()) return std::nullopt;
++    std::optional<std::uint32_t> buttons;
++    for (const PadStep &step : s.pad_script) {
++        const std::uint64_t now = step.in_flips ? s.flip : emulated_us;
++        if (now >= step.at) buttons = step.buttons;
++    }
++    return buttons;
++}
++
++void finish() {
++    State &s = state();
++    if (s.finished) return;
++    s.finished = true;
++    if (!s.stats) return;
++    flush_phase(s.final_name);
++    std::cerr << "[stats] " << s.flip << " flips, " << s.total_calls << " import calls in all\n";
++}
++
++} // namespace portablekit::bringup
+diff --git a/host/perf/bringup_stats.hpp b/host/perf/bringup_stats.hpp
+new file mode 100644
+index 0000000..b06c2a1
+--- /dev/null
++++ b/host/perf/bringup_stats.hpp
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include "gpu/ge_state.hpp"
++#include "psprecomp/runtime.hpp"
++
++#include <cstdint>
++#include <optional>
++
++// Numbers for bringing a game up, collected without a window or a renderer:
++// what the game calls and how often, per frame and per phase; how many
++// instructions it runs between flips; where those instructions are; and what
++// its display lists ask of the GE. All of it is off unless <prefix>_STATS names
++// a directory to write into, and none of it changes what the guest sees.
++//
++//   <prefix>_STATS=<dir>          switch everything on, write into <dir>
++//   <prefix>_STATS_PHASES=a@N,b@M  end the phase called `a` at flip N and `b` at
++//                                 flip M; each phase gets its own files. The
++//                                 last one, named by <prefix>_STATS_FINAL
++//                                 ("end" by default), ends when the run does.
++//   <prefix>_MAX_FRAMES=N         stop after N flips (sceDisplaySetFrameBuf)
++//   <prefix>_MAX_WALL=S           stop after S seconds of real time
++//   <prefix>_MAX_EMU=S            stop after S seconds of emulated time
++//   <prefix>_PAD_SCRIPT=...       scripted pad for a run without a window:
++//                                 `<at>:<buttons>,...`, where <at> is a flip
++//                                 number, or a time with a ms or s suffix of
++//                                 emulated time, and <buttons> is names joined
++//                                 by + (CROSS, START, ...), a number, or `-`
++//                                 for none. A line holds until the next.
++//
++//   <prefix>_TRACE_CALLS=word,word:N prints the first N calls to each import whose
++//                                 `Library::name` contains a word (file names for
++//                                 sceIoOpen and friends); <prefix>_TRACE_FROM_FLIP=F
++//                                 starts counting at flip F.
++//
++// Files, per phase <p>: frames_<p>.csv (one row per flip), calls_<p>.csv (every
++// import by calling thread), calls_per_frame_<p>.txt (the imports of each
++// flip), pc_<p>.csv (instructions per guest address) and ge_<p>.txt.
++namespace portablekit::bringup {
++
++[[nodiscard]] bool enabled();
++// Binds the hooks; called once the system is installed.
++void install(psprecomp::Runtime &runtime, const gpu::GeState &ge);
++// A flip: the guest called sceDisplaySetFrameBuf.
++void on_flip(psprecomp::Runtime &runtime, std::uint32_t framebuffer, std::uint32_t pixel_format);
++// Checks the run limits; cheap, called wherever the kernel schedules.
++void check_limits(psprecomp::Runtime &runtime);
++// The GE side: whether draws are wanted, and the draws, transfers and lists.
++[[nodiscard]] bool wants_draws();
++void on_draw(const gpu::DrawCall &call);
++void on_transfer(const gpu::BlockTransfer &transfer);
++void on_list_run();
++// The pad the script gives at this moment, if there is a script.
++[[nodiscard]] std::optional<std::uint32_t> scripted_buttons(std::uint64_t emulated_us);
++[[nodiscard]] std::uint64_t flip_count();
++// Writes the last phase's files.
++void finish();
++
++} // namespace portablekit::bringup
+diff --git a/host/perf/debug_raster.cpp b/host/perf/debug_raster.cpp
+new file mode 100644
+index 0000000..614045c
+--- /dev/null
++++ b/host/perf/debug_raster.cpp
+@@ -0,0 +1,522 @@
++#include "perf/debug_raster.hpp"
++
++#include "gpu/texture_decode.hpp"
++#include "profile.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace portablekit::bringup::raster {
++namespace {
++
++using gpu::DrawCall;
++using gpu::PrimitiveType;
++using gpu::Vertex;
++
++constexpr std::uint32_t kHeight = 272u;
++
++struct Shadow {
++    std::uint32_t stride{512u};
++    std::uint32_t format{3u};
++    std::vector<std::uint32_t> color;  // 0xAABBGGRR
++    std::vector<float> depth;
++};
++
++struct Range {
++    std::uint64_t first{};
++    std::uint64_t last{};
++    std::uint64_t step{1u};
++};
++
++struct State {
++    bool on{};
++    const psprecomp::GuestMemory *memory{};
++    std::filesystem::path dir;
++    std::vector<Range> ranges;
++    std::uint64_t every{};
++    std::map<std::uint32_t, Shadow> targets;
++    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> textures;
++    std::uint64_t texture_flip{~0ull};
++};
++
++State &state() {
++    static State s;
++    return s;
++}
++
++std::uint32_t key_of(std::uint32_t address) {
++    const std::uint32_t masked = address & 0x1FFFFFFFu;
++    // Video memory is 2 MiB, seen at 0x04000000 and its mirrors.
++    if ((masked >> 24u) == 0x04u || masked < 0x00200000u) return masked & 0x001FFFFFu;
++    return address;
++}
++
++Shadow &target_for(std::uint32_t address, std::uint32_t stride, std::uint32_t format) {
++    Shadow &shadow = state().targets[key_of(address)];
++    if (shadow.color.empty() || shadow.stride != stride) {
++        shadow.stride = stride;
++        shadow.color.assign(static_cast<std::size_t>(stride) * kHeight, 0xFF000000u);
++        shadow.depth.assign(static_cast<std::size_t>(stride) * kHeight, 1.0e30f);
++    }
++    shadow.format = format;
++    return shadow;
++}
++
++std::array<float, 4> mul_vec(const std::array<float, 16> &m, const std::array<float, 4> &v) {
++    std::array<float, 4> out{};
++    for (int r = 0; r < 4; ++r) out[r] = m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
++    return out;
++}
++
++struct Screen {
++    float x{}, y{}, z{}, inv_w{1.0f};
++    float u{}, v{};
++    std::array<float, 4> color{};  // 0..1, rgba
++};
++
++std::array<float, 4> unpack(std::uint32_t c) {
++    return {static_cast<float>(c & 0xFFu) / 255.0f, static_cast<float>((c >> 8u) & 0xFFu) / 255.0f,
++            static_cast<float>((c >> 16u) & 0xFFu) / 255.0f, static_cast<float>(c >> 24u) / 255.0f};
++}
++
++std::uint32_t pack(const std::array<float, 4> &c) {
++    const auto q = [](float f) { return static_cast<std::uint32_t>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
++    return q(c[0]) | (q(c[1]) << 8u) | (q(c[2]) << 16u) | (q(c[3]) << 24u);
++}
++
++float blend_factor(std::uint32_t code, bool source_side, const std::array<float, 4> &src, const std::array<float, 4> &dst,
++                   std::uint32_t fixed, int channel) {
++    const float sa = src[3], da = dst[3];
++    switch (code) {
++    case 0u: return source_side ? dst[channel] : src[channel];
++    case 1u: return 1.0f - (source_side ? dst[channel] : src[channel]);
++    case 2u: return sa;
++    case 3u: return 1.0f - sa;
++    case 4u: return da;
++    case 5u: return 1.0f - da;
++    case 6u: return 2.0f * sa;
++    case 7u: return 1.0f - 2.0f * sa;
++    case 8u: return 2.0f * da;
++    case 9u: return 1.0f - 2.0f * da;
++    case 10u: return unpack(fixed)[channel];
++    default: return 1.0f;
++    }
++}
++
++bool test_function(std::uint32_t function, float a, float b) {
++    switch (function) {
++    case 0u: return false;
++    case 1u: return true;
++    case 2u: return a == b;
++    case 3u: return a != b;
++    case 4u: return a < b;
++    case 5u: return a <= b;
++    case 6u: return a > b;
++    case 7u: return a >= b;
++    default: return true;
++    }
++}
++
++const std::vector<std::uint32_t> *texture_pixels(const DrawCall &call, std::uint64_t flip) {
++    State &s = state();
++    if (s.texture_flip != flip) {
++        s.textures.clear();
++        s.texture_flip = flip;
++    }
++    const std::uint64_t key = gpu::texture_key(*s.memory, call.texture);
++    auto found = s.textures.find(key);
++    if (found == s.textures.end()) {
++        std::vector<std::uint32_t> pixels;
++        if (!gpu::decode_texture(*s.memory, call.texture, pixels)) pixels.clear();
++        found = s.textures.emplace(key, std::move(pixels)).first;
++    }
++    return found->second.empty() ? nullptr : &found->second;
++}
++
++std::uint64_t g_flip_for_cache = 0;
++
++struct Pipeline {
++    const DrawCall &call;
++    Shadow &target;
++    const std::vector<std::uint32_t> *texels{};
++    std::uint32_t scissor_x1{}, scissor_y1{}, scissor_x2{}, scissor_y2{};
++
++    std::array<float, 4> sample(float u, float v) const {
++        const std::uint32_t w = call.texture.width, h = call.texture.height;
++        float fu = u, fv = v;
++        if (!call.through) {
++            fu = u * static_cast<float>(w);
++            fv = v * static_cast<float>(h);
++        }
++        auto wrap = [](float t, std::uint32_t size, bool clamp) {
++            auto i = static_cast<std::int64_t>(std::floor(t));
++            if (clamp) return static_cast<std::uint32_t>(std::clamp<std::int64_t>(i, 0, size - 1u));
++            const auto m = static_cast<std::int64_t>(size);
++            return static_cast<std::uint32_t>(((i % m) + m) % m);
++        };
++        const std::uint32_t x = wrap(fu, w, call.texture.wrap_s != 0u);
++        const std::uint32_t y = wrap(fv, h, call.texture.wrap_t != 0u);
++        return unpack((*texels)[static_cast<std::size_t>(y) * w + x]);
++    }
++
++    void plot(std::int32_t x, std::int32_t y, float z, std::array<float, 4> color, float u, float v) {
++        if (x < static_cast<std::int32_t>(scissor_x1) || x > static_cast<std::int32_t>(scissor_x2) ||
++            y < static_cast<std::int32_t>(scissor_y1) || y > static_cast<std::int32_t>(scissor_y2))
++            return;
++        if (x < 0 || y < 0 || x >= static_cast<std::int32_t>(target.stride) || y >= static_cast<std::int32_t>(kHeight)) return;
++        const std::size_t at = static_cast<std::size_t>(y) * target.stride + static_cast<std::size_t>(x);
++        if (texels != nullptr) {
++            const std::array<float, 4> t = sample(u, v);
++            switch (call.texture.function) {
++            case 1u:  // decal
++                color = {t[0], t[1], t[2], color[3]};
++                if (call.texture.alpha_from_texture) color[3] = t[3];
++                break;
++            case 3u:  // replace
++                color = {t[0], t[1], t[2], call.texture.alpha_from_texture ? t[3] : color[3]};
++                break;
++            case 4u:  // add
++                color = {std::min(1.0f, color[0] + t[0]), std::min(1.0f, color[1] + t[1]),
++                         std::min(1.0f, color[2] + t[2]), call.texture.alpha_from_texture ? color[3] * t[3] : color[3]};
++                break;
++            default:  // modulate
++                color = {color[0] * t[0], color[1] * t[1], color[2] * t[2],
++                         call.texture.alpha_from_texture ? color[3] * t[3] : color[3]};
++                break;
++            }
++        }
++        if (call.alpha_test.enabled &&
++            !test_function(call.alpha_test.function, std::floor(color[3] * 255.0f + 0.5f),
++                           static_cast<float>(call.alpha_test.reference)))
++            return;
++        if (call.depth.test_enabled && !call.through && !call.clear_mode) {
++            if (z > target.depth[at]) return;
++        }
++        if (call.depth.write_enabled && !call.through && !call.clear_mode) target.depth[at] = z;
++        if (call.blend.enabled && !call.clear_mode) {
++            const std::array<float, 4> dst = unpack(target.color[at]);
++            std::array<float, 4> out = color;
++            for (int c = 0; c < 3; ++c) {
++                const float s = blend_factor(call.blend.source_factor, true, color, dst, call.blend.fixed_source, c);
++                const float d = blend_factor(call.blend.destination_factor, false, color, dst, call.blend.fixed_destination, c);
++                switch (call.blend.equation) {
++                case 1u: out[c] = color[c] * s - dst[c] * d; break;
++                case 2u: out[c] = dst[c] * d - color[c] * s; break;
++                case 3u: out[c] = std::min(color[c], dst[c]); break;
++                case 4u: out[c] = std::max(color[c], dst[c]); break;
++                case 5u: out[c] = std::fabs(color[c] * s - dst[c] * d); break;
++                default: out[c] = color[c] * s + dst[c] * d; break;
++                }
++            }
++            color = out;
++            color[3] = 1.0f;
++        }
++        target.color[at] = pack(color) | 0xFF000000u;
++    }
++
++    void triangle(const Screen &a, const Screen &b, const Screen &c) {
++        const float area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
++        if (area == 0.0f || !std::isfinite(area)) return;
++        if (call.culling_enabled && !call.through) {
++            const bool clockwise = area < 0.0f;
++            if (clockwise == call.cull_clockwise) return;
++        }
++        const float min_x = std::max(0.0f, std::floor(std::min({a.x, b.x, c.x})));
++        const float max_x = std::min(static_cast<float>(target.stride - 1u), std::ceil(std::max({a.x, b.x, c.x})));
++        const float min_y = std::max(0.0f, std::floor(std::min({a.y, b.y, c.y})));
++        const float max_y = std::min(static_cast<float>(kHeight - 1u), std::ceil(std::max({a.y, b.y, c.y})));
++        for (float py = min_y; py <= max_y; py += 1.0f) {
++            for (float px = min_x; px <= max_x; px += 1.0f) {
++                const float x = px + 0.5f, y = py + 0.5f;
++                float w0 = ((b.x - x) * (c.y - y) - (c.x - x) * (b.y - y)) / area;
++                float w1 = ((c.x - x) * (a.y - y) - (a.x - x) * (c.y - y)) / area;
++                float w2 = 1.0f - w0 - w1;
++                if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) continue;
++                // Perspective-correct attributes.
++                const float p0 = w0 * a.inv_w, p1 = w1 * b.inv_w, p2 = w2 * c.inv_w;
++                const float sum = p0 + p1 + p2;
++                const float q0 = sum != 0.0f ? p0 / sum : w0, q1 = sum != 0.0f ? p1 / sum : w1,
++                            q2 = sum != 0.0f ? p2 / sum : w2;
++                std::array<float, 4> color{};
++                for (int i = 0; i < 4; ++i) color[i] = a.color[i] * q0 + b.color[i] * q1 + c.color[i] * q2;
++                plot(static_cast<std::int32_t>(px), static_cast<std::int32_t>(py), w0 * a.z + w1 * b.z + w2 * c.z, color,
++                     a.u * q0 + b.u * q1 + c.u * q2, a.v * q0 + b.v * q1 + c.v * q2);
++            }
++        }
++    }
++
++    void sprite(const Screen &a, const Screen &b) {
++        const float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x);
++        const float y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
++        const float width = x1 - x0, height = y1 - y0;
++        if (width <= 0.0f || height <= 0.0f) return;
++        // The second vertex's colour and the first vertex's texture origin.
++        const std::array<float, 4> color = b.color;
++        const float ux = (b.x >= a.x) ? 1.0f : -1.0f;
++        const float vy = (b.y >= a.y) ? 1.0f : -1.0f;
++        (void)ux;
++        (void)vy;
++        const auto first_x = static_cast<std::int32_t>(std::floor(x0 + 0.5f));
++        const auto last_x = static_cast<std::int32_t>(std::floor(x1 + 0.5f));
++        const auto first_y = static_cast<std::int32_t>(std::floor(y0 + 0.5f));
++        const auto last_y = static_cast<std::int32_t>(std::floor(y1 + 0.5f));
++        for (std::int32_t y = first_y; y < last_y; ++y)
++            for (std::int32_t x = first_x; x < last_x; ++x) {
++                const float fx = (static_cast<float>(x) + 0.5f - x0) / width;
++                const float fy = (static_cast<float>(y) + 0.5f - y0) / height;
++                // Texture coordinates run from the first vertex to the second, wherever they lie on screen.
++                const float sx = (a.x <= b.x) ? fx : 1.0f - fx;
++                const float sy = (a.y <= b.y) ? fy : 1.0f - fy;
++                plot(x, y, 0.0f, color, a.u + (b.u - a.u) * sx, a.v + (b.v - a.v) * sy);
++            }
++    }
++};
++
++// Writes a PNG with stored (uncompressed) deflate blocks; no library needed.
++std::uint32_t crc32(const std::uint8_t *data, std::size_t size, std::uint32_t crc = 0u) {
++    static std::array<std::uint32_t, 256> table = [] {
++        std::array<std::uint32_t, 256> t{};
++        for (std::uint32_t i = 0; i < 256u; ++i) {
++            std::uint32_t c = i;
++            for (int k = 0; k < 8; ++k) c = (c & 1u) ? 0xEDB88320u ^ (c >> 1u) : c >> 1u;
++            t[i] = c;
++        }
++        return t;
++    }();
++    crc = ~crc;
++    for (std::size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8u);
++    return ~crc;
++}
++
++void put32(std::vector<std::uint8_t> &out, std::uint32_t v) {
++    out.push_back(static_cast<std::uint8_t>(v >> 24u));
++    out.push_back(static_cast<std::uint8_t>(v >> 16u));
++    out.push_back(static_cast<std::uint8_t>(v >> 8u));
++    out.push_back(static_cast<std::uint8_t>(v));
++}
++
++void chunk(std::vector<std::uint8_t> &out, const char *type, const std::vector<std::uint8_t> &body) {
++    put32(out, static_cast<std::uint32_t>(body.size()));
++    std::vector<std::uint8_t> tagged(type, type + 4);
++    tagged.insert(tagged.end(), body.begin(), body.end());
++    out.insert(out.end(), tagged.begin(), tagged.end());
++    put32(out, crc32(tagged.data(), tagged.size()));
++}
++
++void write_png(const std::filesystem::path &path, const std::vector<std::uint8_t> &rgb, std::uint32_t width,
++               std::uint32_t height) {
++    std::vector<std::uint8_t> raw;
++    raw.reserve((static_cast<std::size_t>(width) * 3u + 1u) * height);
++    for (std::uint32_t y = 0; y < height; ++y) {
++        raw.push_back(0u);
++        raw.insert(raw.end(), rgb.begin() + static_cast<std::ptrdiff_t>(y) * width * 3,
++                   rgb.begin() + static_cast<std::ptrdiff_t>(y + 1u) * width * 3);
++    }
++    std::vector<std::uint8_t> z{0x78u, 0x01u};
++    std::uint32_t a = 1u, b = 0u;
++    for (std::uint8_t byte : raw) {
++        a = (a + byte) % 65521u;
++        b = (b + a) % 65521u;
++    }
++    for (std::size_t at = 0; at < raw.size(); at += 65535u) {
++        const std::size_t n = std::min<std::size_t>(65535u, raw.size() - at);
++        z.push_back(at + n >= raw.size() ? 1u : 0u);
++        z.push_back(static_cast<std::uint8_t>(n));
++        z.push_back(static_cast<std::uint8_t>(n >> 8u));
++        z.push_back(static_cast<std::uint8_t>(~n));
++        z.push_back(static_cast<std::uint8_t>((~n) >> 8u));
++        z.insert(z.end(), raw.begin() + static_cast<std::ptrdiff_t>(at), raw.begin() + static_cast<std::ptrdiff_t>(at + n));
++    }
++    put32(z, (b << 16u) | a);
++    std::vector<std::uint8_t> png{0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
++    std::vector<std::uint8_t> header;
++    put32(header, width);
++    put32(header, height);
++    header.insert(header.end(), {8u, 2u, 0u, 0u, 0u});
++    chunk(png, "IHDR", header);
++    chunk(png, "IDAT", z);
++    chunk(png, "IEND", {});
++    std::ofstream file(path, std::ios::binary);
++    file.write(reinterpret_cast<const char *>(png.data()), static_cast<std::streamsize>(png.size()));
++}
++
++bool wanted(const State &s, std::uint64_t flip) {
++    for (const Range &r : s.ranges)
++        if (flip >= r.first && flip <= r.last && (flip - r.first) % r.step == 0u) return true;
++    return s.ranges.empty() && s.every != 0u && flip % s.every == 0u;
++}
++
++} // namespace
++
++bool enabled() { return state().on; }
++
++void install(const psprecomp::GuestMemory &memory) {
++    State &s = state();
++    const char *dir = portablekit::env("SHOT_DIR");
++    if (dir == nullptr || *dir == '\0') return;
++    s.on = true;
++    s.memory = &memory;
++    s.dir = dir;
++    std::filesystem::create_directories(s.dir);
++    if (const char *every = portablekit::env("SHOT_EVERY"); every != nullptr) s.every = std::strtoull(every, nullptr, 10);
++    if (const char *flips = portablekit::env("SHOT_FLIPS"); flips != nullptr) {
++        std::stringstream list(flips);
++        std::string item;
++        while (std::getline(list, item, ',')) {
++            Range r;
++            char *end = nullptr;
++            r.first = std::strtoull(item.c_str(), &end, 10);
++            r.last = r.first;
++            if (*end == '-') r.last = std::strtoull(end + 1, &end, 10);
++            if (*end == '/') r.step = std::max<std::uint64_t>(1u, std::strtoull(end + 1, nullptr, 10));
++            s.ranges.push_back(r);
++        }
++    }
++    std::cout << "Debug raster: shots into " << s.dir.string() << "\n";
++}
++
++void draw(const DrawCall &call) {
++    State &s = state();
++    if (!s.on || s.memory == nullptr) return;
++    const std::uint32_t stride = call.target.color_stride != 0u ? call.target.color_stride : 512u;
++    Shadow &target = target_for(call.target.color_address, stride, call.target.color_format);
++    Pipeline pipe{call, target};
++    pipe.scissor_x1 = call.viewport.scissor_x1;
++    pipe.scissor_y1 = call.viewport.scissor_y1;
++    pipe.scissor_x2 = call.viewport.scissor_x2;
++    pipe.scissor_y2 = call.viewport.scissor_y2;
++    if (call.clear_mode) {
++        if ((call.clear_flags & 1u) == 0u || call.vertices.size() < 2u) return;
++        const Vertex &a = call.vertices[0];
++        const Vertex &b = call.vertices[1];
++        const float x0 = std::min(a.position[0], b.position[0]), x1 = std::max(a.position[0], b.position[0]);
++        const float y0 = std::min(a.position[1], b.position[1]), y1 = std::max(a.position[1], b.position[1]);
++        const std::uint32_t color = (b.color & 0x00FFFFFFu) | 0xFF000000u;
++        for (auto y = static_cast<std::int32_t>(std::max(0.0f, y0)); y < static_cast<std::int32_t>(std::min(y1, 272.0f)); ++y)
++            for (auto x = static_cast<std::int32_t>(std::max(0.0f, x0)); x < static_cast<std::int32_t>(std::min(x1, static_cast<float>(stride))); ++x)
++                target.color[static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x)] = color;
++        if (call.clear_flags & 4u) std::fill(target.depth.begin(), target.depth.end(), 1.0e30f);
++        return;
++    }
++    if (call.texture.enabled && !call.vertices.empty()) pipe.texels = texture_pixels(call, g_flip_for_cache);
++
++    const std::size_t count = call.indices.empty() ? call.vertices.size() : call.indices.size();
++    std::vector<Screen> verts;
++    verts.reserve(count);
++    const std::uint32_t material = call.material_color;
++    for (std::size_t i = 0; i < count; ++i) {
++        const std::size_t index = call.indices.empty() ? i : call.indices[i];
++        if (index >= call.vertices.size()) return;
++        const Vertex &v = call.vertices[index];
++        Screen out;
++        if (call.through) {
++            out.x = v.position[0];
++            out.y = v.position[1];
++            out.z = v.position[2];
++            out.u = v.texcoord[0];
++            out.v = v.texcoord[1];
++        } else {
++            const std::array<float, 4> p = {v.position[0], v.position[1], v.position[2], 1.0f};
++            const auto clip = mul_vec(call.projection, mul_vec(call.view, mul_vec(call.world, p)));
++            if (clip[3] <= 1e-6f) {
++                out.inv_w = 0.0f;
++                out.x = out.y = -1.0e6f;
++            } else {
++                const float inv = 1.0f / clip[3];
++                const gpu::ViewportState &vp = call.viewport;
++                out.x = clip[0] * inv * vp.x_scale + vp.x_offset - vp.offset_x;
++                out.y = clip[1] * inv * vp.y_scale + vp.y_offset - vp.offset_y;
++                out.z = clip[2] * inv;
++                out.inv_w = inv;
++            }
++            out.u = v.texcoord[0] * call.texture.scale_u + call.texture.offset_u;
++            out.v = v.texcoord[1] * call.texture.scale_v + call.texture.offset_v;
++        }
++        out.color = unpack(call.has_vertex_color ? v.color : material);
++        verts.push_back(out);
++    }
++    switch (call.primitive) {
++    case PrimitiveType::Triangles:
++        for (std::size_t i = 0; i + 2u < verts.size(); i += 3u) pipe.triangle(verts[i], verts[i + 1], verts[i + 2]);
++        break;
++    case PrimitiveType::TriangleStrip:
++        for (std::size_t i = 0; i + 2u < verts.size(); ++i) {
++            if (i & 1u) pipe.triangle(verts[i + 1], verts[i], verts[i + 2]);
++            else pipe.triangle(verts[i], verts[i + 1], verts[i + 2]);
++        }
++        break;
++    case PrimitiveType::TriangleFan:
++        for (std::size_t i = 1; i + 1u < verts.size(); ++i) pipe.triangle(verts[0], verts[i], verts[i + 1]);
++        break;
++    case PrimitiveType::Sprites:
++        for (std::size_t i = 0; i + 1u < verts.size(); i += 2u) pipe.sprite(verts[i], verts[i + 1]);
++        break;
++    default: break;
++    }
++}
++
++void transfer(const gpu::BlockTransfer &t) {
++    State &s = state();
++    if (!s.on || s.memory == nullptr) return;
++    const std::uint32_t destination = key_of(t.destination);
++    if (t.destination != destination && (t.destination & 0x1FFFFFFFu) >> 24u != 0x04u) return;
++    // Pixels of a block transfer carry no format; assume the shadow's own.
++    auto found = s.targets.find(destination);
++    if (found == s.targets.end()) return;
++    Shadow &shadow = found->second;
++    for (std::uint32_t y = 0; y < t.height && t.destination_y + y < kHeight; ++y)
++        for (std::uint32_t x = 0; x < t.width && t.destination_x + x < shadow.stride; ++x) {
++            const std::uint32_t source = t.source + ((t.source_y + y) * t.source_stride + t.source_x + x) * t.bytes_per_pixel;
++            if (!s.memory->contains(source, t.bytes_per_pixel)) return;
++            std::uint32_t color = 0xFF000000u;
++            if (t.bytes_per_pixel == 4u) {
++                color = s.memory->load32(source) | 0xFF000000u;
++            } else if (t.bytes_per_pixel == 2u) {
++                const std::uint32_t p = s.memory->load16(source);
++                if (shadow.format == 0u)
++                    color = ((p & 31u) * 255u / 31u) | (((p >> 5u) & 63u) * 255u / 63u) << 8u | (((p >> 11u) & 31u) * 255u / 31u) << 16u | 0xFF000000u;
++                else
++                    color = ((p & 31u) * 255u / 31u) | (((p >> 5u) & 31u) * 255u / 31u) << 8u | (((p >> 10u) & 31u) * 255u / 31u) << 16u | 0xFF000000u;
++            }
++            shadow.color[static_cast<std::size_t>(t.destination_y + y) * shadow.stride + t.destination_x + x] = color;
++        }
++}
++
++void flip(std::uint64_t flip_number, std::uint32_t framebuffer, std::uint32_t /*pixel_format*/) {
++    State &s = state();
++    if (!s.on) return;
++    g_flip_for_cache = flip_number + 1u;
++    if (!wanted(s, flip_number)) return;
++    const auto found = s.targets.find(key_of(framebuffer));
++    char name[64];
++    std::snprintf(name, sizeof name, "shot_%05llu.png", static_cast<unsigned long long>(flip_number));
++    if (found == s.targets.end()) {
++        std::cout << "Debug raster: flip " << flip_number << " shows 0x" << std::hex << framebuffer << std::dec
++                  << ", which nothing drew into\n";
++        return;
++    }
++    const Shadow &shadow = found->second;
++    std::vector<std::uint8_t> rgb;
++    rgb.reserve(480u * kHeight * 3u);
++    for (std::uint32_t y = 0; y < kHeight; ++y)
++        for (std::uint32_t x = 0; x < 480u; ++x) {
++            const std::uint32_t c = x < shadow.stride ? shadow.color[static_cast<std::size_t>(y) * shadow.stride + x] : 0u;
++            rgb.push_back(static_cast<std::uint8_t>(c));
++            rgb.push_back(static_cast<std::uint8_t>(c >> 8u));
++            rgb.push_back(static_cast<std::uint8_t>(c >> 16u));
++        }
++    write_png(s.dir / name, rgb, 480u, kHeight);
++}
++
++} // namespace portablekit::bringup::raster
+diff --git a/host/perf/debug_raster.hpp b/host/perf/debug_raster.hpp
+new file mode 100644
+index 0000000..4925e20
+--- /dev/null
++++ b/host/perf/debug_raster.hpp
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include "gpu/ge_state.hpp"
++#include "psprecomp/guest_memory.hpp"
++
++#include <cstdint>
++
++// A deliberately small software rasteriser for bring-up on a machine with no
++// GPU: it draws the GE's draw calls into shadow copies of the game's colour
++// buffers so that a flip can be written out as a PNG and looked at. It is not a
++// renderer: no lighting, no fog, nearest-neighbour sampling, painter's order
++// unless the game enables the depth test, and nothing the GE would write to
++// guest memory is written back, so render-to-texture shows what the texture
++// held before. It exists to tell a menu from a loading screen.
++//
++//   <prefix>_SHOT_DIR=<dir>       write shot_<flip>.png here
++//   <prefix>_SHOT_FLIPS=a,b-c,d-e/s  which flips: single, range, range with step
++//   <prefix>_SHOT_EVERY=N         every Nth flip (when no list is given)
++namespace portablekit::bringup::raster {
++
++[[nodiscard]] bool enabled();
++void install(const psprecomp::GuestMemory &memory);
++void draw(const gpu::DrawCall &call);
++// The guest block-copied pixels into video memory.
++void transfer(const gpu::BlockTransfer &transfer);
++// The game displayed `framebuffer`; writes a PNG if this flip is wanted.
++void flip(std::uint64_t flip_number, std::uint32_t framebuffer, std::uint32_t pixel_format);
++
++} // namespace portablekit::bringup::raster
+diff --git a/include/psprecomp/interpreter.hpp b/include/psprecomp/interpreter.hpp
+index bd89f63..2ce83fa 100644
+--- a/include/psprecomp/interpreter.hpp
++++ b/include/psprecomp/interpreter.hpp
+@@ -56,6 +56,23 @@ void set_interpreter_fallback_enabled(bool enabled) noexcept;
+ // uses this to decide which guest addresses deserve a recompiled corpus.
+ [[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint64_t>> interpreter_entry_profile();
+ void report_interpreter_stats(std::size_t limit = 20u);
++
++// Per-instruction counts, for finding where a game spends its time before any
++// of it is recompiled. Off by default (PSPRECOMP_INTERPRETER_PC_PROFILE=1 turns
++// it on from the start); every interpreted instruction, delay slots included,
++// then adds one to the count of its address.
++void set_interpreter_pc_profile(bool enabled);
++[[nodiscard]] bool interpreter_pc_profile_enabled() noexcept;
++// Guest address -> instructions executed there since the last reset, in no
++// particular order. `reset` clears the counts.
++[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint64_t>> interpreter_pc_profile(bool reset);
++
++// A native replacement of a guest function says how many instructions the
++// original would have run from `pc`, so the instruction count, the per-address
++// profile and anything that charges time per instruction stay what they were
++// before the replacement.
++void interpreter_account_native(std::uint32_t pc, std::uint64_t instructions) noexcept;
++
+ void reset_interpreter_stats() noexcept;
+ 
+ } // namespace psprecomp
+diff --git a/include/psprecomp/runtime.hpp b/include/psprecomp/runtime.hpp
+index d922300..9a01621 100644
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -292,6 +292,12 @@ using RuntimePostChainedCallHook = void (*)(Runtime &, AllegrexContext &, std::u
+ void set_runtime_pre_chained_call_hook(RuntimePreChainedCallHook hook) noexcept;
+ void set_runtime_post_chained_call_hook(RuntimePostChainedCallHook hook) noexcept;
+ 
++// Called before each import is handed to its HLE handler, with the import's
++// library and NID and the caller's registers: what a bring-up trace or a call
++// counter is built on. Not called for code that never reaches an import.
++using RuntimePreImportHook = void (*)(Runtime &, std::string_view library, std::uint32_t nid, AllegrexContext &);
++void set_runtime_pre_import_hook(RuntimePreImportHook hook) noexcept;
++
+ #undef PSPRECOMP_RUNTIME_FORCEINLINE
+ 
+ } // namespace psprecomp
+diff --git a/src/interpreter.cpp b/src/interpreter.cpp
+index 80387d4..ae99b5b 100644
+--- a/src/interpreter.cpp
++++ b/src/interpreter.cpp
+@@ -32,6 +32,18 @@ std::size_t g_announced = 0u;
+ constexpr std::size_t kMaxProfiledEntries = 4096u;
+ std::unordered_map<std::uint32_t, std::uint64_t> g_entry_profile;
+ 
++// Per-address instruction counts (set_interpreter_pc_profile): one counter per
++// instruction word of the guest's 32 MiB of RAM, allocated when first turned on.
++constexpr std::uint32_t kProfileBase = 0x08800000u;
++constexpr std::uint32_t kProfileWords = (32u * 1024u * 1024u) / 4u;
++bool g_pc_profile = false;
++std::vector<std::uint64_t> g_pc_counts;
++
++inline void count_pc(std::uint32_t pc) {
++    const std::uint32_t index = (pc - kProfileBase) >> 2u;
++    if (index < kProfileWords) ++g_pc_counts[index];
++}
++
+ // Addresses to report every time interpreted code reaches them, with the
+ // registers a caller would care about. Bringing a game up means finding out
+ // which branch of the game's own code never goes the way it should, and this
+@@ -59,6 +71,8 @@ void load_settings() {
+     if (g_settings_loaded) return;
+     g_settings_loaded = true;
+     g_enabled = std::getenv("PSPRECOMP_NO_INTERPRETER") == nullptr;
++    if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_PC_PROFILE"); text != nullptr && *text != '\0' && *text != '0')
++        set_interpreter_pc_profile(true);
+     g_verbose = std::getenv("PSPRECOMP_INTERPRETER_VERBOSE") != nullptr;
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_BUDGET")) {
+         char *end = nullptr;
+@@ -875,6 +889,29 @@ void reset_interpreter_stats() noexcept {
+     g_entry_profile.clear();
+ }
+ 
++void interpreter_account_native(std::uint32_t pc, std::uint64_t instructions) noexcept {
++    g_instructions += instructions;
++    const std::uint32_t index = (pc - kProfileBase) >> 2u;
++    if (g_pc_profile && index < kProfileWords) g_pc_counts[index] += instructions;
++}
++
++void set_interpreter_pc_profile(bool enabled) {
++    if (enabled && g_pc_counts.empty()) g_pc_counts.assign(kProfileWords, 0u);
++    g_pc_profile = enabled;
++}
++
++bool interpreter_pc_profile_enabled() noexcept { return g_pc_profile; }
++
++std::vector<std::pair<std::uint32_t, std::uint64_t>> interpreter_pc_profile(bool reset) {
++    std::vector<std::pair<std::uint32_t, std::uint64_t>> counts;
++    for (std::uint32_t index = 0; index < g_pc_counts.size(); ++index) {
++        if (g_pc_counts[index] == 0u) continue;
++        counts.emplace_back(kProfileBase + index * 4u, g_pc_counts[index]);
++        if (reset) g_pc_counts[index] = 0u;
++    }
++    return counts;
++}
++
+ void report_interpreter_stats(std::size_t limit) {
+     if (g_instructions == 0u) return;
+     std::cerr << "[interpreter] instructions=" << g_instructions
+@@ -930,6 +967,7 @@ InterpreterExit interpret_allegrex(Runtime &rt, AllegrexContext &ctx,
+             report_watch(rt, ctx, pc);
+         const DecodedInstruction decoded = decode_allegrex(memory.aot_load32(pc));
+         ++executed;
++        if (g_pc_profile) count_pc(pc);
+ 
+         if (!decoded.has_delay_slot()) {
+             if (!execute_simple(rt, ctx, decoded, pc))
+@@ -986,6 +1024,7 @@ InterpreterExit interpret_allegrex(Runtime &rt, AllegrexContext &ctx,
+ 
+         if (run_slot) {
+             ++executed;
++            if (g_pc_profile) count_pc(pc + 4u);
+             ctx.pc = pc + 4u;
+             if (!execute_simple(rt, ctx, slot, pc + 4u))
+                 return leave(rt.stopped() ? InterpreterExit::Stopped : InterpreterExit::Dispatch);
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index c3c33a6..e14fc1c 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -25,6 +25,7 @@ std::uint64_t g_runtime_thread_switch_generation_fast = 0u;
+ namespace {
+ using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
+ RuntimePostImportHook g_post_import_hook = nullptr;
++RuntimePreImportHook g_pre_import_hook = nullptr;
+ std::int32_t g_runtime_thread_uid = -1;
+ std::array<char, 64> g_runtime_thread_name{};
+ std::uint32_t g_runtime_dispatch_pc = 0u;
+@@ -121,6 +122,7 @@ void set_runtime_post_chained_call_hook(RuntimePostChainedCallHook hook) noexcep
+ }
+ 
+ void set_runtime_post_import_hook(RuntimePostImportHook hook) noexcept { g_post_import_hook = hook; }
++void set_runtime_pre_import_hook(RuntimePreImportHook hook) noexcept { g_pre_import_hook = hook; }
+ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noexcept {
+     if (uid != g_runtime_thread_uid) ++g_runtime_thread_switch_generation_fast;
+     g_runtime_thread_uid = uid;
+@@ -1275,6 +1277,7 @@ void Runtime::invoke_native_fast_path(std::uint32_t address, AllegrexContext &ct
+ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
+                                    std::uint32_t nid, AllegrexContext &ctx) {
+     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
++    if (g_pre_import_hook != nullptr) g_pre_import_hook(*this, library, nid, ctx);
+ 
+     const HleFunction *bound = slot < import_bindings_.size() ? import_bindings_[slot] : nullptr;
+     if (bound == nullptr) {
+@@ -1302,6 +1305,7 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
+     // while a thread spinning on an operation the host never completes shows up
+     // as a huge count on one or two wait imports.
+     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
++    if (g_pre_import_hook != nullptr) g_pre_import_hook(*this, library, nid, ctx);
+     const auto library_it = hle_.find(library);
+     const auto function_it = library_it != hle_.end()
+         ? library_it->second.find(nid) : HleLibrary::const_iterator{};

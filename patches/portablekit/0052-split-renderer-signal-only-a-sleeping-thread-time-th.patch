@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 23:08:17 +0000
+Subject: [PATCH] split renderer: signal only a sleeping thread, time threads
+ by their sleeps
+
+Measured on the PS Vita, where a system call is not free: an event signal
+(sceKernelSetEventFlag) costs 3.9 us and a clock read 0.7 us. The GE worker's
+ring signalled its consumer on every post and its producer after every job,
+and read the clock twice a job; with the split renderer that is a job per
+draw, some 1,500 signals and 3,000 clock reads a frame across the walker and
+the GL thread. Now:
+
+- GeWorker signals the consumer only when it may be asleep (a flag set
+  before its last look at the ring) and a waiter for space or completion only
+  when there is one; both sides are sequentially consistent and every sleep
+  still times out, so no wake-up is lost.
+- No per-job timing. A worker can add its sleeps to a phase (WalkIdle,
+  GlIdle); a thread's busy time is the frame less those. New phases also
+  say what the guest waited for (GeSync: sceGeDrawSync/ListSync; FlipWait:
+  frames in flight) and when the walker waited for the GL thread
+  (SplitWait). The kernel's real-time sleeps count as Idle.
+- The split's draw slots give back vertex and index storage above 256
+  vertices / 1,024 indices: storage circulates through every slot, so each
+  grew to the largest draw it had carried (the heap grew by 50 MiB in two
+  minutes). The ring is 1,024 draws.
+- Developer switches for measuring: <PREFIX>_GE_SPLIT_SLOTS,
+  _GE_SPLIT_PRESENTS_AHEAD, _GE_SPLIT_EARLY_SYNC (a job completes when walked,
+  not drawn; measured slower on the Vita, off).
+- The walker reports when thread_local is shared between threads (a C++
+  runtime linked single-threaded), which had made Split run every GL call
+  on the walker.
+- sceGe list/sync calls are in the <PREFIX>_TRACE_PACING trace, which now
+  writes through std::cout so that a platform logging the streams gets it.
+
+Mission 1 on the console with the bot: 25 fps before (one thread really),
+30-31 after. Desktop: framework tests pass; replays of three dump sets
+(337 frames) byte-identical to the reference, inline and threaded.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_worker.cpp b/host/gpu/ge_worker.cpp
+index 732ab25..988a236 100644
+--- a/host/gpu/ge_worker.cpp
++++ b/host/gpu/ge_worker.cpp
+@@ -1,5 +1,7 @@
+ #include "gpu/ge_worker.hpp"
+ 
++#include "perf/phase_timers.hpp"
++
+ #include "kernel/kernel_platform.hpp"
+ #include "settings/port_settings.hpp"
+ #include "profile.hpp"
+@@ -132,21 +134,34 @@ GeWorker::~GeWorker() {
+ 
+ void GeWorker::post(Job job) {
+     const std::uint64_t tail = tail_.load(std::memory_order_relaxed);
+-    while (tail - head_.load(std::memory_order_acquire) >= capacity_) {
++    if (tail - head_.load(std::memory_order_acquire) >= capacity_) {
+         // Full: the GE thread is behind by a whole ring. Wait for it in host time.
+-        if (g_platform.event_wait != nullptr && space_event_ != nullptr) g_platform.event_wait(space_event_, kSleepUs);
++        space_waiters_.fetch_add(1u, std::memory_order_seq_cst);
++        while (tail - head_.load(std::memory_order_seq_cst) >= capacity_) {
++            if (g_platform.event_wait != nullptr && space_event_ != nullptr) g_platform.event_wait(space_event_, kSleepUs);
++        }
++        space_waiters_.fetch_sub(1u, std::memory_order_relaxed);
+     }
+     slots_[tail % capacity_].job = std::move(job);
+-    tail_.store(tail + 1u, std::memory_order_release);
++    tail_.store(tail + 1u, std::memory_order_seq_cst);
+     posted_.store(tail + 1u, std::memory_order_release);
+-    if (g_platform.event_signal != nullptr && work_event_ != nullptr) g_platform.event_signal(work_event_);
++    if (consumer_sleeping_.load(std::memory_order_seq_cst) && g_platform.event_signal != nullptr && work_event_ != nullptr)
++        g_platform.event_signal(work_event_);
+ }
+ 
+ void GeWorker::wait_completed(std::uint64_t target) {
+-    while (completed() < target) {
++    if (completed() >= target) return;
++    space_waiters_.fetch_add(1u, std::memory_order_seq_cst);
++    while (completed_.load(std::memory_order_seq_cst) < target) {
+         if (g_platform.event_wait != nullptr && space_event_ != nullptr)
+             g_platform.event_wait(space_event_, kSleepUs);
+     }
++    space_waiters_.fetch_sub(1u, std::memory_order_relaxed);
++}
++
++void GeWorker::signal_space() noexcept {
++    if (space_waiters_.load(std::memory_order_seq_cst) != 0u && g_platform.event_signal != nullptr && space_event_ != nullptr)
++        g_platform.event_signal(space_event_);
+ }
+ 
+ void GeWorker::nap_on_ge_thread(std::uint64_t us) {
+@@ -163,35 +178,40 @@ void GeWorker::run_loop() {
+         const std::uint64_t head = head_.load(std::memory_order_relaxed);
+         if (head == tail_.load(std::memory_order_acquire)) {
+             if (stop_.load(std::memory_order_acquire) && head == tail_.load(std::memory_order_acquire)) return;
+-            if (g_platform.event_wait != nullptr && work_event_ != nullptr) g_platform.event_wait(work_event_, kSleepUs);
++            consumer_sleeping_.store(true, std::memory_order_seq_cst);
++            if (head == tail_.load(std::memory_order_seq_cst) && !stop_.load(std::memory_order_acquire) &&
++                g_platform.event_wait != nullptr && work_event_ != nullptr) {
++                const std::uint64_t asleep = idle_phase_ >= 0 ? phase::stamp() : 0u;
++                g_platform.event_wait(work_event_, kSleepUs);
++                if (idle_phase_ >= 0 && phase::enabled())
++                    phase::add(static_cast<phase::Phase>(idle_phase_), phase::stamp() - asleep);
++            }
++            consumer_sleeping_.store(false, std::memory_order_relaxed);
+             continue;
+         }
+         Slot &slot = slots_[head % capacity_];
+-        const std::uint64_t start = g_platform.monotonic_us != nullptr ? g_platform.monotonic_us() : 0u;
+         if (slot.job) slot.job();
+         slot.job = nullptr;
+-        if (g_platform.monotonic_us != nullptr)
+-            busy_us_.fetch_add(g_platform.monotonic_us() - start, std::memory_order_relaxed);
+-        head_.store(head + 1u, std::memory_order_release);
++        head_.store(head + 1u, std::memory_order_seq_cst);
+         if (forwarder_ != nullptr) {
+             // Someone else finishes this job's work: they publish its completion (mark_completed). The producer may be
+             // waiting for ring space, which the head just made.
+             forwarder_(forwarder_context_, head + 1u);
+-            if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++            signal_space();
+             continue;
+         }
+-        completed_.store(head + 1u, std::memory_order_release);
++        completed_.store(head + 1u, std::memory_order_seq_cst);
+         // The guest may be waiting for this job (sceGeDrawSync, a full ring, a frame in flight): wake it.
+-        if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++        signal_space();
+         if (wake_hook_ != nullptr) wake_hook_();
+     }
+ }
+ 
+ void GeWorker::mark_completed(std::uint64_t value) {
+     std::uint64_t current = completed_.load(std::memory_order_acquire);
+-    while (current < value && !completed_.compare_exchange_weak(current, value, std::memory_order_acq_rel)) {
++    while (current < value && !completed_.compare_exchange_weak(current, value, std::memory_order_seq_cst)) {
+     }
+-    if (g_platform.event_signal != nullptr && space_event_ != nullptr) g_platform.event_signal(space_event_);
++    signal_space();
+     if (wake_hook_ != nullptr) wake_hook_();
+ }
+ 
+@@ -229,6 +249,11 @@ bool GeWorker::run_with_guest_thread(void (*guest)(void *), void *arg, int guest
+ 
+ GeWorker &ge_worker() {
+     static GeWorker worker;
++    static const bool timed = [] {
++        worker.set_idle_phase(phase::WalkIdle);   // the GE thread's sleeps: its busy time is the rest
++        return true;
++    }();
++    (void)timed;
+     return worker;
+ }
+ 
+diff --git a/host/gpu/ge_worker.hpp b/host/gpu/ge_worker.hpp
+index 1c5b888..815d851 100644
+--- a/host/gpu/ge_worker.hpp
++++ b/host/gpu/ge_worker.hpp
+@@ -80,11 +80,11 @@ public:
+     // waits poll completed() instead (Kernel::wait_host).
+     void wait_completed(std::uint64_t target);
+ 
+-    // ---- statistics ----------------------------------------------------------------------------------------------
+-    // Microseconds the GE thread spent running jobs (with set_clock, else 0).
+-    [[nodiscard]] std::uint64_t busy_us() const noexcept { return busy_us_.load(std::memory_order_relaxed); }
+     // Called by the GE thread after a job posted with `wake` set has run: wakes an idle kernel (kernel_signal_event).
+     void set_wake_hook(void (*hook)()) noexcept { wake_hook_ = hook; }
++    // The phase (perf/phase_timers.hpp) the consumer's sleeps with an empty ring are added to: its thread's idle time,
++    // so its busy time is the rest. Two clock reads a sleep, none a job. -1: not timed.
++    void set_idle_phase(int phase) noexcept { idle_phase_ = phase; }
+ 
+     // ---- consumer: the GE thread ---------------------------------------------------------------------------------
+     // The loop of run_with_guest_thread(), for a caller that starts the guest thread itself (the replay test): runs
+@@ -122,9 +122,16 @@ private:
+     std::atomic<std::uint64_t> completed_{0u};
+     std::atomic<bool> active_{false};
+     std::atomic<bool> stop_{false};
+-    std::atomic<std::uint64_t> busy_us_{0u};
+     void *work_event_ = nullptr;      // the consumer sleeps here when the ring is empty
+-    void *space_event_ = nullptr;     // the producer sleeps here when the ring is full
++    void *space_event_ = nullptr;     // the producer sleeps here when the ring is full, and wait_completed()
++    // Who is (about to be) asleep on the events. A signal is a system call (on the Vita sceKernelSetEventFlag, a few
++    // microseconds), and the split renderer posts one job per draw: signalling only a thread that may be asleep took
++    // two calls a draw off the walker and the GL thread. Set before the sleeper's last look at the ring, read after the
++    // producer's store (both sequentially consistent), so a wake-up is never lost; the sleeps also time out.
++    int idle_phase_ = -1;
++    std::atomic<bool> consumer_sleeping_{false};
++    std::atomic<std::uint32_t> space_waiters_{0u};
++    void signal_space() noexcept;
+     void (*wake_hook_)() = nullptr;
+     CompletionForwarder forwarder_ = nullptr;
+     void *forwarder_context_ = nullptr;
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 6304e2b..26eeb58 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <string>
+@@ -22,8 +23,14 @@ thread_local bool t_gl = false;
+ // The one SplitRenderer of the process (split_of() without RTTI).
+ SplitRenderer *g_instance = nullptr;
+ 
+-// At most this many presents queued and not yet shown: the walker runs at most about a frame ahead of the GL thread.
+-constexpr std::uint64_t kPresentsAhead = 1u;
++// At most this many presents queued and not yet shown: the walker runs at most about a frame ahead of the GL thread
++// (<PREFIX>_GE_SPLIT_PRESENTS_AHEAD overrides it; the ring's size is <PREFIX>_GE_SPLIT_SLOTS).
++constexpr std::uint32_t kPresentsAhead = 1u;
++
++// The storage a draw slot keeps between draws (see submit_taking): enough for most draws of a frame (a few dozen
++// vertices); a larger draw allocates its own. The ring then holds at most some 12 MiB however long the game runs.
++constexpr std::size_t kKeptVertices = 256u;
++constexpr std::size_t kKeptIndices = 1024u;
+ 
+ void warn_foreign_thread(const char *what) {
+     static bool said = false;
+@@ -44,8 +51,27 @@ bool ge_split_setting_enabled() {
+     return text == "1" || text == "on" || text == "true" || text == "yes";
+ }
+ 
++namespace {
++// A developer override of a number (<PREFIX>_<name>), else `fallback`.
++std::uint32_t env_count(const char *name, std::uint32_t fallback, std::uint32_t low, std::uint32_t high) {
++    const char *value = portablekit::env(name);
++    if (value == nullptr || *value == '\0') return fallback;
++    const unsigned long parsed = std::strtoul(value, nullptr, 10);
++    return static_cast<std::uint32_t>(std::clamp<unsigned long>(parsed, low, high));
++}
++} // namespace
++
++bool ge_split_early_sync_enabled() {
++    const char *value = portablekit::env("GE_SPLIT_EARLY_SYNC");
++    if (value == nullptr || *value == '\0') return false;
++    std::string text(value);
++    for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    return text == "1" || text == "on" || text == "true" || text == "yes";
++}
++
+ SplitRenderer::SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots)
+-    : inner_(std::move(inner)), queue_(16384u), slots_(std::max<std::uint32_t>(draw_slots, 64u)) {
++    : inner_(std::move(inner)), queue_(16384u), slots_(env_count("GE_SPLIT_SLOTS", std::max<std::uint32_t>(draw_slots, 64u), 64u, 8192u)),
++      presents_ahead_(env_count("GE_SPLIT_PRESENTS_AHEAD", kPresentsAhead, 1u, 4u)), early_sync_(ge_split_early_sync_enabled()) {
+     g_instance = this;
+ }
+ 
+@@ -81,6 +107,7 @@ template <typename Fn> void SplitRenderer::call(Fn &&fn) {
+     }
+     // `fn` refers to the caller's locals: fine, the caller waits until it has run.
+     queue_.post(GeWorker::Job(std::forward<Fn>(fn)));
++    const phase::Scope wait(phase::SplitWait);
+     queue_.wait_completed(queue_.posted());
+ }
+ 
+@@ -101,6 +128,14 @@ void forward_completion(void *context, std::uint64_t completed) {
+ 
+ void walker_main(void *pointer) {
+     auto *args = static_cast<ThreadArgs *>(pointer);
++    // The GL thread set its own t_gl before starting this thread. Seeing it here means thread_local is one variable for
++    // every thread: a statically linked C++ runtime that thinks the program has one thread (on the Vita, libgcc's
++    // emulated TLS without pthread_cancel in the link). Every renderer call would then run here, on the walker, and the
++    // split would be one thread on another core. Said once, loudly: the numbers of such a run are not the split's.
++    if (t_gl)
++        std::cerr << "[split] thread_local storage is shared between threads: the walker would draw itself, nothing "
++                     "runs on the GL thread (link the C++ runtime as multi-threaded)"
++                  << std::endl;
+     t_walker = true;
+     args->walker->run_loop();
+     // Nothing more will be posted to the GL queue: it stops once it is empty.
+@@ -121,7 +156,13 @@ bool SplitRenderer::run(GeWorker &walker, void (*guest)(void *), void *arg, int
+     if (platform.pin_current_thread != nullptr) platform.pin_current_thread(gl_core);
+     ThreadArgs args{guest, arg, &walker, this};
+     t_gl = true;
+-    walker.set_completion_forwarder(&forward_completion, &args);
++    // Without the forwarder the walker publishes a job as completed itself, once it has walked it (early sync).
++    if (!early_sync_) walker.set_completion_forwarder(&forward_completion, &args);
++    walker.set_idle_phase(phase::WalkIdle);
++    queue_.set_idle_phase(phase::GlIdle);
++    std::cerr << "[split] walker on core " << walker_core << ", GL on core " << gl_core << "; " << slots_.size()
++              << " draw slots, " << presents_ahead_ << " present(s) ahead; a GE job completes when "
++              << (early_sync_ ? "the walker is through it (early sync)" : "the GL thread has drawn it") << std::endl;
+     forwarding_.store(true, std::memory_order_release);
+     walker.set_active(true);
+     queue_.set_active(true);
+@@ -205,7 +246,12 @@ void SplitRenderer::submit_taking(DrawCall &draw, const GuestMemory &memory) {
+     slot.call = draw;   // empty vectors: the slot's keep their capacity
+     slot.call.vertices.swap(vertices);
+     slot.call.indices.swap(indices);
+-    draw.vertices.swap(vertices);   // the slot's former storage, cleared by the assignment above
++    // The slot's former storage goes back to the walker, cleared by the assignment above. Storage circulates between the
++    // walker and every slot, so each vector would end up as large as the largest draw it ever carried, times the ring:
++    // on the Vita the heap grew by some 50 MiB in two minutes. A large one is given back to the heap instead.
++    if (vertices.capacity() > kKeptVertices) VertexList().swap(vertices);
++    if (indices.capacity() > kKeptIndices) std::vector<std::uint16_t>().swap(indices);
++    draw.vertices.swap(vertices);
+     draw.indices.swap(indices);
+     post_draw();
+ }
+@@ -214,8 +260,11 @@ SplitRenderer::DrawSlot &SplitRenderer::claim_slot(const GuestMemory &memory) {
+     const std::uint64_t sequence = draws_posted_;
+     const std::uint64_t count = slots_.size();
+     // The slot is free once the GL thread has drawn the draw that used it `count` draws ago.
+-    while (sequence - draws_done_.load(std::memory_order_acquire) >= count)
+-        queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    if (sequence - draws_done_.load(std::memory_order_acquire) >= count) {
++        const phase::Scope wait(phase::SplitWait);
++        while (sequence - draws_done_.load(std::memory_order_acquire) >= count)
++            queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    }
+     DrawSlot &slot = slots_[sequence % count];
+     slot.memory = &memory;
+     return slot;
+@@ -227,11 +276,10 @@ void SplitRenderer::post_draw() {
+ }
+ 
+ void SplitRenderer::run_draw(std::uint64_t sequence) {
++    // Not timed draw by draw: a clock read is a system call on the Vita (0.7 us, two a draw were a millisecond a frame).
++    // The GL thread's busy time is the frame less its sleeps (GlIdle, see run()).
+     DrawSlot &slot = slots_[sequence % slots_.size()];
+-    {
+-        const phase::Scope submit(phase::GlSubmit);
+-        inner_->submit(slot.call, *slot.memory);
+-    }
++    inner_->submit(slot.call, *slot.memory);
+     draws_done_.store(sequence + 1u, std::memory_order_release);
+ }
+ 
+@@ -267,8 +315,11 @@ bool SplitRenderer::present(std::uint32_t display_address, std::optional<std::ch
+         return false;
+     }
+     const std::uint64_t mine = ++presents_posted_;
+-    while (mine - presents_done_.load(std::memory_order_acquire) > kPresentsAhead + 1u)
+-        queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    if (mine - presents_done_.load(std::memory_order_acquire) > presents_ahead_ + 1u) {
++        const phase::Scope wait(phase::SplitWait);
++        while (mine - presents_done_.load(std::memory_order_acquire) > presents_ahead_ + 1u)
++            queue_.wait_completed(std::min(queue_.completed() + 1u, queue_.posted()));
++    }
+     post([this, display_address, moment] {
+         {
+             const phase::Scope present_scope(phase::Present);
+diff --git a/host/gpu/split_renderer.hpp b/host/gpu/split_renderer.hpp
+index 4dae4cd..ae4dfea 100644
+--- a/host/gpu/split_renderer.hpp
++++ b/host/gpu/split_renderer.hpp
+@@ -34,9 +34,17 @@ namespace portablekit::gpu {
+ // <PREFIX>_GE_SPLIT: on, off; without it, perf.threaded_renderer=split of the port settings (default off).
+ [[nodiscard]] bool ge_split_setting_enabled();
+ 
++// <PREFIX>_GE_SPLIT_EARLY_SYNC=1 (config.txt ge_split_early_sync=1): a GE job counts as completed, and the GE's signal and
++// finish interrupts are raised, once the walker is through it, not once the GL thread has drawn it. A game that waits
++// for the GE every frame (sceGeDrawSync) then waits for the walk only, and its next frame overlaps the drawing of this
++// one. What the guest gives up: the GL thread may read a texture or palette after the guest believes the GE is done
++// with it (a texture rewritten right after the sync shows its new contents a frame early). Block transfers still wait
++// for the drawing (read_back_framebuffer).
++[[nodiscard]] bool ge_split_early_sync_enabled();
++
+ class SplitRenderer final : public Renderer {
+ public:
+-    explicit SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots = 2048u);
++    explicit SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw_slots = 1024u);
+     ~SplitRenderer() override;
+ 
+     [[nodiscard]] Renderer &inner() noexcept { return *inner_; }
+@@ -44,6 +52,8 @@ public:
+     // The GL thread's queue.
+     [[nodiscard]] GeWorker &queue() noexcept { return queue_; }
+     [[nodiscard]] bool forwarding() const noexcept { return forwarding_.load(std::memory_order_acquire); }
++    // ge_split_early_sync_enabled() when the renderer was made: completion and interrupts at the walker.
++    [[nodiscard]] bool early_sync() const noexcept { return early_sync_; }
+ 
+     // Runs `guest(arg)` on a new thread (guest_core), `walker` (the GE worker's loop) on another (walker_core) and the
+     // GL queue on the calling thread, which owns the GL context. Returns when the guest has returned and both queues are
+@@ -111,6 +121,8 @@ private:
+     std::atomic<std::uint64_t> presents_done_{0u};   // GL thread
+     std::atomic<bool> window_open_{true};
+     std::atomic<bool> forwarding_{false};
++    std::uint32_t presents_ahead_{1u};
++    bool early_sync_{false};
+ };
+ 
+ // The SplitRenderer in front of `renderer`, or null when there is none.
+diff --git a/host/hle/hle_media.cpp b/host/hle/hle_media.cpp
+index 772a833..64b1bad 100644
+--- a/host/hle/hle_media.cpp
++++ b/host/hle/hle_media.cpp
+@@ -53,6 +53,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <iostream>
++#include <optional>
+ #include <memory>
+ #include <sstream>
+ #include <string>
+@@ -85,13 +86,16 @@ void trace_pacing(const char *call, std::int64_t value = -1) {
+     ++lines;
+     const std::uint64_t now = kernel().now_us();
+     const Thread *thread = kernel().current_thread();
+-    std::printf("[pacing] %12.3f ms v%-7llu +%5llu us %-20s %s", static_cast<double>(now) / 1000.0,
+-                static_cast<unsigned long long>(kernel().vblank_count()),
+-                static_cast<unsigned long long>(now - kernel().last_vblank_us()),
+-                thread != nullptr ? thread->name.c_str() : "?", call);
+-    if (value >= 0) std::printf(" %lld", static_cast<long long>(value));
+-    std::printf("\n");
+-    if (lines == limit) std::fflush(stdout);
++    // Through std::cout, not printf: a platform that sends the C++ streams to its log (the Vita) gets these too.
++    char text[192];
++    int length = std::snprintf(text, sizeof(text), "[pacing] %12.3f ms v%-7llu +%5llu us %-20s %s",
++                               static_cast<double>(now) / 1000.0, static_cast<unsigned long long>(kernel().vblank_count()),
++                               static_cast<unsigned long long>(now - kernel().last_vblank_us()),
++                               thread != nullptr ? thread->name.c_str() : "?", call);
++    if (value >= 0 && length > 0 && static_cast<std::size_t>(length) < sizeof(text))
++        std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %lld", static_cast<long long>(value));
++    std::cout << text << '\n';
++    if (lines == limit) std::cout.flush();
+ }
+ 
+ constexpr std::uint32_t kEdramBase = 0x04000000u;
+@@ -218,9 +222,11 @@ void raise_ge_interrupt(InterruptCall call) {
+         return;
+     }
+     // With the GE thread split (gpu/split_renderer.hpp) the walker is ahead of the drawing: the interrupt is raised by the
+-    // GL thread when it reaches this point, so a handler that reuses buffers finds the draws before it done.
++    // GL thread when it reaches this point, so a handler that reuses buffers finds the draws before it done (unless the
++    // early sync was asked for: then the walker raises it, as it completes the jobs).
+ #if defined(PORTABLEKIT_GPU_RENDERER)
+-    if (gpu::SplitRenderer *split = gpu::split_of(media().renderer.get()); split != nullptr && split->forwarding()) {
++    if (gpu::SplitRenderer *split = gpu::split_of(media().renderer.get());
++        split != nullptr && split->forwarding() && !split->early_sync()) {
+         split->post([split, call = std::move(call)] {
+             while (!kernel().post_interrupt_from_host(call.function, call.arguments, call.argument_count))
+                 split->queue().nap_on_ge_thread(500u);   // the kernel has not drained for a while
+@@ -482,7 +488,11 @@ void present_frame_threaded(Runtime &rt) {
+         if (from_memory)
+             renderer->upload_frame(address, picture.data(), display.width, display.height, display.buffer_width);
+         {
+-            const phase::Scope present_scope(phase::Present);
++            // With the split GE thread these calls only queue work for the GL thread, which times its present itself
++            // (SplitRenderer::present); a wait of the walker in them is SplitWait, not Present.
++            static const bool split = gpu::split_of(renderer) != nullptr;
++            std::optional<phase::Scope> present_scope;
++            if (!split) present_scope.emplace(phase::Present);
+             renderer->write_back_frame(rt.memory());
+             renderer->set_fast_forward(fast);
+             (void)renderer->present(address, real_time);
+@@ -973,9 +983,11 @@ void register_display_ctrl(HleRegistrar &hle) {
+         constexpr std::uint64_t kFramesInFlight = 2u;
+         if (threaded && media().presents_posted > media().presents_done.load(std::memory_order_acquire) + kFramesInFlight) {
+             const std::uint64_t wanted = media().presents_posted - kFramesInFlight;
+-            kernel().wait_host(ctx, std::nullopt, [wanted](bool) -> std::optional<std::uint32_t> {
+-                if (media().presents_done.load(std::memory_order_acquire) >= wanted) return 0u;
+-                return std::nullopt;
++            const std::uint64_t since = phase::stamp();
++            kernel().wait_host(ctx, std::nullopt, [wanted, since](bool) -> std::optional<std::uint32_t> {
++                if (media().presents_done.load(std::memory_order_acquire) < wanted) return std::nullopt;
++                if (phase::enabled()) phase::add(phase::FlipWait, phase::stamp() - since);
++                return 0u;
+             }, /*zero_time=*/true);
+             return;
+         }
+@@ -1176,6 +1188,7 @@ void register_ge(HleRegistrar &hle) {
+         list.stall = arg(ctx, 1) & 0x0FFFFFFFu;
+         list.callback = static_cast<std::int32_t>(arg(ctx, 2));
+         perf::count_display_list();
++        trace_pacing("sceGeListEnQueue", static_cast<std::int64_t>(id));
+         if (ge_threaded()) {
+             media().ge_lists[id] = list;
+             post_ge_list(rt, id, list, false);
+@@ -1194,6 +1207,7 @@ void register_ge(HleRegistrar &hle) {
+             return;
+         }
+         found->second.stall = arg(ctx, 1) & 0x0FFFFFFFu;
++        trace_pacing("sceGeListUpdateStallAddr", static_cast<std::int64_t>(arg(ctx, 0)));
+         if (ge_threaded()) post_ge_list(rt, arg(ctx, 0), found->second, true);
+         else run_ge_list(rt, arg(ctx, 0));
+         kernel().finish(ctx, 0u);
+@@ -1204,20 +1218,28 @@ void register_ge(HleRegistrar &hle) {
+                                   std::function<std::uint32_t()> answer) {
+         gpu::GeWorker &worker = gpu::ge_worker();
+         if (worker.completed() >= target) {
++            trace_pacing("  GE sync: done already", static_cast<std::int64_t>(mode));
+             kernel().finish(ctx, answer());
+             return;
+         }
+         if (mode != 0u) {
++            trace_pacing("  GE sync: peek, still drawing", static_cast<std::int64_t>(mode));
+             kernel().finish(ctx, 2u);   // peek: still drawing
+             return;
+         }
+-        kernel().wait_host(ctx, std::nullopt, [target, answer = std::move(answer)](bool) -> std::optional<std::uint32_t> {
+-            if (gpu::ge_worker().completed() >= target) return answer();
+-            return std::nullopt;
++        trace_pacing("  GE sync: waits for jobs up to", static_cast<std::int64_t>(target));
++        const std::uint64_t since = phase::stamp();
++        kernel().wait_host(ctx, std::nullopt, [target, since, answer = std::move(answer)](bool) -> std::optional<std::uint32_t> {
++            if (gpu::ge_worker().completed() < target) return std::nullopt;
++            const std::uint64_t waited = phase::stamp() - since;
++            if (phase::enabled()) phase::add(phase::GeSync, waited);
++            trace_pacing("  GE sync: resumed after (host us)", static_cast<std::int64_t>(waited));
++            return answer();
+         }, /*zero_time=*/true);
+     };
+     hle.add("sceGe_user", "sceGeListSync", [wait_for_jobs](Runtime &, AllegrexContext &ctx) {
+         const std::uint32_t id = arg(ctx, 0);
++        trace_pacing("sceGeListSync", static_cast<std::int64_t>(id));
+         // 0 = completed, 2 = still stalled (drawing).
+         const auto answer = [id]() -> std::uint32_t {
+             if (ge_threaded()) {
+@@ -1236,6 +1258,7 @@ void register_ge(HleRegistrar &hle) {
+         wait_for_jobs(ctx, arg(ctx, 1), media().last_list_job, answer);
+     });
+     hle.add("sceGe_user", "sceGeDrawSync", [wait_for_jobs](Runtime &, AllegrexContext &ctx) {
++        trace_pacing("sceGeDrawSync", static_cast<std::int64_t>(arg(ctx, 0)));
+         const auto erase_done = [] {
+             if (ge_threaded())
+                 std::erase_if(media().ge_lists, [](const auto &item) {
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index ba0b1c9..6d5f184 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -715,7 +715,10 @@ void Kernel::sleep_until_event(std::uint64_t target_us) {
+     const Clock::time_point start = Clock::now();
+     if (idle_hook_) idle_hook_(start + std::chrono::microseconds(wait_us));
+     refresh_realtime();
+-    if (target_us > now_us_) kernel_platform().wait_event(target_us - now_us_);
++    if (target_us > now_us_) {
++        const phase::Scope timer(phase::Idle);
++        kernel_platform().wait_event(target_us - now_us_);
++    }
+     perf::add_pacing_time(Clock::now() - start);
+     refresh_realtime();
+ }
+diff --git a/host/perf/phase_timers.hpp b/host/perf/phase_timers.hpp
+index 2db96ff..7a79df0 100644
+--- a/host/perf/phase_timers.hpp
++++ b/host/perf/phase_timers.hpp
+@@ -9,7 +9,8 @@
+ // while the owners of the phases write them.
+ //
+ // Phases are leaves of the guest's work and do not nest into each other except GeWalk, which contains the GlSubmit of
+-// its draws. What is left of a frame is the guest's own code and the HLE calls that were not timed.
++// its draws. What is left of a frame is the guest's own code and the HLE calls that were not timed. GeSync and FlipWait
++// are waits, not work: they overlap the Idle of the kernel that sleeps meanwhile, and say what the guest waited for.
+ namespace portablekit::phase {
+ 
+ enum Phase : unsigned {
+@@ -20,7 +21,12 @@ enum Phase : unsigned {
+     Decode,    // ATRAC3plus and H.264 decoding
+     Audio,     // mixing into the audio sink
+     IsoRead,   // reading the disc image
+-    Idle,      // the kernel waiting for real time
++    Idle,      // the kernel waiting for real time (a delay, the next vblank, a host wait): the guest's idle time
++    GeSync,    // with the GE thread: a guest thread blocked in sceGeDrawSync / sceGeListSync until the GE side has drawn
++    FlipWait,  // with the GE thread: the guest held at a flip because the renderer is frames behind (frames in flight)
++    SplitWait, // with the split GE thread: the walker waiting for the GL thread (draw ring full, presents ahead, a result)
++    WalkIdle,  // with the GE thread: the GE thread (the walker when split) asleep with no job to run
++    GlIdle,    // with the split GE thread: the GL thread asleep with no job to run
+     kCount
+ };
+ 

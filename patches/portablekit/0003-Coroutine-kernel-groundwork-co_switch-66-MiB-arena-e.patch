@@ -1,0 +1,2074 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 17:47:39 +0000
+Subject: [PATCH] Coroutine kernel groundwork: co_switch, 66 MiB arena,
+ execution layer
+
+- psprecomp::Coroutine: hand-written context switch for x86-64 SysV and
+  ARMv7 AAPCS hard-float (r4-r11, lr, d8-d15, FPSCR), guard page and canary,
+  high-water measurement; unit test.
+- GuestMemory is backed by one 66 MiB arena (ARCHITECTURE.md 1): RAM at
+  arena 0, scratchpad at 0x00010000, VRAM at 0x04000000; checked accessors
+  keep mirror folding; g_ram published by the Runtime's memory.
+- exec layer: g_cpu (the one register file), pk_guest_call / pk_hle_call /
+  pk_fatal / pk_yield, weak g_lean_entry table, INTERP_ONLY / LEAN_ONLY,
+  per-address kind table (native hook, lean entry, interpret).
+- Interpreter: interpret_guest_call keeps interpreting across jal, calls
+  import stubs and hooks directly, calls lean entries; optional histogram of
+  loads/stores by 1 MiB region with the PCs of odd accesses.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b612b11..e085748 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -150,7 +150,9 @@ endforeach()
+ # On Windows this also lets WINDOWS_EXPORT_ALL_SYMBOLS include runtime symbols
+ # in the executable's import library for separately linked overlay modules.
+ add_library(psprecomp_core OBJECT
++    "${PORTABLEKIT_ROOT}/src/coroutine.cpp"
+     "${PORTABLEKIT_ROOT}/src/decoder.cpp"
++    "${PORTABLEKIT_ROOT}/src/exec.cpp"
+     "${PORTABLEKIT_ROOT}/src/extra_instructions.cpp"
+     "${PORTABLEKIT_ROOT}/src/deflate.cpp"
+     "${PORTABLEKIT_ROOT}/src/elf32.cpp"
+@@ -195,6 +197,12 @@ endfunction()
+ 
+ if(PSPRECOMP_BUILD_TESTS)
+     enable_testing()
++    # Stackful coroutines: the context switch of the coroutine kernel.
++    add_executable(portablekit_coroutine_tests "${PORTABLEKIT_ROOT}/tests/coroutine_tests.cpp")
++    target_link_libraries(portablekit_coroutine_tests PRIVATE psprecomp_core)
++    set_target_properties(portablekit_coroutine_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_coroutine_tests COMMAND portablekit_coroutine_tests)
++
+     add_executable(psprecomp_tests "${PORTABLEKIT_ROOT}/tests/test_main.cpp")
+     target_link_libraries(psprecomp_tests PRIVATE psprecomp_core)
+     add_dependencies(psprecomp_tests psp_recomp)
+diff --git a/include/psprecomp/coroutine.hpp b/include/psprecomp/coroutine.hpp
+new file mode 100644
+index 0000000..ebb9b4d
+--- /dev/null
++++ b/include/psprecomp/coroutine.hpp
+@@ -0,0 +1,70 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// Stackful coroutines for guest threads.
++//
++// Every PSP thread runs on a host stack of its own, so a blocking system call
++// is an ordinary C++ call that returns when the thread is scheduled again,
++// and nothing is ever unwound. The switch is hand-written per architecture
++// (x86-64 System V, ARMv7 AAPCS with hard-float VFP): no ucontext, no setjmp,
++// no host threads.
++//
++// A Coroutine is either a stack made by create() or a placeholder for the stack
++// the program started on (the default-constructed one), which gets its saved
++// stack pointer the first time something switches away from it.
++namespace psprecomp {
++
++using CoroutineEntry = void (*)(void *argument);
++
++class Coroutine {
++public:
++    static constexpr std::size_t kDefaultStackBytes = 256u * 1024u;
++    static constexpr std::size_t kMinimumStackBytes = 16u * 1024u;
++
++    Coroutine() = default;
++    ~Coroutine();
++    Coroutine(const Coroutine &) = delete;
++    Coroutine &operator=(const Coroutine &) = delete;
++
++    // Allocates a stack and prepares the first switch to land in
++    // entry(argument). `entry` must never return: when it is done it switches
++    // away for good, and whoever switched to it releases the stack.
++    // Returns false when the stack cannot be allocated.
++    [[nodiscard]] bool create(std::size_t stack_bytes, CoroutineEntry entry, void *argument);
++    // Frees the stack. Not valid on the running coroutine.
++    void release() noexcept;
++    [[nodiscard]] bool valid() const noexcept { return stack_ != nullptr; }
++
++    // Saves the running context in `from` and continues `to`; returns when
++    // something switches back to `from`.
++    static void switch_to(Coroutine &from, Coroutine &to) noexcept;
++
++    // Stack safety. The canary is a run of known words at the low end of the
++    // stack (and a PROT_NONE page below it where the host has mmap); both are
++    // always set up, the check itself costs a few loads and is made on every
++    // switch when enabled (debug builds, or PORTABLEKIT_STACK_CHECK=1).
++    [[nodiscard]] bool canary_intact() const noexcept;
++    // True when `sp` (the saved stack pointer of a coroutine that is not
++    // running) lies inside this coroutine's stack with the canary beneath it.
++    [[nodiscard]] bool contains_stack_pointer(const void *sp) const noexcept;
++    // Bytes of the stack that were ever written, found from a fill pattern.
++    // Only meaningful when the stack was painted (stack checking enabled).
++    [[nodiscard]] std::size_t high_water_bytes() const noexcept;
++
++    [[nodiscard]] std::size_t stack_bytes() const noexcept { return usable_bytes_; }
++    [[nodiscard]] const void *saved_stack_pointer() const noexcept { return sp_; }
++    [[nodiscard]] void *stack_base() const noexcept { return stack_; }
++    [[nodiscard]] static bool stack_check_enabled() noexcept;
++
++private:
++    void *sp_{};
++    std::uint8_t *stack_{};        // lowest usable byte (just above the guard page)
++    std::uint8_t *mapping_{};      // start of the host allocation
++    std::size_t mapping_bytes_{};
++    std::size_t usable_bytes_{};
++    bool mapped_{};
++};
++
++} // namespace psprecomp
+diff --git a/include/psprecomp/exec.hpp b/include/psprecomp/exec.hpp
+new file mode 100644
+index 0000000..a1c331c
+--- /dev/null
++++ b/include/psprecomp/exec.hpp
+@@ -0,0 +1,104 @@
++#pragma once
++
++// The execution layer of the coroutine kernel: how guest code is entered, how it
++// reaches the system, and how the lean (function-granular) corpus and the
++// interpreter call each other. ARCHITECTURE.md sections 2-4 are the contract.
++//
++//   g_cpu          the one live AllegrexContext (== Runtime::cpu()).
++//   g_ram          the guest memory arena, 66 MiB; host(a) = g_ram + (a & 0x05FFFFFF).
++//   g_lean_entry   the corpus's table of regfile-convention entry thunks, index
++//                  (pc - lean base) >> 2, nullptr where no function starts. Optional:
++//                  the runtime links with or without a corpus (weak reference), and a
++//                  corpus loaded at run time hands its table to exec_set_lean_table().
++//   pk_guest_call  run the guest function at `pc` to its return, on the current
++//                  coroutine: its lean entry when there is one, else the interpreter.
++//   pk_hle_call    run the HLE function bound to an import stub; may switch coroutines
++//                  before returning.
++//   pk_fatal       the guest did something that cannot continue; never returns.
++//   pk_yield       PK_YIELD(): a point at which a guest loop that waits for an event
++//                  lets time pass and interrupts run.
++#include "psprecomp/allegrex_context.hpp"
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++extern "C" {
++extern psprecomp::AllegrexContext g_cpu;
++extern std::uint8_t *g_ram;
++void pk_guest_call(std::uint32_t pc);
++void pk_hle_call(std::uint32_t stub_pc);
++[[noreturn]] void pk_fatal(const char *message, std::uint32_t pc);
++void pk_yield(void);
++}
++
++// host(a) for generated code and for the host's own unchecked accesses.
++#define PK_GUEST_TO_HOST(a) (g_ram + (static_cast<std::uint32_t>(a) & 0x05FFFFFFu))
++
++namespace psprecomp {
++
++class Runtime;
++
++using LeanEntry = void (*)();
++
++inline constexpr std::uint32_t kLeanDefaultBase = 0x08804000u;
++// Where a guest call made by the host returns to. An interpreted callee has this
++// in $ra and the interpreter stops when control reaches it.
++inline constexpr std::uint32_t kGuestReturnSentinel = 0x0880000Cu;
++
++enum class TargetKind : std::uint8_t {
++    Interpret = 0,  // no native hook, no lean entry (or forced): the interpreter runs it
++    Native = 1,     // an import stub or a profile hook registered with Runtime::register_function
++    Lean = 2,       // a lean entry thunk exists and the function is not forced
++};
++
++struct ExecOptions {
++    // INFECTED_INTERP_ONLY: "all", or addresses and address ranges ("0x08935F54,0x089118B0-0x08911900").
++    // A forced function runs in the interpreter even when the corpus has a lean entry for it.
++    std::string interp_only;
++    // INFECTED_LEAN_ONLY: running the interpreter is a fatal error.
++    bool lean_only = false;
++};
++
++// Attaches the runtime the C entry points work on. Called by Runtime's constructor.
++void exec_attach(Runtime &runtime) noexcept;
++void exec_configure(const ExecOptions &options);
++// Gives the runtime the lean table of a corpus loaded at run time. A table linked in as
++// g_lean_entry is found without this.
++void exec_set_lean_table(const LeanEntry *table, std::uint32_t count, std::uint32_t base = kLeanDefaultBase) noexcept;
++[[nodiscard]] bool exec_have_lean_table() noexcept;
++// Rebuilds the per-address kind table after functions were registered or the options changed.
++void exec_rebuild_kinds();
++[[nodiscard]] TargetKind exec_classify(std::uint32_t pc) noexcept;
++[[nodiscard]] LeanEntry exec_lean_entry(std::uint32_t pc) noexcept;
++void exec_mark_native(std::uint32_t pc) noexcept;
++void exec_clear_native(std::uint32_t pc) noexcept;
++
++// Called when the runtime stopped (or pk_fatal ran) while a guest call is in flight. It
++// must not return: the kernel switches away from the coroutine for good. Without one, the
++// call returns to its caller with the runtime stopped.
++void exec_set_abort_hook(void (*hook)()) noexcept;
++// Called every `interval` interpreted instructions that ran without a system call
++// (interval 0 turns it off), with the pc of the instruction about to run. This is
++// where the old kernel's starvation preemption lives.
++using ExecSpinHook = void (*)(std::uint32_t pc);
++void exec_set_spin_hook(ExecSpinHook hook, std::uint64_t interval) noexcept;
++// The system was entered: resets the spin counter.
++void exec_note_system_call() noexcept;
++
++struct ExecStats {
++    std::uint64_t lean_calls{};         // pk_guest_call that ran a lean entry
++    std::uint64_t interpreted_calls{};  // pk_guest_call that ran the interpreter
++    std::uint64_t native_calls{};       // hooks and import stubs reached through pk_guest_call
++    std::uint64_t hle_calls{};          // pk_hle_call
++    std::uint64_t interpreter_to_lean{};
++    std::uint64_t interpreter_to_native{};
++};
++[[nodiscard]] ExecStats exec_stats() noexcept;
++[[nodiscard]] ExecStats &exec_counters() noexcept;
++// Interpreted instructions were run: feeds the spin hook.
++void exec_account_instructions(std::uint64_t count, std::uint32_t pc);
++void exec_report(std::string &out);
++
++} // namespace psprecomp
+diff --git a/include/psprecomp/guest_memory.hpp b/include/psprecomp/guest_memory.hpp
+index 2debfd3..8ee7c7c 100644
+--- a/include/psprecomp/guest_memory.hpp
++++ b/include/psprecomp/guest_memory.hpp
+@@ -29,8 +29,28 @@ public:
+     static constexpr std::uint32_t kVramMirrorCount = 4u;
+     static constexpr std::uint32_t kVramAddressSpan = kVramSize * kVramMirrorCount;
+     static constexpr std::uint32_t kPhysicalBase = 0x08000000u;
++    static constexpr std::uint32_t kScratchpadBase = 0x00010000u;
++    static constexpr std::uint32_t kScratchpadSize = 16u * 1024u;
++
++    // One flat arena holds everything the guest can address (ARCHITECTURE.md 1):
++    //   arena 0x00000000.. user RAM (guest 0x08000000, and the 0x48/0x88 aliases)
++    //   arena 0x00010000.. the scratchpad (guest 0x00010000, no relocation); it lies
++    //                      in the unused kernel area of user RAM, guest 0x08010000
++    //   arena 0x04000000.. VRAM, 2 MiB (guest 0x04000000 and the 0x44 alias)
++    // so that host(a) = arena + (a & 0x05FFFFFF) is one mask for generated code.
++    // The mask reaches the first 32 MiB of RAM and the first 2 MiB of VRAM; the
++    // checked accessors below also fold the VRAM mirrors, the 64 MiB RAM size and
++    // the other aliases, which the mask does not.
++    static constexpr std::uint32_t kArenaVramOffset = 0x04000000u;
++    static constexpr std::size_t kArenaBytes = 0x04200000u;
++    static constexpr std::uint32_t kHostMask = 0x05FFFFFFu;
+ 
+     explicit GuestMemory(std::uint32_t size_bytes = 32u * 1024u * 1024u);
++    ~GuestMemory();
++    // Publishes this arena as g_ram (the arena generated code indexes).
++    void make_primary() noexcept;
++    [[nodiscard]] std::uint8_t *arena() noexcept { return arena_; }
++    [[nodiscard]] const std::uint8_t *arena() const noexcept { return arena_; }
+ 
+     // The AOT fast paths below index cached region pointers, so an instance may
+     // not be relocated after construction.  Runtime owns exactly one by value
+@@ -164,21 +184,17 @@ public:
+     void zero(std::uint32_t address, std::size_t length);
+ 
+     [[nodiscard]] std::string read_c_string(std::uint32_t address, std::size_t max_length = 256u) const;
+-    [[nodiscard]] const std::vector<std::uint8_t> &bytes() const noexcept;
+-    [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
+ 
+ private:
+-    enum class Region { Vram, Ram };
+-    struct ResolvedAddress {
+-        Region region;
+-        std::size_t offset;
++    // A guest address resolved to host memory: `run` bytes are contiguous from `data`.
++    struct Located {
++        std::uint8_t *data;
++        std::size_t run;
+     };
+-
+-    [[nodiscard]] ResolvedAddress resolve(std::uint32_t address, std::size_t length) const;
++    // False when the address is outside RAM, VRAM (with its mirrors) and the scratchpad.
++    [[nodiscard]] bool locate(std::uint32_t address, Located &out) const noexcept;
++    [[nodiscard]] Located resolve(std::uint32_t address) const;  // throws Error
+     [[nodiscard]] bool is_vram_window(std::uint32_t canonical_address) const noexcept;
+-    [[nodiscard]] std::size_t vram_offset(std::uint32_t canonical_address) const noexcept;
+-    [[nodiscard]] const std::vector<std::uint8_t> &region_bytes(Region region) const noexcept;
+-    [[nodiscard]] std::vector<std::uint8_t> &region_bytes(Region region) noexcept;
+ 
+     // Canonicalize and rebase in one step.  An address below kPhysicalBase --
+     // EDRAM included -- wraps to a value far above any RAM size, so a single
+@@ -225,17 +241,16 @@ private:
+     void aot_store16_slow(std::uint32_t address, std::uint16_t value);
+     void aot_store32_slow(std::uint32_t address, std::uint32_t value);
+ 
+-    std::vector<std::uint8_t> vram_;
+-    std::vector<std::uint8_t> bytes_;
+-    // Cached view of bytes_ for the inline fast paths.  Neither region is ever
+-    // resized after construction, so these stay valid for the object's life.
++    std::uint8_t *arena_{};
++    std::uint32_t ram_bytes_{};
++    // Cached view of the RAM at the start of the arena for the inline fast paths.
++    // Neither is ever moved after construction, so these stay valid for the
++    // object's life.
+     //
+     // Deliberately not __restrict.  It was tried on the theory that aliasing
+     // against the AllegrexContext was forcing the guest register file to spill
+     // on every memory instruction: measured on the 1500-vblank route it moved
+-    // nothing (0.599 us/dispatch against 0.595 without it), and it is not even
+-    // sound here -- this pointer aliases bytes_ below, which other members of
+-    // this class access directly.
++    // nothing (0.599 us/dispatch against 0.595 without it).
+     std::uint8_t *ram_data_{};
+     std::uint32_t ram_limit8_{};
+     std::uint32_t ram_limit16_{};
+diff --git a/include/psprecomp/interpreter.hpp b/include/psprecomp/interpreter.hpp
+index 2ce83fa..1b723ab 100644
+--- a/include/psprecomp/interpreter.hpp
++++ b/include/psprecomp/interpreter.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -44,6 +45,21 @@ struct InterpreterStats {
+ InterpreterExit interpret_allegrex(Runtime &runtime, AllegrexContext &ctx,
+                                    std::uint64_t instruction_budget = 0u);
+ 
++// The coroutine kernel's way in (exec.hpp): runs the callee at `entry` on `ctx`,
++// which the caller has given $ra = kGuestReturnSentinel, until it returns there.
++// `jal`/`jalr`/`j` to an address that has a native hook or a lean entry call it
++// directly, and an import stub runs its HLE function in place, which may switch
++// coroutines before it returns; every other call is interpreted without leaving
++// the loop. Stops early, with the runtime stopped, on an unsupported instruction.
++// May throw psprecomp::Error for a bad guest address.
++void interpret_guest_call(Runtime &runtime, AllegrexContext &ctx, std::uint32_t entry);
++
++// Guest loads and stores by 1 MiB region of the raw address, with the PC of every
++// access that is outside user RAM, VRAM and the scratchpad of the arena
++// (PSPRECOMP_INTERPRETER_REGION_HISTOGRAM=1 turns it on at start).
++void set_interpreter_region_histogram(bool enabled);
++void report_interpreter_region_histogram(std::string &out);
++
+ // Defaults to enabled; PSPRECOMP_NO_INTERPRETER=1 restores the strict
+ // "No recompiled function registered" stop.
+ [[nodiscard]] bool interpreter_fallback_enabled() noexcept;
+diff --git a/include/psprecomp/runtime.hpp b/include/psprecomp/runtime.hpp
+index 9a01621..b80d82b 100644
+--- a/include/psprecomp/runtime.hpp
++++ b/include/psprecomp/runtime.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include "psprecomp/allegrex_context.hpp"
+ #include "psprecomp/corpus_abi.hpp"
++#include "psprecomp/exec.hpp"
+ #include "psprecomp/guest_memory.hpp"
+ #include "psprecomp/nid_registry.hpp"
+ 
+@@ -63,6 +64,11 @@ public:
+     NidRegistry &nids() noexcept;
+     const NidRegistry &nids() const noexcept;
+ 
++    // Registers a native replacement of a guest address: a profile's hook, or an
++    // import stub. The execution layer (exec.hpp) calls it, with the guest's
++    // registers in cpu(), wherever guest code calls this address; it leaves
++    // the result in v0/v1/f0 and returns (it may set pc to $ra, which is ignored).
++    // Code a corpus registers through its host table is not native in this sense.
+     void register_function(std::uint32_t address, RecompiledFunction function, std::string name);
+     void register_hle(std::string library, std::uint32_t nid, HleFunction function);
+     // Binds a PSP import stub's address, so a jump to it calls the HLE and
+@@ -73,6 +79,10 @@ public:
+     // an AOT build keeps the wrapper its own code registered.
+     bool register_import_stub(std::uint32_t address, std::string library, std::uint32_t nid);
+     [[nodiscard]] bool has_function(std::uint32_t address) const;
++    // Execution layer: a native hook or import stub at `address`, and running it
++    // against cpu() with pc = address.
++    [[nodiscard]] bool is_native_function(std::uint32_t address) const noexcept;
++    void call_native(std::uint32_t address);
+     [[nodiscard]] std::size_t function_count() const noexcept;
+ 
+     void set_game_root(std::filesystem::path root);
+@@ -183,9 +193,11 @@ private:
+     // holds nothing executable, and the caller keeps its own diagnostic.
+     [[nodiscard]] bool run_interpreter_fallback(AllegrexContext &ctx);
+ 
++    void register_corpus_function(std::uint32_t address, RecompiledFunction function, std::string name);
++
+     GuestMemory memory_;
+     NidRegistry nids_;
+-    AllegrexContext cpu_;
++    AllegrexContext &cpu_;  // the one live register file, g_cpu
+     std::unordered_map<std::uint32_t, FunctionEntry> functions_;
+     // Direct PC table, covering only the registered code window rather than all
+     // of guest RAM.  direct_base_ is its 1 MiB-aligned first canonical address.
+@@ -205,6 +217,7 @@ private:
+     std::unordered_map<std::uint32_t, NativeFastPath> native_fast_paths_;
+     std::vector<const HleFunction *> import_bindings_;
+     std::filesystem::path game_root_;
++    std::unordered_map<std::uint32_t, bool> native_addresses_;
+     bool stopped_{};
+     std::string stop_reason_;
+     bool hle_histogram_enabled_{};
+diff --git a/src/coroutine.cpp b/src/coroutine.cpp
+new file mode 100644
+index 0000000..912e19f
+--- /dev/null
++++ b/src/coroutine.cpp
+@@ -0,0 +1,278 @@
++#include "psprecomp/coroutine.hpp"
++
++#include <cstdint>
++#include <cstdlib>
++#include <stdlib.h>
++#include <cstring>
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#define PSPRECOMP_CO_HAVE_MMAP 1
++#endif
++
++// ---------------------------------------------------------------------------
++// The switch. One routine per architecture; both save exactly what the calling
++// convention makes the callee preserve, push it on the stack being left, store
++// that stack pointer through `save_sp`, adopt `new_sp` and pop the same set.
++//
++//   void pk_co_switch(void **save_sp, void *new_sp);
++//
++// A new coroutine's first "return" lands in pk_co_start, which calls
++// entry(argument) with both carried in callee-saved registers.
++
++extern "C" void pk_co_switch(void **save_sp, void *new_sp);
++extern "C" void pk_co_start();
++
++#if defined(__x86_64__) && defined(__ELF__)
++
++// Frame, lowest address first, as pk_co_switch pops it:
++//   [mxcsr:4 | x87 control word:4] r15 r14 r13 r12 rbx rbp [return address]
++asm(R"(
++    .text
++    .p2align 4
++    .globl pk_co_switch
++    .type pk_co_switch,@function
++pk_co_switch:
++    pushq %rbp
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    subq $8, %rsp
++    stmxcsr (%rsp)
++    fnstcw 4(%rsp)
++    movq %rsp, (%rdi)
++    movq %rsi, %rsp
++    ldmxcsr (%rsp)
++    fldcw 4(%rsp)
++    addq $8, %rsp
++    popq %r15
++    popq %r14
++    popq %r13
++    popq %r12
++    popq %rbx
++    popq %rbp
++    ret
++    .size pk_co_switch,.-pk_co_switch
++
++    .p2align 4
++    .globl pk_co_start
++    .type pk_co_start,@function
++pk_co_start:
++    movq %r13, %rdi
++    callq *%r12
++    ud2
++    .size pk_co_start,.-pk_co_start
++)");
++
++namespace psprecomp {
++namespace {
++constexpr std::size_t kFrameBytes = 8u * 8u;
++void *prepare_stack(std::uint8_t *top, CoroutineEntry entry, void *argument) {
++    // After pk_co_switch pops the frame and returns, rsp = frame + 64 must be
++    // 16-byte aligned so that pk_co_start's `call` leaves the callee with the
++    // ABI's rsp % 16 == 8.
++    auto *frame = reinterpret_cast<std::uint64_t *>(top - kFrameBytes - 16u);
++    std::uint32_t mxcsr = 0x1F80u;
++    std::uint16_t fpucw = 0x037Fu;
++    asm volatile("stmxcsr %0" : "=m"(mxcsr));
++    asm volatile("fnstcw %0" : "=m"(fpucw));
++    frame[0] = static_cast<std::uint64_t>(mxcsr) | (static_cast<std::uint64_t>(fpucw) << 32u);
++    frame[1] = 0u;                                                 // r15
++    frame[2] = 0u;                                                 // r14
++    frame[3] = reinterpret_cast<std::uint64_t>(argument);          // r13
++    frame[4] = reinterpret_cast<std::uint64_t>(entry);             // r12
++    frame[5] = 0u;                                                 // rbx
++    frame[6] = 0u;                                                 // rbp
++    frame[7] = reinterpret_cast<std::uint64_t>(&pk_co_start);      // return address
++    return frame;
++}
++} // namespace
++} // namespace psprecomp
++
++#elif defined(__arm__) && defined(__ELF__)
++
++#if defined(__thumb__)
++#define PK_CO_THUMB_FUNC ".thumb_func\n"
++#else
++#define PK_CO_THUMB_FUNC ""
++#endif
++#if defined(__VFP_FP__) && !defined(__SOFTFP__)
++#define PK_CO_VFP_SAVE "    vmrs r2, fpscr\n"
++#define PK_CO_VFP_PUSH "    vpush {d8-d15}\n"
++#define PK_CO_VFP_POP "    vpop {d8-d15}\n"
++#define PK_CO_VFP_RESTORE "    vmsr fpscr, r2\n"
++#define PK_CO_FRAME_VFP 1
++#else
++#define PK_CO_VFP_SAVE ""
++#define PK_CO_VFP_PUSH ""
++#define PK_CO_VFP_POP ""
++#define PK_CO_VFP_RESTORE ""
++#define PK_CO_FRAME_VFP 0
++#endif
++
++// Frame, lowest address first: d8-d15 (VFP only), then r2 (holds FPSCR),
++// r4-r11 and lr, as push/vpush leave them.
++asm(
++    ".syntax unified\n"
++    ".text\n"
++    ".align 2\n"
++    ".globl pk_co_switch\n"
++    ".type pk_co_switch,%function\n"
++    PK_CO_THUMB_FUNC
++    "pk_co_switch:\n"
++    PK_CO_VFP_SAVE
++    "    push {r2, r4-r11, lr}\n"
++    PK_CO_VFP_PUSH
++    "    str sp, [r0]\n"
++    "    mov sp, r1\n"
++    PK_CO_VFP_POP
++    "    pop {r2, r4-r11, lr}\n"
++    PK_CO_VFP_RESTORE
++    "    bx lr\n"
++    ".size pk_co_switch,.-pk_co_switch\n"
++    ".align 2\n"
++    ".globl pk_co_start\n"
++    ".type pk_co_start,%function\n"
++    PK_CO_THUMB_FUNC
++    "pk_co_start:\n"
++    "    mov r0, r5\n"
++    "    blx r4\n"
++    "    udf #0\n"
++    ".size pk_co_start,.-pk_co_start\n");
++
++namespace psprecomp {
++namespace {
++constexpr std::size_t kFrameBytes = (PK_CO_FRAME_VFP ? 64u : 0u) + 10u * 4u;
++void *prepare_stack(std::uint8_t *top, CoroutineEntry entry, void *argument) {
++    auto *frame = reinterpret_cast<std::uint32_t *>(top - kFrameBytes);
++    std::size_t index = 0;
++#if PK_CO_FRAME_VFP
++    for (; index < 16; ++index) frame[index] = 0u;                 // d8-d15
++#endif
++    std::uint32_t fpscr = 0u;
++#if PK_CO_FRAME_VFP
++    asm volatile("vmrs %0, fpscr" : "=r"(fpscr));
++#endif
++    frame[index++] = fpscr;                                          // r2
++    frame[index++] = reinterpret_cast<std::uintptr_t>(entry);        // r4
++    frame[index++] = reinterpret_cast<std::uintptr_t>(argument);     // r5
++    for (int reg = 6; reg <= 11; ++reg) frame[index++] = 0u;         // r6-r11
++    frame[index++] = reinterpret_cast<std::uintptr_t>(&pk_co_start); // lr
++    return frame;
++}
++} // namespace
++} // namespace psprecomp
++
++#else
++#error "psprecomp::Coroutine has no context switch for this architecture (x86-64 ELF and ARMv7 ELF are written)"
++#endif
++
++namespace psprecomp {
++namespace {
++
++constexpr std::size_t kCanaryWords = 16u;
++constexpr std::uint32_t kCanary = 0xC0FFEE05u;
++constexpr std::uint8_t kPaint = 0xA5u;
++
++std::size_t page_size() {
++#if defined(PSPRECOMP_CO_HAVE_MMAP)
++    static const std::size_t size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
++    return size;
++#else
++    return 4096u;
++#endif
++}
++
++} // namespace
++
++bool Coroutine::stack_check_enabled() noexcept {
++    static const bool enabled = [] {
++#if !defined(NDEBUG)
++        return std::getenv("PORTABLEKIT_NO_STACK_CHECK") == nullptr;
++#else
++        const char *text = std::getenv("PORTABLEKIT_STACK_CHECK");
++        return text != nullptr && *text != '\0' && *text != '0';
++#endif
++    }();
++    return enabled;
++}
++
++Coroutine::~Coroutine() { release(); }
++
++bool Coroutine::create(std::size_t stack_bytes, CoroutineEntry entry, void *argument) {
++    release();
++    if (stack_bytes < kMinimumStackBytes) stack_bytes = kMinimumStackBytes;
++    const std::size_t page = page_size();
++    stack_bytes = (stack_bytes + page - 1u) & ~(page - 1u);
++#if defined(PSPRECOMP_CO_HAVE_MMAP)
++    // One PROT_NONE page below the stack turns an overflow into a fault at the
++    // overflowing instruction instead of silent corruption of a neighbour.
++    const std::size_t total = stack_bytes + page;
++    void *mapping = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    if (mapping == MAP_FAILED) return false;
++    (void)mprotect(mapping, page, PROT_NONE);
++    mapping_ = static_cast<std::uint8_t *>(mapping);
++    mapping_bytes_ = total;
++    stack_ = mapping_ + page;
++    mapped_ = true;
++#else
++    void *mapping = ::aligned_alloc(16u, stack_bytes);
++    if (mapping == nullptr) return false;
++    mapping_ = static_cast<std::uint8_t *>(mapping);
++    mapping_bytes_ = stack_bytes;
++    stack_ = mapping_;
++    mapped_ = false;
++#endif
++    usable_bytes_ = stack_bytes;
++    if (stack_check_enabled()) std::memset(stack_, kPaint, usable_bytes_);
++    auto *canary = reinterpret_cast<std::uint32_t *>(stack_);
++    for (std::size_t i = 0; i < kCanaryWords; ++i) canary[i] = kCanary;
++    sp_ = prepare_stack(stack_ + usable_bytes_, entry, argument);
++    return true;
++}
++
++void Coroutine::release() noexcept {
++    if (mapping_ == nullptr) return;
++#if defined(PSPRECOMP_CO_HAVE_MMAP)
++    if (mapped_) munmap(mapping_, mapping_bytes_);
++    else std::free(mapping_);
++#else
++    std::free(mapping_);
++#endif
++    mapping_ = nullptr;
++    stack_ = nullptr;
++    mapping_bytes_ = 0u;
++    usable_bytes_ = 0u;
++    sp_ = nullptr;
++    mapped_ = false;
++}
++
++void Coroutine::switch_to(Coroutine &from, Coroutine &to) noexcept {
++    pk_co_switch(&from.sp_, to.sp_);
++}
++
++bool Coroutine::canary_intact() const noexcept {
++    if (stack_ == nullptr) return true;
++    const auto *canary = reinterpret_cast<const std::uint32_t *>(stack_);
++    for (std::size_t i = 0; i < kCanaryWords; ++i)
++        if (canary[i] != kCanary) return false;
++    return true;
++}
++
++bool Coroutine::contains_stack_pointer(const void *sp) const noexcept {
++    if (stack_ == nullptr) return true;  // the program's own stack: not ours to check
++    const auto *p = static_cast<const std::uint8_t *>(sp);
++    return p >= stack_ + kCanaryWords * sizeof(std::uint32_t) && p <= stack_ + usable_bytes_;
++}
++
++std::size_t Coroutine::high_water_bytes() const noexcept {
++    if (stack_ == nullptr) return 0u;
++    std::size_t offset = kCanaryWords * sizeof(std::uint32_t);
++    while (offset < usable_bytes_ && stack_[offset] == kPaint) ++offset;
++    return usable_bytes_ - offset;
++}
++
++} // namespace psprecomp
+diff --git a/src/exec.cpp b/src/exec.cpp
+new file mode 100644
+index 0000000..fcf1fb7
+--- /dev/null
++++ b/src/exec.cpp
+@@ -0,0 +1,310 @@
++#include "psprecomp/exec.hpp"
++
++#include "psprecomp/common.hpp"
++#include "psprecomp/interpreter.hpp"
++#include "psprecomp/runtime.hpp"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sstream>
++
++// The state of the one register file; the arena pointer g_ram is defined with the
++// memory it points into (guest_memory.cpp).
++extern "C" {
++psprecomp::AllegrexContext g_cpu{};
++
++// A corpus links its table in under these names (ARCHITECTURE.md 3). Weak, so the runtime
++// links with or without one; a corpus loaded at run time uses exec_set_lean_table().
++extern void (*const g_lean_entry[])() __attribute__((weak));
++extern const std::uint32_t g_lean_entry_count __attribute__((weak));
++}
++
++namespace psprecomp {
++namespace {
++
++constexpr std::uint32_t kWindowBase = 0x08000000u;
++constexpr std::uint32_t kWindowBytes = 32u * 1024u * 1024u;
++constexpr std::uint32_t kWindowWords = kWindowBytes / 4u;
++constexpr std::uint8_t kNativeBit = 1u;
++constexpr std::uint8_t kLeanBit = 2u;
++
++struct State {
++    Runtime *runtime{};
++    const LeanEntry *lean{};
++    std::uint32_t lean_count{};
++    std::uint32_t lean_base{kLeanDefaultBase};
++    bool all_interpreted{};
++    bool lean_only{};
++    std::vector<std::pair<std::uint32_t, std::uint32_t>> forced;
++    std::uint8_t *kinds{};
++    void (*abort_hook)(){};
++    ExecSpinHook spin_hook{};
++    std::uint64_t spin_interval{};
++    std::uint64_t since_system_call{};
++    ExecStats stats{};
++};
++
++State &state() {
++    static State value;
++    return value;
++}
++
++long kind_index(std::uint32_t pc) noexcept {
++    const std::uint32_t c = pc & 0x1FFFFFFFu;
++    if (c < kWindowBase || c >= kWindowBase + kWindowBytes || (c & 3u) != 0u) return -1;
++    return static_cast<long>((c - kWindowBase) >> 2u);
++}
++
++std::uint8_t *kinds_table(State &s) {
++    if (s.kinds == nullptr) s.kinds = static_cast<std::uint8_t *>(std::calloc(kWindowWords, 1u));
++    return s.kinds;
++}
++
++[[noreturn]] void give_up() {
++    State &s = state();
++    std::fflush(stdout);
++    std::fflush(stderr);
++    if (s.abort_hook != nullptr) s.abort_hook();
++    // Nothing to switch away to: the process cannot continue the guest call.
++    std::abort();
++}
++
++// Leaves the guest call when the runtime stopped. Without an abort hook the call returns and the
++// caller (a test) looks at Runtime::stopped().
++void leave_if_stopped() {
++    State &s = state();
++    if (s.runtime != nullptr && s.runtime->stopped() && s.abort_hook != nullptr) s.abort_hook();
++}
++
++bool parse_number(const std::string &text, std::uint32_t &value) {
++    if (text.empty()) return false;
++    char *end = nullptr;
++    const unsigned long parsed = std::strtoul(text.c_str(), &end, 0);
++    if (end == text.c_str() || *end != '\0') return false;
++    value = static_cast<std::uint32_t>(parsed);
++    return true;
++}
++
++} // namespace
++
++void exec_attach(Runtime &runtime) noexcept {
++    State &s = state();
++    s.runtime = &runtime;
++    // Clear the kind table for the new runtime and pick up a linked corpus.
++    if (s.kinds != nullptr) std::memset(s.kinds, 0, kWindowWords);
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Waddress"
++    if (g_lean_entry != nullptr && &g_lean_entry_count != nullptr) {
++        s.lean = g_lean_entry;
++        s.lean_count = g_lean_entry_count;
++        s.lean_base = kLeanDefaultBase;
++    }
++#pragma GCC diagnostic pop
++}
++
++void exec_set_lean_table(const LeanEntry *table, std::uint32_t count, std::uint32_t base) noexcept {
++    State &s = state();
++    s.lean = table;
++    s.lean_count = count;
++    s.lean_base = base;
++    exec_rebuild_kinds();
++}
++
++bool exec_have_lean_table() noexcept { return state().lean != nullptr && state().lean_count != 0u; }
++
++void exec_configure(const ExecOptions &options) {
++    State &s = state();
++    s.lean_only = options.lean_only;
++    s.all_interpreted = false;
++    s.forced.clear();
++    std::string token;
++    std::istringstream list(options.interp_only);
++    while (std::getline(list, token, ',')) {
++        token.erase(std::remove_if(token.begin(), token.end(), [](char c) { return c == ' ' || c == '\t'; }), token.end());
++        if (token.empty()) continue;
++        if (token == "all") {
++            s.all_interpreted = true;
++            continue;
++        }
++        const std::size_t dash = token.find('-');
++        std::uint32_t low = 0u, high = 0u;
++        if (dash == std::string::npos) {
++            if (!parse_number(token, low)) throw Error("INTERP_ONLY: not an address: " + token);
++            high = low;
++        } else if (!parse_number(token.substr(0, dash), low) || !parse_number(token.substr(dash + 1u), high)) {
++            throw Error("INTERP_ONLY: not an address range: " + token);
++        }
++        if (high < low) std::swap(low, high);
++        s.forced.emplace_back(low & 0x1FFFFFFFu, high & 0x1FFFFFFFu);
++    }
++    exec_rebuild_kinds();
++}
++
++void exec_rebuild_kinds() {
++    State &s = state();
++    std::uint8_t *table = kinds_table(s);
++    if (table == nullptr) return;
++    // The lean bit is rebuilt from the table; native bits stay as registered.
++    for (std::uint32_t i = 0; i < s.lean_count; ++i) {
++        const long index = kind_index(s.lean_base + i * 4u);
++        if (index < 0) continue;
++        table[index] = static_cast<std::uint8_t>(table[index] & ~kLeanBit);
++        if (s.lean == nullptr || s.lean[i] == nullptr || s.all_interpreted) continue;
++        const std::uint32_t address = (s.lean_base + i * 4u) & 0x1FFFFFFFu;
++        bool forced = false;
++        for (const auto &[low, high] : s.forced)
++            if (address >= low && address <= high) { forced = true; break; }
++        if (!forced) table[index] = static_cast<std::uint8_t>(table[index] | kLeanBit);
++    }
++}
++
++TargetKind exec_classify(std::uint32_t pc) noexcept {
++    const State &s = state();
++    if (s.kinds == nullptr) return TargetKind::Interpret;
++    const long index = kind_index(pc);
++    if (index < 0) return TargetKind::Interpret;
++    const std::uint8_t kind = s.kinds[index];
++    if ((kind & kNativeBit) != 0u) return TargetKind::Native;
++    if ((kind & kLeanBit) != 0u) return TargetKind::Lean;
++    return TargetKind::Interpret;
++}
++
++LeanEntry exec_lean_entry(std::uint32_t pc) noexcept {
++    const State &s = state();
++    const std::uint32_t index = (pc - s.lean_base) >> 2u;
++    return index < s.lean_count ? s.lean[index] : nullptr;
++}
++
++void exec_mark_native(std::uint32_t pc) noexcept {
++    State &s = state();
++    std::uint8_t *table = kinds_table(s);
++    const long index = kind_index(pc);
++    if (table != nullptr && index >= 0) table[index] = static_cast<std::uint8_t>(table[index] | kNativeBit);
++}
++
++void exec_clear_native(std::uint32_t pc) noexcept {
++    State &s = state();
++    const long index = kind_index(pc);
++    if (s.kinds != nullptr && index >= 0) s.kinds[index] = static_cast<std::uint8_t>(s.kinds[index] & ~kNativeBit);
++}
++
++void exec_set_abort_hook(void (*hook)()) noexcept { state().abort_hook = hook; }
++
++void exec_set_spin_hook(ExecSpinHook hook, std::uint64_t interval) noexcept {
++    State &s = state();
++    s.spin_hook = hook;
++    s.spin_interval = hook != nullptr ? interval : 0u;
++}
++
++void exec_note_system_call() noexcept { state().since_system_call = 0u; }
++
++void exec_account_instructions(std::uint64_t count, std::uint32_t pc) {
++    State &s = state();
++    s.since_system_call += count;
++    if (s.spin_interval != 0u && s.since_system_call >= s.spin_interval) {
++        s.since_system_call = 0u;
++        if (s.spin_hook != nullptr) s.spin_hook(pc);
++    }
++}
++
++ExecStats exec_stats() noexcept { return state().stats; }
++ExecStats &exec_counters() noexcept { return state().stats; }
++
++void exec_report(std::string &out) {
++    const ExecStats &st = state().stats;
++    char line[256];
++    std::snprintf(line, sizeof line,
++                  "[exec] pk_guest_call: %llu lean, %llu interpreted, %llu native; pk_hle_call: %llu; "
++                  "interpreter->lean %llu, interpreter->native %llu; lean table: %s (%u entries)\n",
++                  static_cast<unsigned long long>(st.lean_calls), static_cast<unsigned long long>(st.interpreted_calls),
++                  static_cast<unsigned long long>(st.native_calls), static_cast<unsigned long long>(st.hle_calls),
++                  static_cast<unsigned long long>(st.interpreter_to_lean),
++                  static_cast<unsigned long long>(st.interpreter_to_native),
++                  exec_have_lean_table() ? "linked" : "none", state().lean_count);
++    out += line;
++}
++
++} // namespace psprecomp
++
++// ---------------------------------------------------------------------------
++// The C entry points.
++
++using psprecomp::State;
++
++extern "C" void pk_guest_call(std::uint32_t pc) {
++    using namespace psprecomp;
++    State &s = state();
++    Runtime &rt = *s.runtime;
++    switch (exec_classify(pc)) {
++    case TargetKind::Native:
++        ++s.stats.native_calls;
++        exec_note_system_call();
++        try {
++            rt.call_native(pc);
++        } catch (const std::exception &e) {
++            rt.stop(std::string(e.what()) + " in native function " + hex32(pc));
++        }
++        break;
++    case TargetKind::Lean:
++        ++s.stats.lean_calls;
++        exec_lean_entry(pc)();
++        break;
++    case TargetKind::Interpret: {
++        if (s.lean_only) pk_fatal("lean-only mode: this function would run in the interpreter", pc);
++        ++s.stats.interpreted_calls;
++        const std::uint32_t saved_ra = g_cpu.gpr[31];
++        g_cpu.gpr[31] = kGuestReturnSentinel;
++        try {
++            interpret_guest_call(rt, g_cpu, pc);
++        } catch (const std::exception &e) {
++            // Name the guest code, as a fault in generated code is named.
++            std::ostringstream message;
++            message << e.what() << " while interpreting from " << hex32(pc) << " guest_pc=" << hex32(g_cpu.pc)
++                    << " (a0=" << hex32(g_cpu.gpr[4]) << ", a1=" << hex32(g_cpu.gpr[5]) << ", sp=" << hex32(g_cpu.gpr[29])
++                    << ", ra=" << hex32(g_cpu.gpr[31]) << ")";
++            rt.stop(message.str());
++        }
++        g_cpu.gpr[31] = saved_ra;
++        break;
++    }
++    }
++    leave_if_stopped();
++}
++
++extern "C" void pk_hle_call(std::uint32_t stub_pc) {
++    using namespace psprecomp;
++    State &s = state();
++    Runtime &rt = *s.runtime;
++    ++s.stats.hle_calls;
++    exec_note_system_call();
++    try {
++        rt.call_native(stub_pc);
++    } catch (const std::exception &e) {
++        rt.stop(std::string(e.what()) + " in the system call at " + hex32(stub_pc));
++    }
++    leave_if_stopped();
++}
++
++extern "C" [[noreturn]] void pk_fatal(const char *message, std::uint32_t pc) {
++    using namespace psprecomp;
++    State &s = state();
++    std::ostringstream text;
++    text << "guest fatal: " << message << " at pc " << hex32(pc) << " (a0=" << hex32(g_cpu.gpr[4])
++         << ", a1=" << hex32(g_cpu.gpr[5]) << ", sp=" << hex32(g_cpu.gpr[29]) << ", ra=" << hex32(g_cpu.gpr[31]) << ")";
++    std::fprintf(stderr, "[fatal] %s\n", text.str().c_str());
++    if (s.runtime != nullptr) s.runtime->stop(text.str());
++    give_up();
++}
++
++extern "C" void pk_yield(void) {
++    using namespace psprecomp;
++    State &s = state();
++    // A loop that waits for an event reaches here without having called the system.
++    if (s.spin_hook != nullptr) {
++        s.since_system_call = 0u;
++        s.spin_hook(g_cpu.pc);
++    }
++    leave_if_stopped();
++}
+diff --git a/src/guest_memory.cpp b/src/guest_memory.cpp
+index b758f10..2ebcf59 100644
+--- a/src/guest_memory.cpp
++++ b/src/guest_memory.cpp
+@@ -1,5 +1,6 @@
+ #include "psprecomp/guest_memory.hpp"
+ #include "psprecomp/common.hpp"
++#include "psprecomp/exec.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -9,6 +10,16 @@
+ #include <iostream>
+ #include <limits>
+ 
++#include <stdlib.h>
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
++// The arena generated code indexes (declared in exec.hpp).
++extern "C" {
++std::uint8_t *g_ram = nullptr;
++}
++
+ namespace psprecomp {
+ 
+ // Declared in runtime.hpp/runtime.cpp.  guest_memory.cpp intentionally avoids
+@@ -88,74 +99,103 @@ void set_write_watch(std::uint32_t address, std::uint32_t size) {
+               << watch.size << " bytes\n";
+ }
+ 
++
++// The arena the guest addresses. Linux maps it lazily (untouched pages cost
++// nothing, which keeps a test that makes many GuestMemory objects cheap); other
++// platforms, the Vita among them, allocate and clear it.
+ namespace {
+-// The CPU's scratchpad: 16 KiB of fast RAM at 0x00010000. It lives in the
+-// same host buffer as EDRAM, after its 2 MiB, so the header (and with it every
+-// generated unit) does not change: the out-of-line paths below that handle
+-// EDRAM handle it too.
+-constexpr std::uint32_t kScratchpadBase = 0x00010000u;
+-constexpr std::uint32_t kScratchpadSize = 16u * 1024u;
+-// Where a contiguous run starting at `offset` of the EDRAM buffer must end:
+-// EDRAM's own 2 MiB (a run past it wraps, per byte) or the scratchpad's end.
+-[[nodiscard]] constexpr std::size_t shared_limit(std::size_t offset) noexcept {
+-    return offset < GuestMemory::kVramSize ? GuestMemory::kVramSize : GuestMemory::kVramSize + kScratchpadSize;
++
++std::uint8_t *arena_allocate(std::size_t bytes) {
++#if defined(__linux__)
++    void *mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    return mapping == MAP_FAILED ? nullptr : static_cast<std::uint8_t *>(mapping);
++#else
++    // 1 MiB aligned, as the contract asks.
++    void *memory = ::aligned_alloc(1u << 20, bytes);
++    if (memory != nullptr) std::memset(memory, 0, bytes);
++    return static_cast<std::uint8_t *>(memory);
++#endif
++}
++
++void arena_release(std::uint8_t *arena, std::size_t bytes) noexcept {
++    if (arena == nullptr) return;
++#if defined(__linux__)
++    munmap(arena, bytes);
++#else
++    (void)bytes;
++    std::free(arena);
++#endif
+ }
++
+ } // namespace
+ 
+ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+-    : vram_(kVramSize + kScratchpadSize, 0u), bytes_(size_bytes, 0u), write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
++    : write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
+     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
+         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
+     }
+-    // Bind the inline AOT fast paths to main RAM.  bytes_ is never resized
++    arena_ = arena_allocate(kArenaBytes);
++    if (arena_ == nullptr) throw Error("Cannot allocate the 66 MiB guest memory arena");
++    ram_bytes_ = size_bytes;
++    // Bind the inline AOT fast paths to main RAM.  The arena is never moved
+     // afterwards, and the instance is non-copyable, so this stays valid.
+-    ram_data_ = bytes_.data();
++    ram_data_ = arena_;
+     ram_limit8_ = size_bytes - 1u;
+     ram_limit16_ = size_bytes - 2u;
+     ram_limit32_ = size_bytes - 4u;
+ }
+ 
+-std::uint32_t GuestMemory::size() const noexcept { return static_cast<std::uint32_t>(bytes_.size()); }
++GuestMemory::~GuestMemory() {
++    if (g_ram == arena_) g_ram = nullptr;
++    arena_release(arena_, kArenaBytes);
++}
++
++void GuestMemory::make_primary() noexcept { g_ram = arena_; }
++
++std::uint32_t GuestMemory::size() const noexcept { return ram_bytes_; }
+ std::uint32_t GuestMemory::vram_size() const noexcept { return kVramSize; }
+ 
+-// EDRAM and its mirrors, and the scratchpad, which shares its host buffer.
++// EDRAM and its mirrors, and the scratchpad.
+ bool GuestMemory::is_vram_window(std::uint32_t canonical_address) const noexcept {
+     return (canonical_address >= kVramPhysicalBase && canonical_address < kVramPhysicalBase + kVramAddressSpan) ||
+            (canonical_address >= kScratchpadBase && canonical_address < kScratchpadBase + kScratchpadSize);
+ }
+ 
+-std::size_t GuestMemory::vram_offset(std::uint32_t canonical_address) const noexcept {
+-    if (canonical_address < kVramPhysicalBase)
+-        return static_cast<std::size_t>(kVramSize + (canonical_address - kScratchpadBase));
+-    return static_cast<std::size_t>((canonical_address - kVramPhysicalBase) & (kVramSize - 1u));
+-}
+-
+-bool GuestMemory::contains(std::uint32_t address, std::size_t length) const noexcept {
++bool GuestMemory::locate(std::uint32_t address, Located &out) const noexcept {
+     const std::uint32_t c = canonical(address);
+-    const std::uint64_t end = static_cast<std::uint64_t>(c) + static_cast<std::uint64_t>(length);
+-    if (c >= kScratchpadBase && end <= static_cast<std::uint64_t>(kScratchpadBase) + kScratchpadSize) return true;
+-    if (is_vram_window(c) && end <= static_cast<std::uint64_t>(kVramPhysicalBase) + kVramAddressSpan)
++    if (c >= kPhysicalBase) {
++        const std::size_t offset = c - kPhysicalBase;
++        if (offset >= ram_bytes_) return false;
++        out = {arena_ + offset, ram_bytes_ - offset};
+         return true;
+-    if (c >= kPhysicalBase && end <= static_cast<std::uint64_t>(kPhysicalBase) + bytes_.size())
++    }
++    if (c >= kVramPhysicalBase) {
++        if (c >= kVramPhysicalBase + kVramAddressSpan) return false;
++        const std::size_t offset = (c - kVramPhysicalBase) & (kVramSize - 1u);
++        out = {arena_ + kArenaVramOffset + offset, kVramSize - offset};
++        return true;
++    }
++    if (c >= kScratchpadBase && c < kScratchpadBase + kScratchpadSize) {
++        out = {arena_ + c, kScratchpadBase + kScratchpadSize - c};
+         return true;
++    }
+     return false;
+ }
+ 
+-GuestMemory::ResolvedAddress GuestMemory::resolve(std::uint32_t address, std::size_t length) const {
+-    if (!contains(address, length)) {
+-        throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+-    }
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c))
+-        return {Region::Vram, vram_offset(c)};
+-    return {Region::Ram, static_cast<std::size_t>(c - kPhysicalBase)};
++GuestMemory::Located GuestMemory::resolve(std::uint32_t address) const {
++    Located where{};
++    if (!locate(address, where)) throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
++    return where;
+ }
+ 
+-const std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) const noexcept {
+-    return region == Region::Vram ? vram_ : bytes_;
+-}
+-std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) noexcept {
+-    return region == Region::Vram ? vram_ : bytes_;
++bool GuestMemory::contains(std::uint32_t address, std::size_t length) const noexcept {
++    const std::uint32_t c = canonical(address);
++    const std::uint64_t end = static_cast<std::uint64_t>(c) + static_cast<std::uint64_t>(length);
++    if (c >= kPhysicalBase) return end <= static_cast<std::uint64_t>(kPhysicalBase) + ram_bytes_;
++    if (c >= kVramPhysicalBase)
++        return c < kVramPhysicalBase + kVramAddressSpan &&
++               end <= static_cast<std::uint64_t>(kVramPhysicalBase) + kVramAddressSpan;
++    return c >= kScratchpadBase && end <= static_cast<std::uint64_t>(kScratchpadBase) + kScratchpadSize;
+ }
+ 
+ namespace {
+@@ -182,54 +222,32 @@ void trace_vram_read(std::uint32_t canonical_address) {
+ 
+ } // namespace
+ 
+-// The `_slow` bodies below are the original aot_* implementations, reached only
+-// when the inline main-RAM fast path in the header declines the access: EDRAM,
+-// an out-of-range address, a region-crossing width, or an armed write watch.
++// The `_slow` bodies below are reached only when the inline main-RAM fast path in
++// the header declines the access: EDRAM, an out-of-range address, a region-crossing
++// width, or an armed write watch.
+ std::uint8_t GuestMemory::aot_load8_slow(std::uint32_t address) const {
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c)) {
+-        trace_vram_read(c);
+-        return vram_[vram_offset(c)];
++    Located where{};
++    if (locate(address, where)) {
++        if (is_vram_window(canonical(address))) trace_vram_read(canonical(address));
++        return *where.data;
+     }
+-    if (c >= kPhysicalBase && c - kPhysicalBase < bytes_.size())
+-        return bytes_[static_cast<std::size_t>(c - kPhysicalBase)];
+     return load8(address);
+ }
+ 
+ std::uint16_t GuestMemory::aot_load16_slow(std::uint32_t address) const {
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c)) {
+-        trace_vram_read(c);
+-        const std::size_t offset = vram_offset(c);
+-        if (offset + 2u <= shared_limit(offset))
+-            return static_cast<std::uint16_t>(vram_[offset]) |
+-                   static_cast<std::uint16_t>(static_cast<std::uint16_t>(vram_[offset + 1u]) << 8u);
+-    } else if (c >= kPhysicalBase) {
+-        const std::size_t offset = static_cast<std::size_t>(c - kPhysicalBase);
+-        if (offset + 2u <= bytes_.size())
+-            return static_cast<std::uint16_t>(bytes_[offset]) |
+-                   static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes_[offset + 1u]) << 8u);
++    Located where{};
++    if (locate(address, where) && where.run >= 2u) {
++        if (is_vram_window(canonical(address))) trace_vram_read(canonical(address));
++        return read_le16(where.data);
+     }
+     return load16(address);
+ }
+ 
+ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
+-    const std::uint32_t c = canonical(address);
+-    const std::vector<std::uint8_t> *data = nullptr;
+-    std::size_t offset = 0u;
+-    if (is_vram_window(c)) {
+-        trace_vram_read(c);
+-        data = &vram_;
+-        offset = vram_offset(c);
+-    } else if (c >= kPhysicalBase) {
+-        data = &bytes_;
+-        offset = static_cast<std::size_t>(c - kPhysicalBase);
+-    }
+-    if (data != nullptr && offset + 4u <= (data == &vram_ ? shared_limit(offset) : data->size())) {
+-        return static_cast<std::uint32_t>((*data)[offset]) |
+-               (static_cast<std::uint32_t>((*data)[offset + 1u]) << 8u) |
+-               (static_cast<std::uint32_t>((*data)[offset + 2u]) << 16u) |
+-               (static_cast<std::uint32_t>((*data)[offset + 3u]) << 24u);
++    Located where{};
++    if (locate(address, where) && where.run >= 4u) {
++        if (is_vram_window(canonical(address))) trace_vram_read(canonical(address));
++        return read_le32(where.data);
+     }
+     return load32(address);
+ }
+@@ -247,42 +265,20 @@ std::uint32_t GuestMemory::aot_load_word_right(std::uint32_t address, std::uint3
+ 
+ void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
+     if (write_watch_enabled_) { store8(address, value); return; }
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c)) { vram_[vram_offset(c)] = value; return; }
+-    if (c >= kPhysicalBase && c - kPhysicalBase < bytes_.size()) {
+-        bytes_[static_cast<std::size_t>(c - kPhysicalBase)] = value;
+-        return;
+-    }
++    Located where{};
++    if (locate(address, where)) { *where.data = value; return; }
+     store8(address, value);
+ }
+ void GuestMemory::aot_store16_slow(std::uint32_t address, std::uint16_t value) {
+     if (write_watch_enabled_) { store16(address, value); return; }
+-    const std::uint32_t c = canonical(address);
+-    std::vector<std::uint8_t> *data = nullptr;
+-    std::size_t offset = 0u;
+-    if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+-    else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
+-    if (data != nullptr && offset + 2u <= (data == &vram_ ? shared_limit(offset) : data->size())) {
+-        (*data)[offset] = static_cast<std::uint8_t>(value & 0xFFu);
+-        (*data)[offset + 1u] = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
+-        return;
+-    }
++    Located where{};
++    if (locate(address, where) && where.run >= 2u) { write_le16(where.data, value); return; }
+     store16(address, value);
+ }
+ void GuestMemory::aot_store32_slow(std::uint32_t address, std::uint32_t value) {
+     if (write_watch_enabled_) { store32(address, value); return; }
+-    const std::uint32_t c = canonical(address);
+-    std::vector<std::uint8_t> *data = nullptr;
+-    std::size_t offset = 0u;
+-    if (is_vram_window(c)) { data = &vram_; offset = vram_offset(c); }
+-    else if (c >= kPhysicalBase) { data = &bytes_; offset = static_cast<std::size_t>(c - kPhysicalBase); }
+-    if (data != nullptr && offset + 4u <= (data == &vram_ ? shared_limit(offset) : data->size())) {
+-        (*data)[offset] = static_cast<std::uint8_t>(value & 0xFFu);
+-        (*data)[offset + 1u] = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
+-        (*data)[offset + 2u] = static_cast<std::uint8_t>((value >> 16u) & 0xFFu);
+-        (*data)[offset + 3u] = static_cast<std::uint8_t>((value >> 24u) & 0xFFu);
+-        return;
+-    }
++    Located where{};
++    if (locate(address, where) && where.run >= 4u) { write_le32(where.data, value); return; }
+     store32(address, value);
+ }
+ void GuestMemory::aot_store_word_left(std::uint32_t address, std::uint32_t value) {
+@@ -318,35 +314,32 @@ void GuestMemory::aot_copy_lz_match(std::uint32_t destination, std::uint32_t sou
+         return;
+     }
+ 
+-    const ResolvedAddress destination_resolved = resolve(destination, length);
+-    const ResolvedAddress source_resolved = resolve(source, length);
+-    if (destination_resolved.region != source_resolved.region) {
++    Located destination_located{};
++    Located source_located{};
++    if (!locate(destination, destination_located) || !locate(source, source_located) ||
++        destination_located.run < length || source_located.run < length) {
+         bytewise_copy();
+         return;
+     }
+-
+-    auto &data = region_bytes(destination_resolved.region);
+-    if (destination_resolved.offset + length > data.size() ||
+-        source_resolved.offset + length > data.size() ||
+-        source_resolved.offset >= destination_resolved.offset) {
++    // Same host region, source below destination: the overlap rule below applies.
++    if (source_located.data >= destination_located.data) {
+         bytewise_copy();
+         return;
+     }
+-
+-    const std::size_t destination_offset = destination_resolved.offset;
+-    const std::size_t source_offset = source_resolved.offset;
++    std::uint8_t *destination_bytes = destination_located.data;
++    const std::uint8_t *source_bytes = source_located.data;
+     const std::size_t total = static_cast<std::size_t>(length);
+-    const std::size_t distance = destination_offset - source_offset;
++    const std::size_t distance = static_cast<std::size_t>(destination_bytes - source_bytes);
+ 
+     // Seed one full match-distance (or the entire short copy), then duplicate
+     // the already produced prefix in geometrically growing non-overlapping
+     // chunks. This is equivalent to the guest's forward byte loop, including
+     // distance=1 runs, but completes in O(log(length)) host copies.
+     std::size_t copied = std::min(distance, total);
+-    std::memcpy(data.data() + destination_offset, data.data() + source_offset, copied);
++    std::memcpy(destination_bytes, source_bytes, copied);
+     while (copied < total) {
+         const std::size_t chunk = std::min(copied, total - copied);
+-        std::memcpy(data.data() + destination_offset + copied, data.data() + destination_offset, chunk);
++        std::memcpy(destination_bytes + copied, destination_bytes, chunk);
+         copied += chunk;
+     }
+ }
+@@ -357,17 +350,10 @@ std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length
+ }
+ 
+ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length) const noexcept {
+-    const std::uint32_t c = canonical(address);
+-    if (is_vram_window(c)) {
+-        const std::size_t offset = vram_offset(c);
+-        // A run that would wrap past the end of the 2 MiB EDRAM image is not
+-        // contiguous in host memory even though it is legal in guest space.
+-        if (offset + length <= shared_limit(offset)) return vram_.data() + offset;
+-        return nullptr;
+-    }
+-    if (c < kPhysicalBase) return nullptr;
+-    const std::size_t offset = static_cast<std::size_t>(c - kPhysicalBase);
+-    if (offset + length <= bytes_.size()) return bytes_.data() + offset;
++    Located where{};
++    // A run that would wrap past the end of the 2 MiB EDRAM image (or of any region)
++    // is not contiguous in host memory even though it is legal in guest space.
++    if (locate(address, where) && length <= where.run) return where.data;
+     return nullptr;
+ }
+ 
+@@ -377,8 +363,7 @@ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t
+ // per-byte path, which keeps the original wrapping and error behaviour.
+ std::uint8_t GuestMemory::load8(std::uint32_t address) const {
+     if (const std::uint8_t *source = raw_pointer(address, 1u)) return *source;
+-    const auto r = resolve(address, 1u);
+-    return region_bytes(r.region)[r.offset];
++    return *resolve(address).data;
+ }
+ std::uint16_t GuestMemory::load16(std::uint32_t address) const {
+     if (const std::uint8_t *source = raw_pointer(address, 2u)) return read_le16(source);
+@@ -403,33 +388,23 @@ std::uint32_t GuestMemory::load_word_right(std::uint32_t address, std::uint32_t
+     return (existing & (0xFFFFFF00u << (24u - shift))) | (memory_word >> shift);
+ }
+ void GuestMemory::store8(std::uint32_t address, std::uint8_t value) {
+-    const auto r = resolve(address, 1u);
+-    auto &data = region_bytes(r.region);
+-    const std::uint8_t old = data[r.offset];
+-    log_write_watch(address, 1u, "store8", old, value);
+-    data[r.offset] = value;
++    std::uint8_t *target = resolve(address).data;
++    log_write_watch(address, 1u, "store8", *target, value);
++    *target = value;
+ }
+ void GuestMemory::store16(std::uint32_t address, std::uint16_t value) {
+     const std::uint16_t old = load16(address);
+     log_write_watch(address, 2u, "store16", old, value);
+-    const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
+-        const auto r = resolve(byte_address, 1u);
+-        region_bytes(r.region)[r.offset] = byte;
+-    };
+-    write_byte(address, static_cast<std::uint8_t>(value & 0xFFu));
+-    write_byte(address + 1u, static_cast<std::uint8_t>((value >> 8u) & 0xFFu));
++    *resolve(address).data = static_cast<std::uint8_t>(value & 0xFFu);
++    *resolve(address + 1u).data = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
+ }
+ void GuestMemory::store32(std::uint32_t address, std::uint32_t value) {
+     const std::uint32_t old = load32(address);
+     log_write_watch(address, 4u, "store32", old, value);
+-    const auto write_byte = [this](std::uint32_t byte_address, std::uint8_t byte) {
+-        const auto r = resolve(byte_address, 1u);
+-        region_bytes(r.region)[r.offset] = byte;
+-    };
+-    write_byte(address, static_cast<std::uint8_t>(value & 0xFFu));
+-    write_byte(address + 1u, static_cast<std::uint8_t>((value >> 8u) & 0xFFu));
+-    write_byte(address + 2u, static_cast<std::uint8_t>((value >> 16u) & 0xFFu));
+-    write_byte(address + 3u, static_cast<std::uint8_t>((value >> 24u) & 0xFFu));
++    *resolve(address).data = static_cast<std::uint8_t>(value & 0xFFu);
++    *resolve(address + 1u).data = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
++    *resolve(address + 2u).data = static_cast<std::uint8_t>((value >> 16u) & 0xFFu);
++    *resolve(address + 3u).data = static_cast<std::uint8_t>((value >> 24u) & 0xFFu);
+ }
+ void GuestMemory::store_word_left(std::uint32_t address, std::uint32_t value) {
+     const std::uint32_t shift = (address & 3u) * 8u;
+@@ -452,12 +427,9 @@ void GuestMemory::copy_in(std::uint32_t address, std::span<const std::uint8_t> s
+     log_write_watch(address, source.size(), "copy_in", 0u, 0u);
+     std::size_t copied = 0u;
+     while (copied < source.size()) {
+-        const std::uint32_t current = address + static_cast<std::uint32_t>(copied);
+-        const auto r = resolve(current, 1u);
+-        auto &data = region_bytes(r.region);
+-        const std::size_t chunk = std::min(source.size() - copied, data.size() - r.offset);
+-        std::copy_n(source.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
+-                    data.begin() + static_cast<std::ptrdiff_t>(r.offset));
++        const Located where = resolve(address + static_cast<std::uint32_t>(copied));
++        const std::size_t chunk = std::min(source.size() - copied, where.run);
++        std::memcpy(where.data, source.data() + copied, chunk);
+         copied += chunk;
+     }
+ }
+@@ -466,12 +438,9 @@ void GuestMemory::copy_out(std::uint32_t address, std::span<std::uint8_t> destin
+         throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+     std::size_t copied = 0u;
+     while (copied < destination.size()) {
+-        const std::uint32_t current = address + static_cast<std::uint32_t>(copied);
+-        const auto r = resolve(current, 1u);
+-        const auto &data = region_bytes(r.region);
+-        const std::size_t chunk = std::min(destination.size() - copied, data.size() - r.offset);
+-        std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(r.offset), chunk,
+-                    destination.begin() + static_cast<std::ptrdiff_t>(copied));
++        const Located where = resolve(address + static_cast<std::uint32_t>(copied));
++        const std::size_t chunk = std::min(destination.size() - copied, where.run);
++        std::memcpy(destination.data() + copied, where.data, chunk);
+         copied += chunk;
+     }
+ }
+@@ -481,11 +450,9 @@ void GuestMemory::zero(std::uint32_t address, std::size_t length) {
+     log_write_watch(address, length, "zero", 0u, 0u);
+     std::size_t cleared = 0u;
+     while (cleared < length) {
+-        const std::uint32_t current = address + static_cast<std::uint32_t>(cleared);
+-        const auto r = resolve(current, 1u);
+-        auto &data = region_bytes(r.region);
+-        const std::size_t chunk = std::min(length - cleared, data.size() - r.offset);
+-        std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(r.offset), chunk, 0u);
++        const Located where = resolve(address + static_cast<std::uint32_t>(cleared));
++        const std::size_t chunk = std::min(length - cleared, where.run);
++        std::memset(where.data, 0, chunk);
+         cleared += chunk;
+     }
+ }
+@@ -499,8 +466,6 @@ std::string GuestMemory::read_c_string(std::uint32_t address, std::size_t max_le
+     }
+     throw Error("Unterminated guest string at " + hex32(address));
+ }
+-const std::vector<std::uint8_t> &GuestMemory::bytes() const noexcept { return bytes_; }
+-const std::vector<std::uint8_t> &GuestMemory::vram_bytes() const noexcept { return vram_; }
+ 
+ // The slow paths of AotFastView, reached from generated code through a table
+ // so that the corpus references no symbol of the runtime.
+diff --git a/src/interpreter.cpp b/src/interpreter.cpp
+index ae99b5b..e375200 100644
+--- a/src/interpreter.cpp
++++ b/src/interpreter.cpp
+@@ -3,6 +3,7 @@
+ #include "psprecomp/allegrex_context.hpp"
+ #include "psprecomp/common.hpp"
+ #include "psprecomp/decoder.hpp"
++#include "psprecomp/exec.hpp"
+ #include "psprecomp/extra_instructions.hpp"
+ #include "psprecomp/guest_memory.hpp"
+ #include "psprecomp/runtime.hpp"
+@@ -10,6 +11,7 @@
+ #include <algorithm>
+ #include <bit>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
+ #include <iostream>
+ #include <limits>
+@@ -44,6 +46,60 @@ inline void count_pc(std::uint32_t pc) {
+     if (index < kProfileWords) ++g_pc_counts[index];
+ }
+ 
++// Guest memory accesses by 1 MiB region of the raw address (PSPRECOMP_INTERPRETER_REGION_HISTOGRAM=1,
++// or set_interpreter_region_histogram): what the unchecked mask `a & 0x05FFFFFF` of the lean code
++// would have to cope with. Categories follow the arena of ARCHITECTURE.md 1.
++bool g_region_hist = false;
++struct RegionCounts {
++    std::uint64_t loads{};
++    std::uint64_t stores{};
++};
++std::vector<RegionCounts> g_region_counts;  // indexed by address >> 20
++struct OddAccess {
++    std::uint32_t pc{};
++    std::uint32_t address{};
++    bool store{};
++    std::uint64_t count{};
++    int category{};
++};
++std::unordered_map<std::uint64_t, OddAccess> g_odd_accesses;  // key: pc, category, direction
++constexpr std::size_t kMaxOddAccesses = 256u;
++
++// Categories of a raw guest address; the first three are the arena's own.
++constexpr const char *kAccessCategories[] = {
++    "user-ram",           "vram",         "scratchpad",
++    "kernel-area-of-ram", "ram-beyond-32MiB", "vram-mirror-beyond-2MiB", "other",
++};
++constexpr int kFirstOddCategory = 3;
++
++int classify_access(std::uint32_t address) noexcept {
++    const std::uint32_t c = address & 0x1FFFFFFFu;
++    if (c >= 0x08800000u && c < 0x0A000000u) return 0;
++    if (c >= 0x04000000u && c < 0x04200000u) return 1;
++    if (c >= 0x00010000u && c < 0x00014000u) return 2;
++    if (c >= 0x08000000u && c < 0x08800000u) return 3;
++    if (c >= 0x0A000000u && c < 0x0C000000u) return 4;
++    if (c >= 0x04200000u && c < 0x04800000u) return 5;
++    return 6;
++}
++
++void note_access(std::uint32_t pc, std::uint32_t address, bool store) {
++    if (g_region_counts.empty()) g_region_counts.assign(4096u, RegionCounts{});
++    RegionCounts &counts = g_region_counts[address >> 20u];
++    if (store) ++counts.stores;
++    else ++counts.loads;
++    const int category = classify_access(address);
++    if (category < kFirstOddCategory) return;
++    const std::uint64_t key = (static_cast<std::uint64_t>(pc) << 8u) | (static_cast<std::uint64_t>(category) << 1u) |
++                              (store ? 1u : 0u);
++    auto found = g_odd_accesses.find(key);
++    if (found == g_odd_accesses.end()) {
++        if (g_odd_accesses.size() >= kMaxOddAccesses) return;
++        found = g_odd_accesses.emplace(key, OddAccess{pc, address, store, 0u, category}).first;
++    }
++    ++found->second.count;
++}
++
+ // Addresses to report every time interpreted code reaches them, with the
+ // registers a caller would care about. Bringing a game up means finding out
+ // which branch of the game's own code never goes the way it should, and this
+@@ -74,6 +130,8 @@ void load_settings() {
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_PC_PROFILE"); text != nullptr && *text != '\0' && *text != '0')
+         set_interpreter_pc_profile(true);
+     g_verbose = std::getenv("PSPRECOMP_INTERPRETER_VERBOSE") != nullptr;
++    if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_REGION_HISTOGRAM"); text != nullptr && *text != '\0' && *text != '0')
++        g_region_hist = true;
+     if (const char *text = std::getenv("PSPRECOMP_INTERPRETER_BUDGET")) {
+         char *end = nullptr;
+         const unsigned long long value = std::strtoull(text, &end, 0);
+@@ -354,26 +412,28 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+                           ((rt_value & 0x00FF0000u) >> 8u) | ((rt_value & 0xFF000000u) >> 24u));
+         break;
+ 
+-    case OpcodeKind::Lw: ctx.set_gpr(d.rt, memory.aot_load32(rs + imm)); break;
+-    case OpcodeKind::Lwl: ctx.set_gpr(d.rt, memory.aot_load_word_left(rs + imm, rt_value)); break;
+-    case OpcodeKind::Lwr: ctx.set_gpr(d.rt, memory.aot_load_word_right(rs + imm, rt_value)); break;
+-    case OpcodeKind::Sw: memory.aot_store32(rs + imm, rt_value); break;
+-    case OpcodeKind::Swl: memory.aot_store_word_left(rs + imm, rt_value); break;
+-    case OpcodeKind::Swr: memory.aot_store_word_right(rs + imm, rt_value); break;
++    case OpcodeKind::Lw: if (g_region_hist) note_access(pc, rs + imm, false); ctx.set_gpr(d.rt, memory.aot_load32(rs + imm)); break;
++    case OpcodeKind::Lwl: if (g_region_hist) note_access(pc, rs + imm, false); ctx.set_gpr(d.rt, memory.aot_load_word_left(rs + imm, rt_value)); break;
++    case OpcodeKind::Lwr: if (g_region_hist) note_access(pc, rs + imm, false); ctx.set_gpr(d.rt, memory.aot_load_word_right(rs + imm, rt_value)); break;
++    case OpcodeKind::Sw: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store32(rs + imm, rt_value); break;
++    case OpcodeKind::Swl: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store_word_left(rs + imm, rt_value); break;
++    case OpcodeKind::Swr: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store_word_right(rs + imm, rt_value); break;
+     case OpcodeKind::Lh:
++        if (g_region_hist) note_access(pc, rs + imm, false);
+         ctx.set_gpr(d.rt, static_cast<std::uint32_t>(static_cast<std::int32_t>(
+             static_cast<std::int16_t>(memory.aot_load16(rs + imm)))));
+         break;
+-    case OpcodeKind::Lhu: ctx.set_gpr(d.rt, memory.aot_load16(rs + imm)); break;
+-    case OpcodeKind::Sh: memory.aot_store16(rs + imm, static_cast<std::uint16_t>(rt_value)); break;
++    case OpcodeKind::Lhu: if (g_region_hist) note_access(pc, rs + imm, false); ctx.set_gpr(d.rt, memory.aot_load16(rs + imm)); break;
++    case OpcodeKind::Sh: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store16(rs + imm, static_cast<std::uint16_t>(rt_value)); break;
+     case OpcodeKind::Lb:
++        if (g_region_hist) note_access(pc, rs + imm, false);
+         ctx.set_gpr(d.rt, static_cast<std::uint32_t>(static_cast<std::int32_t>(
+             static_cast<std::int8_t>(memory.aot_load8(rs + imm)))));
+         break;
+-    case OpcodeKind::Lbu: ctx.set_gpr(d.rt, memory.aot_load8(rs + imm)); break;
+-    case OpcodeKind::Sb: memory.aot_store8(rs + imm, static_cast<std::uint8_t>(rt_value)); break;
+-    case OpcodeKind::Lwc1: ctx.fpr[d.rt] = std::bit_cast<float>(memory.aot_load32(rs + imm)); break;
+-    case OpcodeKind::Swc1: memory.aot_store32(rs + imm, std::bit_cast<std::uint32_t>(ctx.fpr[d.rt])); break;
++    case OpcodeKind::Lbu: if (g_region_hist) note_access(pc, rs + imm, false); ctx.set_gpr(d.rt, memory.aot_load8(rs + imm)); break;
++    case OpcodeKind::Sb: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store8(rs + imm, static_cast<std::uint8_t>(rt_value)); break;
++    case OpcodeKind::Lwc1: if (g_region_hist) note_access(pc, rs + imm, false); ctx.fpr[d.rt] = std::bit_cast<float>(memory.aot_load32(rs + imm)); break;
++    case OpcodeKind::Swc1: if (g_region_hist) note_access(pc, rs + imm, true); memory.aot_store32(rs + imm, std::bit_cast<std::uint32_t>(ctx.fpr[d.rt])); break;
+ 
+     case OpcodeKind::Mfhi: ctx.set_gpr(d.rd, ctx.hi); break;
+     case OpcodeKind::Mflo: ctx.set_gpr(d.rd, ctx.lo); break;
+@@ -713,6 +773,15 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+         ctx.execute_vfpu_vhdp(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_vt(d.word), vfpu_length(d.word));
+         break;
+     case OpcodeKind::Extra:
++        if (g_region_hist) {
++            // ll/sc and the unaligned quad pair, the memory instructions that live in extra_instructions.cpp.
++            const std::uint32_t major = d.word >> 26u;
++            if (major == 0x30u || major == 0x38u || major == 0x35u || major == 0x3Du) {
++                const std::uint32_t mask = major == 0x30u || major == 0x38u ? 0xFFFFu : 0xFFFCu;
++                const auto offset = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(d.word & mask)));
++                note_access(pc, ctx.gpr[(d.word >> 21u) & 31u] + offset, major == 0x38u || major == 0x3Du);
++            }
++        }
+         execute_extra_instruction(rt, ctx, pc, d.word);
+         break;
+     case OpcodeKind::Vcrs: {
+@@ -808,6 +877,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+         const auto offset = static_cast<std::uint32_t>(
+             static_cast<std::int32_t>(static_cast<std::int16_t>(d.word & 0xFFFCu)));
+         const std::uint32_t scalar = ((d.word >> 16u) & 0x1Fu) | ((d.word & 3u) << 5u);
++        if (g_region_hist) note_access(pc, rs + offset, false);
+         ctx.set_vfpu_scalar_bits(scalar, memory.aot_load32(rs + offset));
+         break;
+     }
+@@ -815,6 +885,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+         const auto offset = static_cast<std::uint32_t>(
+             static_cast<std::int32_t>(static_cast<std::int16_t>(d.word & 0xFFFCu)));
+         const std::uint32_t scalar = ((d.word >> 16u) & 0x1Fu) | ((d.word & 3u) << 5u);
++        if (g_region_hist) note_access(pc, rs + offset, true);
+         memory.aot_store32(rs + offset, ctx.vfpu_scalar_bits(scalar));
+         break;
+     }
+@@ -823,6 +894,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+             static_cast<std::int32_t>(static_cast<std::int16_t>(d.word & 0xFFFCu)));
+         const std::uint32_t vector = ((d.word >> 16u) & 0x1Fu) | ((d.word & 1u) << 5u);
+         const std::uint32_t address = rs + offset;
++        if (g_region_hist) { note_access(pc, address, false); note_access(pc, address + 12u, false); }
+         const float value[4]{
+             std::bit_cast<float>(memory.aot_load32(address + 0u)),
+             std::bit_cast<float>(memory.aot_load32(address + 4u)),
+@@ -838,6 +910,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+         float value[4]{};
+         ctx.read_vfpu_vector(value, vector, 4u);
+         const std::uint32_t address = rs + offset;
++        if (g_region_hist) { note_access(pc, address, true); note_access(pc, address + 12u, true); }
+         for (std::uint32_t lane = 0u; lane < 4u; ++lane)
+             memory.aot_store32(address + lane * 4u, std::bit_cast<std::uint32_t>(value[lane]));
+         break;
+@@ -1033,4 +1106,190 @@ InterpreterExit interpret_allegrex(Runtime &rt, AllegrexContext &ctx,
+     }
+ }
+ 
++
++void set_interpreter_region_histogram(bool enabled) {
++    g_region_hist = enabled;
++    if (enabled && g_region_counts.empty()) g_region_counts.assign(4096u, RegionCounts{});
++}
++
++void report_interpreter_region_histogram(std::string &out) {
++    if (g_region_counts.empty()) return;
++    char line[256];
++    std::uint64_t per_category_loads[7]{};
++    std::uint64_t per_category_stores[7]{};
++    out += "[regions] guest loads and stores by 1 MiB region of the raw address (interpreter)\n";
++    for (std::uint32_t region = 0; region < g_region_counts.size(); ++region) {
++        const RegionCounts &counts = g_region_counts[region];
++        if (counts.loads == 0u && counts.stores == 0u) continue;
++        const int category = classify_access(region << 20u);
++        per_category_loads[category] += counts.loads;
++        per_category_stores[category] += counts.stores;
++        std::snprintf(line, sizeof line, "[regions]   0x%08X  loads %12llu  stores %12llu  %s\n", region << 20u,
++                      static_cast<unsigned long long>(counts.loads), static_cast<unsigned long long>(counts.stores),
++                      category < kFirstOddCategory ? "ok" : "ODD");
++        out += line;
++    }
++    for (int category = 0; category < 7; ++category) {
++        if (per_category_loads[category] == 0u && per_category_stores[category] == 0u) continue;
++        std::snprintf(line, sizeof line, "[regions] total %-26s loads %12llu  stores %12llu\n",
++                      kAccessCategories[category], static_cast<unsigned long long>(per_category_loads[category]),
++                      static_cast<unsigned long long>(per_category_stores[category]));
++        out += line;
++    }
++    std::vector<const OddAccess *> odd;
++    for (const auto &[key, access] : g_odd_accesses) odd.push_back(&access);
++    std::sort(odd.begin(), odd.end(), [](const OddAccess *a, const OddAccess *b) { return a->count > b->count; });
++    if (odd.empty()) {
++        out += "[regions] no access outside user RAM, VRAM and the scratchpad\n";
++        return;
++    }
++    out += "[regions] accesses outside user RAM / VRAM / scratchpad (pc, first address seen):\n";
++    for (const OddAccess *access : odd) {
++        std::snprintf(line, sizeof line, "[regions]   pc 0x%08X  %-5s 0x%08X  x%-10llu %s\n", access->pc,
++                      access->store ? "store" : "load", access->address,
++                      static_cast<unsigned long long>(access->count), kAccessCategories[access->category]);
++        out += line;
++    }
++}
++
++namespace {
++
++// Accounts the instructions run since the last flush, hands them to the spin hook (which may
++// switch coroutines) and says whether the runtime stopped meanwhile.
++inline void flush_interpreted(std::uint64_t &executed, std::uint32_t pc) {
++    g_instructions += executed;
++    const std::uint64_t count = executed;
++    executed = 0u;
++    exec_account_instructions(count, pc);
++}
++
++} // namespace
++
++void interpret_guest_call(Runtime &rt, AllegrexContext &ctx, std::uint32_t entry) {
++    load_settings();
++    GuestMemory &memory = rt.memory();
++    ExecStats &counters = exec_counters();
++    std::uint32_t pc = entry;
++    note_entry(entry);
++
++    constexpr std::uint64_t kSlice = 1024u;
++    std::uint64_t executed = 0u;
++
++    while (true) {
++        if (executed >= kSlice) {
++            ctx.pc = pc;
++            flush_interpreted(executed, pc);
++            if (rt.stopped()) return;
++        }
++        ctx.pc = pc;
++        if (!g_watch.empty() && std::binary_search(g_watch.begin(), g_watch.end(), pc))
++            report_watch(rt, ctx, pc);
++        const DecodedInstruction decoded = decode_allegrex(memory.aot_load32(pc));
++        ++executed;
++        if (g_pc_profile) count_pc(pc);
++
++        if (!decoded.has_delay_slot()) {
++            if (!execute_simple(rt, ctx, decoded, pc)) {
++                g_instructions += executed;
++                return;
++            }
++            pc += 4u;
++            continue;
++        }
++
++        const DecodedInstruction slot = decode_allegrex(memory.aot_load32(pc + 4u));
++        if (slot.is_control_flow()) {
++            ctx.pc = pc + 4u;
++            rt.unsupported(pc + 4u, slot.word, "control flow in delay slot");
++            g_instructions += executed;
++            return;
++        }
++
++        const std::uint32_t return_pc = pc + 8u;
++        std::uint32_t next = return_pc;
++        bool run_slot = true;
++        bool is_call = false;
++        bool is_jump = false;  // j/jal/jr/jalr: a transfer that may land on a function
++        switch (decoded.kind) {
++        case OpcodeKind::J:
++        case OpcodeKind::Jal:
++            if (decoded.kind == OpcodeKind::Jal) {
++                ctx.set_gpr(31u, return_pc);
++                is_call = true;
++            }
++            is_jump = true;
++            next = ((pc + 4u) & 0xF0000000u) | (decoded.target << 2u);
++            break;
++        case OpcodeKind::Jr:
++        case OpcodeKind::Jalr: {
++            // Both operands are read before the delay slot runs, so a slot that
++            // overwrites rs or the link register cannot change the transfer.
++            const std::uint32_t jump_target = ctx.gpr[decoded.rs];
++            if (decoded.kind == OpcodeKind::Jalr) {
++                ctx.set_gpr(decoded.rd == 0u ? 31u : decoded.rd, return_pc);
++                is_call = true;
++            }
++            is_jump = true;
++            next = jump_target;
++            break;
++        }
++        default: {
++            // The condition is evaluated before the link write, because a
++            // branch-and-link whose condition register is $ra must test the old
++            // value. A likely branch annuls its delay slot when not taken.
++            const bool taken = evaluate_branch(ctx, decoded);
++            if (is_link_branch(decoded.kind)) ctx.set_gpr(31u, return_pc);
++            if (taken) {
++                next = pc + 4u + static_cast<std::uint32_t>(
++                    static_cast<std::int32_t>(decoded.immediate) * 4);
++            }
++            run_slot = taken || !is_likely_branch(decoded.kind);
++            break;
++        }
++        }
++
++        if (run_slot) {
++            ++executed;
++            if (g_pc_profile) count_pc(pc + 4u);
++            ctx.pc = pc + 4u;
++            if (!execute_simple(rt, ctx, slot, pc + 4u)) {
++                g_instructions += executed;
++                return;
++            }
++        }
++        if (!is_jump) {
++            pc = next;
++            continue;
++        }
++
++        // A jump: the end of this callee, a call into a native hook or the system, a call into
++        // the lean corpus, or plain interpreted control flow.
++        if (!is_call && next == kGuestReturnSentinel) {
++            g_instructions += executed;
++            return;
++        }
++        const TargetKind kind = exec_classify(next);
++        if (kind == TargetKind::Interpret) {
++            pc = next;
++            continue;
++        }
++        g_instructions += executed;
++        executed = 0u;
++        ctx.pc = next;
++        if (kind == TargetKind::Native) {
++            ++counters.interpreter_to_native;
++            exec_note_system_call();
++            rt.call_native(next);
++        } else {
++            ++counters.interpreter_to_lean;
++            exec_lean_entry(next)();
++        }
++        if (rt.stopped()) return;
++        // A call returns to the instruction after its delay slot; a jump that was a tail call
++        // returns to where the interpreted function would have returned.
++        pc = is_call ? return_pc : ctx.gpr[31];
++        if (!is_call && pc == kGuestReturnSentinel) return;
++    }
++}
++
+ } // namespace psprecomp
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index e14fc1c..ef4ce29 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -148,7 +148,12 @@ bool runtime_thread_switch_generation_matches(std::uint64_t generation) noexcept
+ }
+ 
+ Runtime::Runtime(std::uint32_t ram_size)
+-    : CorpusRuntime(&corpus_host_api(), &g_corpus_process), memory_(ram_size) {
++    : CorpusRuntime(&corpus_host_api(), &g_corpus_process), memory_(ram_size), cpu_(g_cpu) {
++    // The guest memory arena and the register file are process-wide, as generated code
++    // addresses them by name (exec.hpp); the newest Runtime owns them.
++    g_cpu = AllegrexContext{};
++    memory_.make_primary();
++    exec_attach(*this);
+     // RAM never moves after construction, so one view serves every unit.
+     fast_view_ = memory_.aot_fast_view();
+     // Most commercial PSP titles use a few hundred import stubs. Seed a small
+@@ -430,6 +435,23 @@ NidRegistry &Runtime::nids() noexcept { return nids_; }
+ const NidRegistry &Runtime::nids() const noexcept { return nids_; }
+ 
+ void Runtime::register_function(std::uint32_t address, RecompiledFunction function, std::string name) {
++    register_corpus_function(address, function, std::move(name));
++    native_addresses_[address] = true;
++    exec_mark_native(address);
++}
++
++bool Runtime::is_native_function(std::uint32_t address) const noexcept {
++    return native_addresses_.find(address) != native_addresses_.end();
++}
++
++void Runtime::call_native(std::uint32_t address) {
++    const RecompiledFunction function = lookup_function(address);
++    if (function == nullptr) throw Error("No native function at " + hex32(address));
++    cpu_.pc = address;
++    function(*this, cpu_);
++}
++
++void Runtime::register_corpus_function(std::uint32_t address, RecompiledFunction function, std::string name) {
+     if (!function) throw Error("Attempted to register a null recompiled function");
+     functions_[address] = FunctionEntry{function, std::move(name)};
+     const std::uint32_t c = memory_.canonical(address);
+@@ -1218,6 +1240,8 @@ void Runtime::unregister_functions(std::uint32_t start, std::uint32_t end) {
+             ++it;
+             continue;
+         }
++        native_addresses_.erase(it->first);
++        exec_clear_native(it->first);
+         const std::uint32_t c = memory_.canonical(it->first);
+         if (c >= direct_base_) {
+             const std::size_t index = static_cast<std::size_t>(c - direct_base_) / 4u;
+@@ -1366,7 +1390,7 @@ struct RuntimeCorpusHost {
+                 host(rt).memory().aot_store_word_right(address, value);
+             },
+             [](CorpusRuntime &rt, std::uint32_t address, CorpusFunction function, const char *name) {
+-                host(rt).register_function(address, function, name);
++                host(rt).register_corpus_function(address, function, name);
+             },
+             [](CorpusRuntime &rt, std::uint32_t unit_index, std::uint32_t unit_address, std::uint32_t unit_span,
+                CorpusFunction function, CorpusEntryFunction entry_function) {
+diff --git a/tests/coroutine_tests.cpp b/tests/coroutine_tests.cpp
+new file mode 100644
+index 0000000..6bf5afe
+--- /dev/null
++++ b/tests/coroutine_tests.cpp
+@@ -0,0 +1,160 @@
++// Stackful coroutines: the context switch, argument passing, floating-point
++// state across switches, deep stacks, the canary and many short lives.
++// No kernel, no game.
++
++#include "psprecomp/coroutine.hpp"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++using psprecomp::Coroutine;
++
++int g_failures = 0;
++
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++Coroutine g_main;
++Coroutine g_a;
++Coroutine g_b;
++
++struct PingPong {
++    std::uint64_t counter = 0;
++    std::uint64_t limit = 0;
++    double accumulator_a = 1.0;
++    double accumulator_b = 2.0;
++};
++PingPong g_pp;
++
++void ping(void *argument) {
++    auto *state = static_cast<PingPong *>(argument);
++    // Values that live across the switch in callee-saved registers (VFP d8-d15
++    // on ARM, the GPRs everywhere).
++    double local = 1.5;
++    std::uint64_t mine = 0xA0A0A0A0u;
++    for (;;) {
++        ++state->counter;
++        local = local * 1.0000001 + 0.5;
++        state->accumulator_a = local;
++        if (state->counter >= state->limit || mine != 0xA0A0A0A0u) Coroutine::switch_to(g_a, g_main);
++        Coroutine::switch_to(g_a, g_b);
++    }
++}
++
++void pong(void *argument) {
++    auto *state = static_cast<PingPong *>(argument);
++    double local = 2.5;
++    std::uint64_t mine = 0xB0B0B0B0u;
++    for (;;) {
++        ++state->counter;
++        local = local * 0.9999999 + 0.25;
++        state->accumulator_b = local;
++        if (mine != 0xB0B0B0B0u) Coroutine::switch_to(g_b, g_main);
++        Coroutine::switch_to(g_b, g_a);
++    }
++}
++
++int g_entry_value = 0;
++void entry_with_argument(void *argument) {
++    g_entry_value = *static_cast<int *>(argument);
++    Coroutine::switch_to(g_a, g_main);
++}
++
++// Recursion that touches a lot of stack, and returns a checksum.
++std::uint64_t deep(int depth) {
++    volatile std::uint8_t pad[1024];
++    pad[0] = static_cast<std::uint8_t>(depth);
++    pad[1023] = static_cast<std::uint8_t>(depth * 3);
++    if (depth == 0) return pad[0] + pad[1023];
++    return deep(depth - 1) + pad[0] + pad[1023];
++}
++
++std::uint64_t g_deep_result = 0;
++void deep_entry(void *argument) {
++    g_deep_result = deep(*static_cast<int *>(argument));
++    Coroutine::switch_to(g_a, g_main);
++}
++
++int g_lifetimes = 0;
++void short_lived(void *) {
++    ++g_lifetimes;
++    Coroutine::switch_to(g_a, g_main);
++}
++
++} // namespace
++
++int main() {
++    // Argument and first entry.
++    {
++        int value = 4242;
++        check(g_a.create(Coroutine::kDefaultStackBytes, entry_with_argument, &value), "a stack is allocated");
++        Coroutine::switch_to(g_main, g_a);
++        check(g_entry_value == 4242, "the entry function receives its argument");
++        g_a.release();
++    }
++
++    // Ping-pong: a million switches each way, with floating-point and integer
++    // locals that must survive every one of them.
++    {
++        g_pp.limit = 400000;
++        check(g_a.create(Coroutine::kDefaultStackBytes, ping, &g_pp), "ping stack");
++        check(g_b.create(Coroutine::kDefaultStackBytes, pong, &g_pp), "pong stack");
++        Coroutine::switch_to(g_main, g_a);
++        check(g_pp.counter >= g_pp.limit, "400000 round trips complete");
++        // Recompute the expected recurrences.
++        double a = 1.5, b = 2.5;
++        const std::uint64_t half = (g_pp.counter + 1) / 2;
++        for (std::uint64_t i = 0; i < half; ++i) a = a * 1.0000001 + 0.5;
++        for (std::uint64_t i = 0; i < g_pp.counter / 2; ++i) b = b * 0.9999999 + 0.25;
++        check(std::fabs(g_pp.accumulator_a - a) < 1e-9 * std::fabs(a), "floating-point locals survive the switches (a)");
++        check(std::fabs(g_pp.accumulator_b - b) < 1e-9 * std::fabs(b), "floating-point locals survive the switches (b)");
++        g_a.release();
++        g_b.release();
++    }
++
++    // Deep stack use: 200 KiB of a 256 KiB stack.
++    {
++        int depth = 200;
++        check(g_a.create(Coroutine::kDefaultStackBytes, deep_entry, &depth), "deep stack");
++        Coroutine::switch_to(g_main, g_a);
++        std::uint64_t expected = 0;
++        for (int d = 0; d <= depth; ++d) expected += static_cast<std::uint8_t>(d) + static_cast<std::uint8_t>(d * 3);
++        check(g_deep_result == expected, "200 KiB of recursion on a 256 KiB stack");
++        check(g_a.canary_intact(), "the canary is intact after deep recursion");
++        check(g_a.contains_stack_pointer(g_a.saved_stack_pointer()), "the saved stack pointer lies inside the stack");
++        g_a.release();
++    }
++
++    // The canary notices a write below the stack.
++    {
++        int value = 1;
++        check(g_a.create(Coroutine::kMinimumStackBytes, entry_with_argument, &value), "small stack");
++        check(g_a.canary_intact(), "a new stack has its canary");
++        *static_cast<std::uint32_t *>(g_a.stack_base()) = 0u;
++        check(!g_a.canary_intact(), "a smashed canary is detected");
++        g_a.release();
++    }
++
++    // Many short lives.
++    {
++        for (int i = 0; i < 2000; ++i) {
++            Coroutine co;
++            if (!co.create(64u * 1024u, short_lived, nullptr)) { check(false, "create in a loop"); break; }
++            // Reuse g_a as the "from" slot so short_lived can come back.
++            g_a.release();
++            Coroutine::switch_to(g_main, co);  // short_lived switches to g_main from g_a: g_a's sp slot receives it
++            co.release();
++        }
++        check(g_lifetimes == 2000, "2000 coroutines are created, run and released");
++    }
++
++    std::printf("%s\n", g_failures == 0 ? "all coroutine checks passed" : "coroutine checks FAILED");
++    return g_failures == 0 ? 0 : 1;
++}

@@ -1,0 +1,495 @@
+Infected port: vglSkipRedundantState. With it on, the custom-shader draws leave out sceGxmSetVertexProgram,
+sceGxmSetFragmentProgram, sceGxmSetFragmentTexture and sceGxmSetVertexStream calls that would set what the previous
+such draw set; every other path that sets those (clears, blits, the scissor test, fixed function, legacy draws) and
+every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Off by default.
+
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1157,6 +1157,10 @@
+ // Overloads a buffer object with a pre-GPU mapped memory block with a copy-less action.
+ void vglBufferData(GLenum target, const GLvoid *data);
+ 
++// Infected port (patch 0003): skip setting a GXM vertex program, fragment program, fragment texture or vertex stream
++// that the previous custom-shader draw already set and nothing has changed since (off by default).
++void vglSkipRedundantState(GLboolean enable);
++
+ // calloc implementation for vitaGL internal memory pools.
+ void *vglCalloc(uint32_t nmember, uint32_t size);
+ 
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -454,6 +454,11 @@
+ 	vgl_error = x; \
+ 	return y;
+ 
++// Infected port (patch 0003): moved by every path that sets the GXM programs, fragment textures or vertex streams other
++// than the custom-shader draws, and by every scene begun or ended, so that those draws know what they last set is stale.
++extern uint32_t vgl_gxm_state_epoch;
++#define vgl_gxm_state_touched() (vgl_gxm_state_epoch++)
++
+ extern size_t max_vcache_size;
+ extern size_t max_fcache_size;
+ static inline __attribute__((always_inline)) void patch_vertex_program(SceGxmShaderPatcherId id, const SceGxmVertexAttribute *attr, uint32_t attr_num, const SceGxmVertexStream *stream, uint32_t stream_num, SceGxmVertexProgram **prog) {
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -224,7 +224,7 @@
+ 		p->blend_info.raw = blend_info.raw; \
+ 		rebuild_frag_shader(p->fshader->id, &p->fprog, (SceGxmProgram *)p->vshader->prog, is_fbo_float ? SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4 : SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4); \
+ 	} \
+-	sceGxmSetFragmentProgram(gxm_context, p->fprog);
++	rs_set_fragment_program(p->fprog);
+ 	
+ #define align_attributes(attributes, streams) \
+ 	if (p->has_unaligned_attrs) { \
+@@ -395,6 +395,78 @@
+ 	SceGxmVertexProgram *vprog;
+ } vertex_layout_cache_entry;
+ 
++// Infected port (patch 0003): the GXM state the custom-shader draws set, so that vglSkipRedundantState can leave out a
++// call that would set it to what it already is. Valid while vgl_gxm_state_epoch is the value it was recorded at.
++uint32_t vgl_gxm_state_epoch = 1;
++static GLboolean rs_enabled = GL_FALSE;
++static uint32_t rs_epoch = 0;
++static const SceGxmVertexProgram *rs_vprog = NULL;
++static const SceGxmFragmentProgram *rs_fprog = NULL;
++#define RS_FRAG_TEXTURES 4
++static SceGxmTexture rs_ftex[RS_FRAG_TEXTURES];
++static uint32_t rs_ftex_valid = 0;
++static const void *rs_stream[VERTEX_ATTRIBS_NUM];
++static uint32_t rs_stream_valid = 0;
++
++void vglSkipRedundantState(GLboolean enable) {
++	rs_enabled = enable;
++	vgl_gxm_state_touched();
++}
++
++static inline __attribute__((always_inline)) void rs_refresh(void) {
++	if (rs_epoch != vgl_gxm_state_epoch) {
++		rs_epoch = vgl_gxm_state_epoch;
++		rs_vprog = NULL;
++		rs_fprog = NULL;
++		rs_ftex_valid = 0;
++		rs_stream_valid = 0;
++	}
++}
++
++static inline __attribute__((always_inline)) void rs_set_vertex_program(const SceGxmVertexProgram *prog) {
++	if (rs_enabled) {
++		rs_refresh();
++		if (prog == rs_vprog)
++			return;
++		rs_vprog = prog;
++	}
++	sceGxmSetVertexProgram(gxm_context, prog);
++}
++
++static inline __attribute__((always_inline)) void rs_set_fragment_program(const SceGxmFragmentProgram *prog) {
++	if (rs_enabled) {
++		rs_refresh();
++		if (prog == rs_fprog)
++			return;
++		rs_fprog = prog;
++	}
++	sceGxmSetFragmentProgram(gxm_context, prog);
++}
++
++static inline __attribute__((always_inline)) void rs_set_fragment_texture(uint32_t unit, const SceGxmTexture *tex) {
++	if (rs_enabled && unit < RS_FRAG_TEXTURES) {
++		rs_refresh();
++		const uint32_t bit = 1u << unit;
++		if ((rs_ftex_valid & bit) && __builtin_memcmp(&rs_ftex[unit], tex, sizeof(SceGxmTexture)) == 0)
++			return;
++		rs_ftex[unit] = *tex;
++		rs_ftex_valid |= bit;
++	}
++	sceGxmSetFragmentTexture(gxm_context, unit, tex);
++}
++
++static inline __attribute__((always_inline)) void rs_set_vertex_stream(uint32_t index, const void *ptr) {
++	if (rs_enabled && index < VERTEX_ATTRIBS_NUM) {
++		rs_refresh();
++		const uint32_t bit = 1u << index;
++		if ((rs_stream_valid & bit) && rs_stream[index] == ptr)
++			return;
++		rs_stream[index] = ptr;
++		rs_stream_valid |= bit;
++	}
++	sceGxmSetVertexStream(gxm_context, index, ptr);
++}
++
+ #define VERTEX_LAYOUT_CACHE_ENTRIES 4
+ static uint32_t vertex_program_layout_current_ver = 0;
+ static vertex_layout_cache_entry vertex_layout_cache[VERTEX_LAYOUT_CACHE_ENTRIES] = {};
+@@ -839,7 +911,7 @@
+ 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
+ 				tex->overridden = GL_FALSE;
+ 			}
+-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			rs_set_fragment_texture(i, &tex->gxm_tex);
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+ 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
+ 			if (info) {
+@@ -900,16 +972,16 @@
+ 		SceGxmVertexStream *streams = layout_entry->stream;
+ 		vertex_layout_setup_ptrs(p, layout_entry->is_packed, lowest, highest - lowest, highest, ptrs);
+ 		p->vprog = layout_entry->vprog;
+-		sceGxmSetVertexProgram(gxm_context, p->vprog);
++		rs_set_vertex_program(p->vprog);
+ 		upload_uniforms();
+ 		for (int j = 0; j < drawcount; j++) {
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+ 				if (cur_vao->vertex_attrib_state & (1 << attr_idx)) {
+ 					if (layout_entry->is_packed) {
+-						sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
++						rs_set_vertex_stream(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+ 					} else {
+-						sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
++						rs_set_vertex_stream(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+ 					}
+ 				}
+ 			}
+@@ -1021,7 +1093,7 @@
+ #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
+ 	vertex_layout_cache_insert(p, VERTEX_LAYOUT_MULTI_DRAW, 0, is_packed, GL_FALSE, attributes, streams);
+ #endif
+-	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	rs_set_vertex_program(p->vprog);
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
+@@ -1034,14 +1106,14 @@
+ 			if (is_active) {
+ #ifdef STRICT_DRAW_COMPLIANCE
+ 				if (is_packed[i])
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
++					rs_set_vertex_stream(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+ 				else
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
++					rs_set_vertex_stream(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+ #else
+ 				if (is_packed)
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
++					rs_set_vertex_stream(i, ptrs[0] + (first[j] - lowest) * streams[0].stride);
+ 				else
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
++					rs_set_vertex_stream(i, ptrs[i] + (first[j] - lowest) * streams[i].stride);
+ #endif
+ 			}
+ 		}
+@@ -1097,7 +1169,7 @@
+ 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
+ 				tex->overridden = GL_FALSE;
+ 			}
+-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			rs_set_fragment_texture(i, &tex->gxm_tex);
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+ 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
+ 			if (info) {
+@@ -1158,17 +1230,17 @@
+ 		void *ptrs[VERTEX_ATTRIBS_NUM];
+ 		vertex_layout_setup_ptrs(p, layout_entry->is_packed, first, count, count, ptrs);
+ 		p->vprog = layout_entry->vprog;
+-		sceGxmSetVertexProgram(gxm_context, p->vprog);
++		rs_set_vertex_program(p->vprog);
+ 		upload_uniforms();
+ 		for (int i = 0; i < p->attr_num; i++) {
+ 			uint8_t attr_idx = p->attr_map[i];
+ 			if (cur_vao->vertex_attrib_state & (1 << attr_idx)) {
+ 				if (layout_entry->is_packed)
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[0]);
++					rs_set_vertex_stream(i, ptrs[0]);
+ 				else
+-					sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
++					rs_set_vertex_stream(i, ptrs[i]);
+ 			} else {
+-				sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
++				rs_set_vertex_stream(i, cur_vao->vertex_attrib_value[attr_idx]);
+ 			}
+ 		}
+ #ifdef HAVE_PROFILING
+@@ -1302,7 +1374,7 @@
+ #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
+ 	vertex_layout_cache_insert(p, VERTEX_LAYOUT_ARRAYS, layout_variant, is_packed, GL_FALSE, attributes, streams);
+ #endif
+-	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	rs_set_vertex_program(p->vprog);
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
+@@ -1313,16 +1385,16 @@
+ 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
+ 		if (is_active) {
+ #ifdef DRAW_SPEEDHACK
+-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
++			rs_set_vertex_stream(i, ptrs[i]);
+ #else
+ #ifdef STRICT_DRAW_COMPLIANCE
+-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
++			rs_set_vertex_stream(i, is_packed[i] ? ptrs[0] : ptrs[i]);
+ #else
+-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
++			rs_set_vertex_stream(i, is_packed ? ptrs[0] : ptrs[i]);
+ #endif
+ #endif
+ 		} else {
+-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
++			rs_set_vertex_stream(i, cur_vao->vertex_attrib_value[attr_idx]);
+ 		}
+ 		if (!p->has_unaligned_attrs) {
+ 			attributes[i].regIndex = i;
+@@ -1383,7 +1455,7 @@
+ 				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
+ 				tex->overridden = GL_FALSE;
+ 			}
+-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			rs_set_fragment_texture(i, &tex->gxm_tex);
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+ 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
+ 			if (info) {
+@@ -1463,17 +1535,17 @@
+ 			void *ptrs[VERTEX_ATTRIBS_NUM];
+ 			vertex_layout_setup_ptrs(p, layout_entry->is_packed, 0, top_idx, top_idx, ptrs);
+ 			p->vprog = layout_entry->vprog;
+-			sceGxmSetVertexProgram(gxm_context, p->vprog);
++			rs_set_vertex_program(p->vprog);
+ 			upload_uniforms();
+ 			for (int i = 0; i < p->attr_num; i++) {
+ 				uint8_t attr_idx = p->attr_map[i];
+ 				if (cur_vao->vertex_attrib_state & (1 << attr_idx)) {
+ 					if (layout_entry->is_packed)
+-						sceGxmSetVertexStream(gxm_context, i, ptrs[0]);
++						rs_set_vertex_stream(i, ptrs[0]);
+ 					else
+-						sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
++						rs_set_vertex_stream(i, ptrs[i]);
+ 				} else {
+-					sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
++					rs_set_vertex_stream(i, cur_vao->vertex_attrib_value[attr_idx]);
+ 				}
+ 			}
+ #ifdef HAVE_PROFILING
+@@ -1639,7 +1711,7 @@
+ #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
+ 	vertex_layout_cache_insert(p, VERTEX_LAYOUT_ELEMENTS, (uint8_t)index_type, is_packed, is_full_vbo, attributes, streams);
+ #endif
+-	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	rs_set_vertex_program(p->vprog);
+ 
+ 	// Uploading both fragment and vertex uniforms data
+ 	upload_uniforms();
+@@ -1650,16 +1722,16 @@
+ 		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
+ 		if (is_active) {
+ #ifdef DRAW_SPEEDHACK
+-			sceGxmSetVertexStream(gxm_context, i, ptrs[i]);
++			rs_set_vertex_stream(i, ptrs[i]);
+ #else
+ #ifdef STRICT_DRAW_COMPLIANCE
+-			sceGxmSetVertexStream(gxm_context, i, is_packed[i] ? ptrs[0] : ptrs[i]);
++			rs_set_vertex_stream(i, is_packed[i] ? ptrs[0] : ptrs[i]);
+ #else
+-			sceGxmSetVertexStream(gxm_context, i, is_packed ? ptrs[0] : ptrs[i]);
++			rs_set_vertex_stream(i, is_packed ? ptrs[0] : ptrs[i]);
+ #endif
+ #endif
+ 		} else {
+-			sceGxmSetVertexStream(gxm_context, i, cur_vao->vertex_attrib_value[attr_idx]);
++			rs_set_vertex_stream(i, cur_vao->vertex_attrib_value[attr_idx]);
+ 		}
+ 		if (!p->has_unaligned_attrs) {
+ 			attributes[i].regIndex = i;
+@@ -1688,7 +1760,7 @@
+ 	setup_frag_program();
+ 
+ 	// Setting up required vertex shader
+-	sceGxmSetVertexProgram(gxm_context, p->vprog);
++	rs_set_vertex_program(p->vprog);
+ 
+ 	// Uploading textures on relative texture units
+ 	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
+@@ -1699,7 +1771,7 @@
+ #ifndef TEXTURES_SPEEDHACK
+ 			tex->last_frame = vgl_framecount;
+ #endif
+-			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
++			rs_set_fragment_texture(i, &tex->gxm_tex);
+ #ifdef HAVE_GLSL_TEXTURE_SIZE
+ 			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
+ 			if (info) {
+@@ -3872,7 +3944,7 @@
+ 	}
+ 
+ 	// Setting vertex stream to passed index in sceGxm
+-	sceGxmSetVertexStream(gxm_context, index, ptr);
++	rs_set_vertex_stream(index, ptr);
+ #endif
+ }
+ 
+@@ -3881,7 +3953,7 @@
+ 
+ #ifdef ENABLE_LEGACY_PIPELINE
+ 	// Setting vertex stream to passed index in sceGxm
+-	sceGxmSetVertexStream(gxm_context, index, pointer);
++	rs_set_vertex_stream(index, pointer);
+ #endif
+ }
+ 
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -574,6 +574,7 @@
+ static inline __attribute__((always_inline)) void scene_end(void) {
+ 	// Ends current gxm scene
+ 	query_fence.value++;
++	vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 	sceGxmEndScene(gxm_context, NULL, &query_fence);
+ 	if (system_app_mode && vsync_interval)
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+@@ -622,6 +623,7 @@
+ 				shared_fb_info.vsync = vsync_interval;
+ 				gxm_back_buffer_index = (shared_fb_info.index + 1) % 2;
+ 			}
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
+ 				NULL, NULL,
+ 				gxm_sync_objects[gxm_back_buffer_index],
+@@ -672,8 +674,10 @@
+ #ifdef RECYCLE_RENDERTARGETS
+ 			fbo_rt->last_frame = vgl_framecount;
+ #endif
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			int r = sceGxmBeginScene(gxm_context, 0, fbo_rt->rt,
+ #else
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
+ #endif
+ 					NULL, NULL, NULL,
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -670,6 +670,7 @@
+ 	sceGxmSetFrontPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+ 	sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+ 
++	vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
+ 	sceGxmSetFragmentProgram(gxm_context, is_fbo_float ? clear_fragment_program_float_patched : clear_fragment_program_patched);
+ 
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -840,6 +840,7 @@
+ 	sceGxmSetBackPolygonMode(gxm_context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+ 
+ 	// Set framebuffer blit shader
++	vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 	sceGxmSetVertexProgram(gxm_context, blit_vertex_program_patched);
+ 	if (is_fbo_float) {
+ 		sceGxmSetFragmentProgram(gxm_context, blit_fragment_program_float_patched);
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -595,12 +595,14 @@
+ #ifndef TEXTURES_SPEEDHACK
+ 			texture_slots[tex_unit->tex_id[0]].last_frame = vgl_framecount;
+ #endif
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			sceGxmSetFragmentTexture(gxm_context, 0, &texture_slots[tex_unit->tex_id[0]].gxm_tex);
+ 			sceGxmSetVertexStream(gxm_context, 1, texture_object);
+ 			if (ffp_vertex_num_params > 2)
+ 				sceGxmSetVertexStream(gxm_context, 2, color_object);
+ 		} else if (ffp_vertex_num_params > 1)
+ 			sceGxmSetVertexStream(gxm_context, 1, color_object);
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetVertexStream(gxm_context, 0, vertex_object);
+ 		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, index_object, count);
+ 	}
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -1180,6 +1180,7 @@
+ 		ffp_blend_info.raw = blend_info.raw;
+ 	}
+ 
++	vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 	sceGxmSetVertexProgram(gxm_context, ffp_vertex_program_patched);
+ 	sceGxmSetFragmentProgram(gxm_context, ffp_fragment_program_patched);
+ 
+@@ -1355,6 +1356,7 @@
+ 			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
+ 			tex->overridden = GL_FALSE;
+ 		}
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+ 	}
+ 	
+@@ -1455,6 +1457,7 @@
+ #endif
+ 				}
+ 			}
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			sceGxmSetVertexStream(gxm_context, j++, ptr);
+ 		}
+ 	}
+@@ -1494,6 +1497,7 @@
+ 			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
+ 			tex->overridden = GL_FALSE;
+ 		}
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+ 	}
+ 	
+@@ -1611,6 +1615,7 @@
+ 	
+ 	for (int i = 0; i < drawcount; i++) {
+ 		for (int z = 0; z < j; z++) {
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			sceGxmSetVertexStream(gxm_context, z, ptrs[z] + (first[i] - lowest) * strides[z]);
+ 		}
+ 		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, idx_ptr, count[i]);
+@@ -1708,6 +1713,7 @@
+ 			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
+ 			tex->overridden = GL_FALSE;
+ 		}
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+ 	}
+ 
+@@ -1791,6 +1797,7 @@
+ #endif
+ 			}
+ 		}
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetVertexStream(gxm_context, i, ptr);
+ 	}
+ #ifdef HAVE_PROFILING
+@@ -2777,6 +2784,7 @@
+ 				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
+ 				tex->overridden = GL_FALSE;
+ 			}
++			vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
+ 		}
+ 	} else if (texture_units[0].state) { // Texturing usage
+@@ -2809,6 +2817,7 @@
+ 			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
+ 			tex->overridden = GL_FALSE;
+ 		}
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetFragmentTexture(gxm_context, 0, &tex->gxm_tex);
+ 	} else { // No texturing usage
+ 		ffp_vertex_attrib_state = (1 << FFP_ATTRIB_POSITION) | (1 << FFP_ATTRIB_COLOR);
+@@ -2824,6 +2833,7 @@
+ 
+ 	// Uploading vertex streams and performing the draw
+ 	for (int i = 0; i < ffp_vertex_num_params; i++) {
++		vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 		sceGxmSetVertexStream(gxm_context, i, legacy_pool);
+ 	}
+ 
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -257,6 +257,7 @@
+ 	const float scissor_depth = 1.0f;
+ 
+ 	// Setting current vertex program to clear screen one and fragment program to scissor test one
++	vgl_gxm_state_touched(); // Infected port (patch 0003)
+ 	sceGxmSetVertexProgram(gxm_context, clear_vertex_program_patched);
+ 	sceGxmSetFragmentProgram(gxm_context, scissor_test_fragment_program);
+ 

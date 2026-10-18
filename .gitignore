@@ -1,0 +1,13 @@
+third_party/
+dist/
+build/
+sysroot/
+out/
+*.o
+*.a
+__pycache__/
+*.vpk
+*.iso
+*.bin
+private/
+texpack-work/

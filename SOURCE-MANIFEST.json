@@ -1,0 +1,1522 @@
+{
+  "date": "2026-10-18",
+  "scope": "Imported source files after documented privacy and documentation edits; not a binary-reproduction receipt",
+  "files": [
+    {
+      "path": ".gitignore",
+      "sha256": "0adf9d9ecce2d56f10041a725d37f3c29f4150b8a993fd9c848110f79a9c9636"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "9bcbd03c72368b79527a67648747f7c4ea49b602c23c0c973ad88082cf0d5c18"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "bd92245bf766a856c1036b9a9df40e88d3a11c5c28fa46d17dd1f3965feeed12"
+    },
+    {
+      "path": "docs/BUILDING.md",
+      "sha256": "2acbab1172d576990f114bcad9c4599e9cddcf7c301fac8f17ff4ca1bd291b40"
+    },
+    {
+      "path": "docs/GAMEPLAY_TUNING.md",
+      "sha256": "662a07d789a9bd1191634c28985018eb92eb33c9b4f9cb45bd4b4dd664f36ce6"
+    },
+    {
+      "path": "docs/GL_RENDERER.md",
+      "sha256": "4ff47e1181b63df6db2a97063a87c48eaaf5c7d055c52e7f74877368c45acfda"
+    },
+    {
+      "path": "docs/HD_MOVIES.md",
+      "sha256": "d26a28578ca60b886ee2f5a65b4d8401cd625a18dbb1372b466c27680ce313b8"
+    },
+    {
+      "path": "docs/SETTINGS.md",
+      "sha256": "f5a2b660eeabe7d8ad429fd2c90f7df29bdcad4797b52958bb73317bdd2e3b64"
+    },
+    {
+      "path": "patches/portablekit/0001-Bring-up-tooling-run-statistics-call-trace-scripted-.patch",
+      "sha256": "f8bdeef6190f7b0944bd10aa073fd23fa87a530993351b28783706a16763f260"
+    },
+    {
+      "path": "patches/portablekit/0002-Bring-up-call-trace-thread-filter-and-start-time.patch",
+      "sha256": "acfb3fa46432b4286f1ebf395d00856d1d45232af290433dd116d8760f75140f"
+    },
+    {
+      "path": "patches/portablekit/0003-Coroutine-kernel-groundwork-co_switch-66-MiB-arena-e.patch",
+      "sha256": "712f95c6c9669169231f9fe8d79314e95391100dbfe654f232042cb8f3d02106"
+    },
+    {
+      "path": "patches/portablekit/0004-Coroutine-kernel-every-guest-thread-on-its-own-host-.patch",
+      "sha256": "fd85016f72fc6326d6b0f93f409f72dabdf9e771a3b4020cc508ba382f5f2c0f"
+    },
+    {
+      "path": "patches/portablekit/0005-MPEG-hold-ring-packets-until-their-access-units-are-.patch",
+      "sha256": "578a3b476052af80fc146c3e0b7fe402e2801cb5855ae91cf4809ef1599b0286"
+    },
+    {
+      "path": "patches/portablekit/0006-Print-the-interpreter-region-histogram-at-the-end-of.patch",
+      "sha256": "9ef26913de2c5cc9f3ca7fc4b9038be03ed699a7bca86c3c9d26ac3d903deef1"
+    },
+    {
+      "path": "patches/portablekit/0007-Docs-switches-of-the-coroutine-kernel.patch",
+      "sha256": "f888bdf4fa5a42849fa0fdcd29492e7e2697715daf7e56967c92150ac05ecbed"
+    },
+    {
+      "path": "patches/portablekit/0008-Kernel-tests-lean-entries-forced-interpretation-lean.patch",
+      "sha256": "d004d5ad09c609b92ea218be4b06ffe5ccfb6200fdefc75231202dfafdd2c6d4"
+    },
+    {
+      "path": "patches/portablekit/0009-Merge-gl-renderer-into-coroutine-kernel-line.patch",
+      "sha256": "406979ab9e57dfac7a3dd901d1196d1d7c229442dec177b92aab192b7ff92d20"
+    },
+    {
+      "path": "patches/portablekit/0010-GE-recorder-read-RAM-and-VRAM-through-the-arena-merg.patch",
+      "sha256": "17e5784953d78ec905befc00788fc431a8352cf1d032ca731335af4250d98fed"
+    },
+    {
+      "path": "patches/portablekit/0011-Vita-app-seams-arena-provider-pad-audio-clock-hooks-.patch",
+      "sha256": "e0222ab65759ff82305206507cc44f468402066a20d7b565e39d6b56a85e29d6"
+    },
+    {
+      "path": "patches/portablekit/0012-Vita-no-ad-hoc-client-thread-reset-renderer-GL-cache.patch",
+      "sha256": "77ea04a3a7780c8447b681f0762d05d67167d51adeaa89a2f2915bd915f3e91a"
+    },
+    {
+      "path": "patches/portablekit/0013-GL-renderer-flip-the-final-present-blit-on-vitaGL-wi.patch",
+      "sha256": "13ad38c31d18a4ddbae26f05a672d2006ff60909ebc5dcde996cb719ba45113d"
+    },
+    {
+      "path": "patches/portablekit/0014-GL-renderer-unroll-the-four-lights-in-the-vertex-sha.patch",
+      "sha256": "0b2671f4f84537cba6dbb1b40d5dd1a6e17603d97904881a0536368a7b9ae2ca"
+    },
+    {
+      "path": "patches/portablekit/0015-GE-thread-SPSC-job-ring-gpu-GeWorker-host-interrupt-.patch",
+      "sha256": "7078cf548ae3fbbaea2224ab6700459c7d715f48be499a711f724f3c535f7eec"
+    },
+    {
+      "path": "patches/portablekit/0016-Merge-the-integration-branch-bench-mode-movie-textur.patch",
+      "sha256": "bb33b364d90d19daaf904c85e179102d02cfd4b801857e6841c254a0d2f3a153"
+    },
+    {
+      "path": "patches/portablekit/0017-GE-thread-off-under-INFECTED_BENCH-GE_DUMP-fix-the-m.patch",
+      "sha256": "502f7b97720c9042ec8d5046086294a3a5dd31ad5f009e843ec8f7b83d440206"
+    },
+    {
+      "path": "patches/portablekit/0018-Merge-branch-integration-into-infected-next.patch",
+      "sha256": "beaf26f98c67e56bdcdbd749cd96b059f526c8ea47f965addb931aa7402e60ea"
+    },
+    {
+      "path": "patches/portablekit/0019-Merge-gfx-options-port-settings-overlay-renderer-opt.patch",
+      "sha256": "94f826d0401a7056134e6ae88d4decc5aaaf0c86844ce5918a35464a9bc8f6d1"
+    },
+    {
+      "path": "patches/portablekit/0020-Merge-branch-gfx-options-into-infected-next.patch",
+      "sha256": "2be5eae6cf7b98dc0e7ad2936e7dee12996cef221d63fe7c98d57e5a05115b2b"
+    },
+    {
+      "path": "patches/portablekit/0021-Merge-texture-pack-HD-texture-replacement-texture-du.patch",
+      "sha256": "000c2e2214e8614c2ec5ab93aaae54a143dfa7aa1891b5b5362bd3f231ebc6d1"
+    },
+    {
+      "path": "patches/portablekit/0022-Join-the-branches-HD-textures-follow-gfx.hd_textures.patch",
+      "sha256": "49a5d044929a25efdbfbd73f47298c373dfe84c43bc814aa95c89f7eb9c6af7a"
+    },
+    {
+      "path": "patches/portablekit/0023-Vita-prewarm-all-shader-variants-HD-uploads-wait-for.patch",
+      "sha256": "820cabc63a40e8b0563a8161a822e2133ec1378cb15357b98a44d5f6e24ceb46"
+    },
+    {
+      "path": "patches/portablekit/0024-Virtual-clock-stands-still-while-the-GE-thread-draws.patch",
+      "sha256": "83bf868b40c73858655a46d6485c77d2b6db0efd388c02cb6b6851a2552957b2"
+    },
+    {
+      "path": "patches/portablekit/0025-Menu-the-guest-resumed-line-prints-the-clock-read-in.patch",
+      "sha256": "9cab603ad4bebbc38db1270ddb8f2a08fd03c12f06487f4a84704731e2ccf83c"
+    },
+    {
+      "path": "patches/portablekit/0026-gl-an-HD-replacement-keeps-its-own-mip-chain-no-buil.patch",
+      "sha256": "af1e1b482e7bc130fbfa41b1c016aceef27a160b786113983bdee3c30ec85ca3"
+    },
+    {
+      "path": "patches/portablekit/0027-Merge-gameplay-tuning-framework-commits-profile-fram.patch",
+      "sha256": "058947cfb103bb3dac966bdd8a36d63802bb5caf9537a83b40fefe78089abfe8"
+    },
+    {
+      "path": "patches/portablekit/0028-HD-packs-Automatic-2x-else-4x-per-mode-budgets-confi.patch",
+      "sha256": "b1b24e2fbc98767e3afc335684e970b364aeeb0171ea9b50f5cd17e6007099d7"
+    },
+    {
+      "path": "patches/portablekit/0029-gl-release-stale-HD-replacements-when-the-HD-budget-.patch",
+      "sha256": "3da533a07949c4479af6fee649bd2606a8bb53dfc253231bfca6e922f0d7db57"
+    },
+    {
+      "path": "patches/portablekit/0030-Merge-branch-m-hd-movies-into-infected.patch",
+      "sha256": "f08fa4dee8dcff60d1e8c9e6a70a182cb28b36a2f2d27002e91ed98748a668c2"
+    },
+    {
+      "path": "patches/portablekit/0031-settings-the-HD-movies-row-says-EXPERIMENTAL-descrip.patch",
+      "sha256": "653c66b87268be22ea1fb752f485a04e52d3cb3f4d6525e5904cc95e86a19a7d"
+    },
+    {
+      "path": "patches/portablekit/0032-settings-the-greyed-reason-of-the-HD-movies-row-fits.patch",
+      "sha256": "55ac1e3d4f354959507dc02c3432a6600ea3cb6cf5766161399d742a4b123cc8"
+    },
+    {
+      "path": "patches/portablekit/0033-coroutine-open-the-PS-Vita-s-per-thread-stack-bounds.patch",
+      "sha256": "bc444b8f722d4e47831763b19898dcaf9aa5900024f79b86120f72d87960d6fd"
+    },
+    {
+      "path": "patches/portablekit/0034-renderer-run-copies-for-wrapped-textures-GL-thread-t.patch",
+      "sha256": "e0f65b4de0c6f81bbda5f67e4b1c2aa2281cec0dc98d181f7a997c133fed7bfe"
+    },
+    {
+      "path": "patches/portablekit/0035-Merge-the-HD-movies-follow-ups-sampling-decoder-hand.patch",
+      "sha256": "14413d899c37a617f1dacd0c154e32be5183e574d6cffde9a8d31ff8f73f2170"
+    },
+    {
+      "path": "patches/portablekit/0036-renderer-draw-from-scratch-memory-buffers-on-the-PS-.patch",
+      "sha256": "749eb50dcdd187d1d0c31da2570c3b83bd7bdd929800e37221296d5a48f35310"
+    },
+    {
+      "path": "patches/portablekit/0037-GE-NEON-vertex-skinning-on-32-bit-ARM-trace-switches.patch",
+      "sha256": "8560dc3dccaed656ec6878313559cb51614d9f750c2e5ab66e5e7a66fc7f36e0"
+    },
+    {
+      "path": "patches/portablekit/0038-GE-split-the-threaded-renderer-into-a-list-walker-an.patch",
+      "sha256": "b17cb29e1e8f3153550710b3533d09f5990e32fc0b77f9bca23802ab1a226534"
+    },
+    {
+      "path": "patches/portablekit/0039-renderer-specialised-fragment-programs-a-fill-rate-t.patch",
+      "sha256": "227993f12f69c2fd74d9884dea4608998493d2d4c36dc05d693e8f87fa88ae52"
+    },
+    {
+      "path": "patches/portablekit/0040-settings-Performance-Resolution-960x544-or-720x408.patch",
+      "sha256": "9d6a306d564afa88e208b8c7c919fe11bdfc2df48c1b418a85e2b3682d22b2a3"
+    },
+    {
+      "path": "patches/portablekit/0041-renderer-specialise-the-lighting-code-to-each-light-.patch",
+      "sha256": "d10c599b33403471345e37a13ecb45fb5744ce651f12cadd69f9230912366f4e"
+    },
+    {
+      "path": "patches/portablekit/0042-docs-light-specialisation-and-its-measured-program-s.patch",
+      "sha256": "17f97054b52da2df4c0833e785ad479155292ca531b09d5620e6d1c6a487fcae"
+    },
+    {
+      "path": "patches/portablekit/0043-renderer-drop-alpha-tests-that-every-fragment-passes.patch",
+      "sha256": "e05be07f157f0c1c25e549eeb2e4d98421f760aedaa184b5942396aa61ec6bcd"
+    },
+    {
+      "path": "patches/portablekit/0044-GE-NEON-skinning-reads-bone-columns-laid-out-once-pe.patch",
+      "sha256": "0bd9a121edf67f0ecbb3a35a9bce2e59f9970d4d744bf21945da4f597a34a22d"
+    },
+    {
+      "path": "patches/portablekit/0045-settings-Renderer-thread-gets-a-third-choice-Split-t.patch",
+      "sha256": "4e2d5f875e44e7be76747597cc6a17baa2fce31373ac8e6e2a81ee4a8c365db1"
+    },
+    {
+      "path": "patches/portablekit/0046-perf-halve-the-CPU-cost-of-the-list-walk-and-the-GL-.patch",
+      "sha256": "2e7ab04b0cd925155a3059d43c4588cb4736e935fb1f2b2d5a199b2ed7762ad8"
+    },
+    {
+      "path": "patches/portablekit/0047-renderer-keep-scratch-buffers-bound-between-batches-.patch",
+      "sha256": "28043277bdc5e2e1a5fa8793436f356e2f14ff653ad636617bdb93e4fe066eb0"
+    },
+    {
+      "path": "patches/portablekit/0048-split-renderer-expand-strips-and-fans-on-the-walker-.patch",
+      "sha256": "e5e0a2c9bfb1b4c0a4da4c2ae3fda4c2ecc9d55df2fa228e8863db308ef71c42"
+    },
+    {
+      "path": "patches/portablekit/0049-renderer-vertex-opacity-on-the-walker-s-side-scan-on.patch",
+      "sha256": "d4a9c3a99ccbf1c091d8b3ab65611dd77d26bc53badbe2a6560a445596c2fdf0"
+    },
+    {
+      "path": "patches/portablekit/0050-tools-armprof-ARM-instruction-counts-of-the-walk-and.patch",
+      "sha256": "480adf45a96f9996757d7d5ebcc489bcd59856ba1e2df51964fe21039f1e4d46"
+    },
+    {
+      "path": "patches/portablekit/0051-settings-a-platform-s-own-default-for-a-key.patch",
+      "sha256": "c213bea606ca83467f8356d940e8bebb7fdb49c0fe0d07cbffa7a8c445ca2d8a"
+    },
+    {
+      "path": "patches/portablekit/0052-split-renderer-signal-only-a-sleeping-thread-time-th.patch",
+      "sha256": "365e1d0b4e605575f25d86f16b065858168d91ddb1f3714027890bb4034cb6ec"
+    },
+    {
+      "path": "patches/portablekit/0053-hd-textures-read-and-recolour-replacements-off-the-G.patch",
+      "sha256": "42e4abb2210caf09a80ea83638306b852e9f3a6cfb91ad56d867598b7cf7beef"
+    },
+    {
+      "path": "patches/portablekit/0054-split-renderer-frame-skipping-so-the-game-and-its-au.patch",
+      "sha256": "ecaf75df96e3a76ef028a0ecc29db5fc5d4b224007c89b0426e458f47dbbf899"
+    },
+    {
+      "path": "patches/portablekit/0055-audio-a-pull-mode-for-a-platform-s-device-thread-and.patch",
+      "sha256": "091f5e42c143620451e88ac957a21893ee4760a3eea840959fb3d8d872cbb7e3"
+    },
+    {
+      "path": "patches/portablekit/0056-textures-read-whole-swizzle-blocks-when-a-texture-do.patch",
+      "sha256": "9a3a324733ae7126e0b84d3dbc5eec72f7274a19c8b01081e38fa107284df4a3"
+    },
+    {
+      "path": "patches/portablekit/0057-movies-decode-one-picture-ahead-on-a-helper-thread-a.patch",
+      "sha256": "467d1f2f0825c88540ea6a6a16815c9153d09c2c8fa7a85158ce697e3d6f3bd8"
+    },
+    {
+      "path": "patches/portablekit/0058-textures-decode-palette-and-swizzled-16-bit-textures.patch",
+      "sha256": "695655e2fc4e3590f7eb99e923cc34bbb39b94d96aacd075d6c8f1d9304981bc"
+    },
+    {
+      "path": "patches/portablekit/0059-split-renderer-an-idle-work-hook-so-the-GL-thread-ca.patch",
+      "sha256": "9b73d0cde63ea68b05b8e702fb32904cdc98c01665ce9a700ad6c67d1b7bd086"
+    },
+    {
+      "path": "patches/portablekit/0060-gl-MMPX-upscaled-HUD-textures-and-shader-programs-li.patch",
+      "sha256": "40372c4b992e74817d82283c16b4577f5e597ef98d6a64c8859b0a1cad18f20f"
+    },
+    {
+      "path": "patches/portablekit/0061-gl-perf-a-render-target-trace-and-a-phase-timer-for-.patch",
+      "sha256": "aa35d844fc4a9ad5f69d30ff8c3eda0e26ffa5ee76354f3c579bdadbe8ca91af"
+    },
+    {
+      "path": "patches/portablekit/0062-gl-timing-report-splits-the-GL-thread-s-submit-into-.patch",
+      "sha256": "360acd96a347cd375ba01de71e6705af8d461cde9f289814b57649d397d4de38"
+    },
+    {
+      "path": "patches/portablekit/0063-gl-compact_vertices-a-batch-without-the-vertex-field.patch",
+      "sha256": "d897a59f0436a08d06b223acf3620270f4a170758dc0e77593dae35f62f951ac"
+    },
+    {
+      "path": "patches/portablekit/0064-gl-the-draw-trace-prints-a-signature-of-the-compared.patch",
+      "sha256": "a2c4f2bc65a124a239696863489438b6c06ea93e76a4af944727baafef3ef826"
+    },
+    {
+      "path": "patches/portablekit/README.md",
+      "sha256": "82b595394210b3654b96faa57a816f67987d063c646ce990fadc4f2a57bf8a73"
+    },
+    {
+      "path": "port/CMakeLists.txt",
+      "sha256": "4baf861a9443e24a2322a88d813e9200a87e16dcd4530c58fa41cb6324034fe4"
+    },
+    {
+      "path": "port/host/infected_bot.cpp",
+      "sha256": "15d99075c9be47cbb132334ceed2a8a511d2a56a49040bfd6d75b0ee20fc3faa"
+    },
+    {
+      "path": "port/host/infected_bot.hpp",
+      "sha256": "538cfb68c87b531c15e7e785db639a9ee268139c0fe1fc75c4c828851de07a02"
+    },
+    {
+      "path": "port/host/infected_profile.cpp",
+      "sha256": "4e0d2f4dcd3e4149bf2ccf6a37a7e947eb9c0572cb28581e6b45704fd7fac902"
+    },
+    {
+      "path": "port/host/infected_tuning.cpp",
+      "sha256": "371bcf9ed7a265c75fcdb13280df887064ba1ddcc82fc252485b5f1e2641681d"
+    },
+    {
+      "path": "port/host/infected_tuning.hpp",
+      "sha256": "8f785962937f7df5421207f8a08ed2d95f7cc5f78316851cc4844108d5c83a61"
+    },
+    {
+      "path": "port/host/lean_count.cpp",
+      "sha256": "8e69179ae343d40c311580d9e74ae84fb7af9a0777840a436150d5c78778ffa8"
+    },
+    {
+      "path": "recomp/build_lib.sh",
+      "sha256": "e6b2e339a45e8334059c6224051e6bfc24d19f8eddee6520ae767a9cdfd438f9"
+    },
+    {
+      "path": "recomp/infected_profile.json",
+      "sha256": "ef78bbedfcc0c81632c8207a97722594af8b17dd75c7cdb3dcb16fcf38859824"
+    },
+    {
+      "path": "recomp/lean_abi.h",
+      "sha256": "fd4036add5e18c280880da66cfe4178b91c562e9650cbe17d380c05213fef8ab"
+    },
+    {
+      "path": "recomp/lean_gen.py",
+      "sha256": "ce0bac2a16371bb3e4645ddc65cae05efd510cf7fb460fd323e71c179c53d458"
+    },
+    {
+      "path": "recomp/lean_vfpu.h",
+      "sha256": "0bf127ab61bea7390e6f3ce1d41812678a29824c8e7b61797e9196ae4034d1a8"
+    },
+    {
+      "path": "recomp/lean_vfpu_fast.h",
+      "sha256": "0d1d78bd9f55dd04ae81781b6529aa6df95326a0d3c44823d5d276e43d4cf1a9"
+    },
+    {
+      "path": "recomp/leangen/abi.py",
+      "sha256": "db6c97cfd93afff84d78d80be2aaac6614e39c29030ed0b4f4903e259172bee9"
+    },
+    {
+      "path": "recomp/leangen/analysis.py",
+      "sha256": "7ade65ac3b0c8491beacd2b05976ca5049408b85e80dcccf0876158de3fd2e59"
+    },
+    {
+      "path": "recomp/leangen/cfg.py",
+      "sha256": "ee4279daa9d05a5b1ab9c61da8b5e5d3c27f8f8a153fd6989a27999ad257ff1d"
+    },
+    {
+      "path": "recomp/leangen/discover.py",
+      "sha256": "0097e9849ea173ab40c08303b9b41caf4f123798827ccd2ac9fef077468bd8a5"
+    },
+    {
+      "path": "recomp/leangen/emit.py",
+      "sha256": "70764681f0a4a3360741a71c298a25ae5e8c8ec130b05f54ab191c15ed4e8fc4"
+    },
+    {
+      "path": "recomp/leangen/fuse.py",
+      "sha256": "1d8e8914e1c3060b372bdf84b8c2691241b09399e6ba1805c46141df1e559b8b"
+    },
+    {
+      "path": "recomp/leangen/image.py",
+      "sha256": "f30021328b90f98fa5f48a19326291d0d7cf00a9a33731e9a6dc8ffefa6b868d"
+    },
+    {
+      "path": "recomp/leangen/live.py",
+      "sha256": "5b689104f01bfaf07f89f08d8d5d1e77a64c345784ed59102c7b44b351d6632f"
+    },
+    {
+      "path": "recomp/leangen/mips.py",
+      "sha256": "b000db3e4d416cb5a47b543e8252503b727fdbd41473ddfeab51ca1a99d844dc"
+    },
+    {
+      "path": "recomp/leangen/pipeline.py",
+      "sha256": "4c1d23ddbc0a245a371d934232237af1938b89b92cea70068f2093c0e6b2eb17"
+    },
+    {
+      "path": "recomp/leangen/synth.py",
+      "sha256": "c757a6b2c62671f88ae4ed8aaf7910a3829c7ce4c14cb22b033110c78afc1222"
+    },
+    {
+      "path": "recomp/leangen/vfpu.py",
+      "sha256": "28a260efd7aed02f8d807dfb1a00203265c9cfe477b18c0c2a44c39625a4c399"
+    },
+    {
+      "path": "recomp/prototype/diff/build_rt.sh",
+      "sha256": "7132d6c1005fc0f0245f5c5afecef373ee05ad4e1a5ea7eddaff0aee7050a2d7"
+    },
+    {
+      "path": "recomp/prototype/diff/difftest.cpp",
+      "sha256": "153b12ffab42beaa68829ccc1fda1ec63be5389b50428ca7f79ce39ddba94b5b"
+    },
+    {
+      "path": "recomp/prototype/diff/difftest_decls.inc",
+      "sha256": "441702f816ec1727b0c7788dc742379a5d31c25b154f5ee338973c90fd2d0ef8"
+    },
+    {
+      "path": "recomp/prototype/diff/difftest_table.inc",
+      "sha256": "9aa0901e42eff162bbc576271fc5afec17ffac764eb757382c0ce1560f321349"
+    },
+    {
+      "path": "recomp/prototype/diff/lean_diff.cpp",
+      "sha256": "3b1354ae45eda438a4508abdeb3f65b7d8b83adaeaba280f9e9ad014468bf934"
+    },
+    {
+      "path": "recomp/prototype/dyn_profile.py",
+      "sha256": "5c17f308dd7c2e60580c2485860a90d2843bdcd2be64c86abb3e57d28f1d5150"
+    },
+    {
+      "path": "recomp/prototype/dyn_unsup.py",
+      "sha256": "9485a70fc102587251a49c823a5537e877f465c7c1d2e8d031aa444e0a933c16"
+    },
+    {
+      "path": "recomp/prototype/insncount.py",
+      "sha256": "7c4fbe027e4d7b8c22de2704a45c953dfe9bce12758714d3428e4ee9d3d41174"
+    },
+    {
+      "path": "recomp/prototype/lean.h",
+      "sha256": "a5954fbe6314887c245e1f5b7cab0043dbcfbf06027a34fc915d76456f336938"
+    },
+    {
+      "path": "recomp/prototype/lean_gen.py",
+      "sha256": "256bfd86fd88bbab8ae764b79995e3a666331784e6ebbed64ea608aa5c673930"
+    },
+    {
+      "path": "recomp/prototype/lean_measure.py",
+      "sha256": "4e9e3a8f13281664f79b14a6b0e4af91bf9482de94c9c3fc1dfc90e761f1fcf9"
+    },
+    {
+      "path": "recomp/prototype/pick_funcs.py",
+      "sha256": "2d84257dea9763cdd95bf60c5ce6857516618e980592bdd4223964e249176d9e"
+    },
+    {
+      "path": "recomp/prototype/slice_unit.py",
+      "sha256": "b8f638f13b05a02a5f089150afcdae0db1f45c99bd5284741a022ef719226c1e"
+    },
+    {
+      "path": "recomp/tests/build_tests.sh",
+      "sha256": "4a28bc40886d4639a87ad5a9ad8693cdb3304ceec4ef00ad8fdc84496fd61cfe"
+    },
+    {
+      "path": "recomp/tests/difftest.cpp",
+      "sha256": "93264b7ccf909e2231c02efc12a335063c67b474af4704806955deeed94327c8"
+    },
+    {
+      "path": "recomp/tests/lean_neon_shim.h",
+      "sha256": "37daf434bdb3a5ddb56f7c826d57acf1f64b2581f1edb47925d697fcd96d8cdb"
+    },
+    {
+      "path": "recomp/tests/run_synth.sh",
+      "sha256": "e5a4338aff0ac300955bb3ec7e7c69a04ab0d6992e65d7dca847b49d99b4e5fc"
+    },
+    {
+      "path": "recomp/tests/snapshot/mksnaplist.py",
+      "sha256": "b94ab9f6f756002a8ecd5c8647655bba32a7f888a29b248bef6b8a2a97b09013"
+    },
+    {
+      "path": "recomp/tests/snapshot/portablekit-snapshot.patch",
+      "sha256": "cd6e213f4cffdf5e749ff446c1a4c7bd7c21b6b8bb442d52dddee88fdbaa4bd8"
+    },
+    {
+      "path": "recomp/tests/stub_runtime.cpp",
+      "sha256": "07c56e4f478a845bae616c49692e36a671729b8122dbecc999d19d2a04b55962"
+    },
+    {
+      "path": "recomp/tests/stub_runtime.h",
+      "sha256": "1e1fcb33ec941ad2a653aed9fc73166ecaad4d1298eed0c796112ddd1823145d"
+    },
+    {
+      "path": "recomp/tests/synth/cases_core.py",
+      "sha256": "52e2b15d11cafe6c36fb5d54194de6d622f2f78cae70fd58f7b81bd78e6c1f53"
+    },
+    {
+      "path": "recomp/tests/synth/cases_vfpu.py",
+      "sha256": "4aa686a5cf1dcece716ca847f2590d2cd9b5efb47480222238b9d9dfa3d9edc3"
+    },
+    {
+      "path": "recomp/tests/synth/show.py",
+      "sha256": "88388d1135732794454a31976ba213d6f8d8708e6700f67510aec14427db3015"
+    },
+    {
+      "path": "recomp/tools/psp_api_arity.py",
+      "sha256": "7767051827c711ef7a04b51b6f853de054a3590651b9dcab011f4cf0a85e0174"
+    },
+    {
+      "path": "scripts/get-portablekit.sh",
+      "sha256": "16e80f7c82131172468de7a92ed35982880f6c2e6a6b1721bd7d9e2f06a4ffec"
+    },
+    {
+      "path": "tools/all_live.overlay",
+      "sha256": "a1d79e0c5b79e7de54c713af6856ecde9c0374db3f3572b053668550e75f7712"
+    },
+    {
+      "path": "tools/all_live.sh",
+      "sha256": "1a522b1f301de5e4b07b8b5ea611282973dccd68c416f01d74ed52b8a492a4a4"
+    },
+    {
+      "path": "tools/all_live_flow.script",
+      "sha256": "6183480a2c2fb208a95968adb17dbe9b925c7f017ae9ee132e5995ef43eff889"
+    },
+    {
+      "path": "tools/all_live_flow2.script",
+      "sha256": "8f4963b5e8999873d07a06ab2fe0df263b1e601cc66fd61b29983a09c5dc5a5c"
+    },
+    {
+      "path": "tools/all_live_flow3.script",
+      "sha256": "bf0c4c9b63876e9d65e79a244ac2368dc8d39e606ce9fde372137ede579b2f80"
+    },
+    {
+      "path": "tools/all_scripts/g1/menu_change.overlay",
+      "sha256": "6a0502cb641b593c9a96cdaf14737ed305345672319b4c06e9d846e6c8d659d8"
+    },
+    {
+      "path": "tools/all_scripts/g1/menu_control.overlay",
+      "sha256": "621dd2f3dd772687f85fcb82a35563127afac9f1883b5253a0dba7852a36769a"
+    },
+    {
+      "path": "tools/all_scripts/g1/pad_open6000.script",
+      "sha256": "0d8877f15e5450ec4c99d91de59403a4f5c5b248a99395b8ecc2890351178008"
+    },
+    {
+      "path": "tools/all_scripts/g1_live.sh",
+      "sha256": "75c4e1cb1ae655599549dfd20da7fc94d311bb58a11ec709bfaf88f0c99fe506"
+    },
+    {
+      "path": "tools/all_scripts/live_pair.sh",
+      "sha256": "4896867eb31275b7a588f2bd390255505ac1f594c0a2cca89c348963d87eb7f6"
+    },
+    {
+      "path": "tools/all_scripts/packfilter.py",
+      "sha256": "3598a4ec8aebd33bbeeacd0e9704016a4811c647aae600f098bfd9a296ff5ac5"
+    },
+    {
+      "path": "tools/all_scripts/regress.sh",
+      "sha256": "39cc6b5efe3d16c28b325ef0e4437ecff0a51b1a2b19453e1c9d5d925923ea31"
+    },
+    {
+      "path": "tools/all_scripts/v3k_bench_same.sh",
+      "sha256": "28239f6fa3c789062e406d003d185188932b2d3e395989a5f24b2b1c5575b372"
+    },
+    {
+      "path": "tools/all_scripts/v3k_bench_stats.sh",
+      "sha256": "678b81e8673d0aa41f4d1f2380949675a45cdb1ac8567d05b8456aea8547f4d9"
+    },
+    {
+      "path": "tools/all_scripts/v3k_hd.keys",
+      "sha256": "e91f31f77cabc2e92566e51cb6b7acb32d6dec1bfc62786e88f5adb126d49b78"
+    },
+    {
+      "path": "tools/all_scripts/v3k_menu.keys",
+      "sha256": "267fe4a6ccefd1b12b9fa4f32564815f75d2e696cefc9aebbe5656cef9543b73"
+    },
+    {
+      "path": "tools/all_scripts/v3k_pack_test.sh",
+      "sha256": "e09f9523283184b6ebb3703a57d1eff4a619205c5732471fbf01ffd42d96cf12"
+    },
+    {
+      "path": "tools/bot/d.sh",
+      "sha256": "706a438c1c58fd28555d2796346312803e4a83973cbf4969983c1a0f13248680"
+    },
+    {
+      "path": "tools/bot/dumpdiff.py",
+      "sha256": "aa892d9a39cbfa6ade3c88687b5181af948f51dcf65ecbd09228f63fbce03465"
+    },
+    {
+      "path": "tools/bot/funcs.py",
+      "sha256": "61fa14efde696ed01eb8bbfd89d55778873ceb8739d8c7528ffabe9da6ced215"
+    },
+    {
+      "path": "tools/bot/gdiff.py",
+      "sha256": "6273bcbe7599fcadd8044f49c36277a70018cb6b7d5ce12ec109030c4ef70fcd"
+    },
+    {
+      "path": "tools/bot/m1_runs.sh",
+      "sha256": "ce6ae00ab9e26c95f6f288003fd64ccf6f0a5b38860950797bd6d0f599aa535c"
+    },
+    {
+      "path": "tools/bot/mission1_win.expect",
+      "sha256": "41e06e36b3dcd31247f0e4e8bf1e86b7d0c98092844f593af3336d4de9d15319"
+    },
+    {
+      "path": "tools/bot/mission1_win.pad",
+      "sha256": "baeb7155aba7010c27195bdcdbc6e4729d2ebe4754ce523f052194f5ffcedca7"
+    },
+    {
+      "path": "tools/bot/mission1_win_fresh.expect",
+      "sha256": "683d740c96abbc7365178139f27fc873e8d22873ccf95815974e81be0a488e05"
+    },
+    {
+      "path": "tools/bot/mission1_win_fresh.pad",
+      "sha256": "6f122b03925b360d7d95b76eba2575afcdaeed9a031d9e3df09344485725df86"
+    },
+    {
+      "path": "tools/bot/replay_check.sh",
+      "sha256": "c584767cd066eef058214b6a91ac002d618124606dfeae130072911e1b9d1e88"
+    },
+    {
+      "path": "tools/bot/run.sh",
+      "sha256": "25ea1f86fc0ac18245b9068f82ce5d44071d4d519755d4a8742ecb5612cea076"
+    },
+    {
+      "path": "tools/bot/sheet.py",
+      "sha256": "6e138c84695df9611826b439342ee84c75eb5a160a89e6b22c52fe79b2c96596"
+    },
+    {
+      "path": "tools/bot/soak_report.py",
+      "sha256": "ae7f9a5468ac5782dccdb1755c19e50dc1f5419e68628bd6a8e587fe68cc384f"
+    },
+    {
+      "path": "tools/bot/sweep.sh",
+      "sha256": "7fd0faccc22df02c7aa37b782cf077d9e1891c2f4bae0a28390cf36fd7053f37"
+    },
+    {
+      "path": "tools/bot/tab.py",
+      "sha256": "4b7b843308910c128e70f71f972ce2ceeba46dfe100a348962e0ee5892f78914"
+    },
+    {
+      "path": "tools/bot/vita-config.txt",
+      "sha256": "44514cb900e6124b5bde7609c6dc59aa757e377c109b183f39559398ed25ef4b"
+    },
+    {
+      "path": "tools/dis.sh",
+      "sha256": "bf84c5a896b62c4ff95262b0d0f392ce9df87bda492fc921c8b48085b61b069f"
+    },
+    {
+      "path": "tools/dump_image.cpp",
+      "sha256": "29e960cb5403a56ff9093fa068f1f284c91748d6f1f72b01b642f36940e854a8"
+    },
+    {
+      "path": "tools/gfx_live.sh",
+      "sha256": "00a25c514b913851e16d26713349aec05d99bb8f18a8a3ce5717affdec5bbe84"
+    },
+    {
+      "path": "tools/gfx_overlay_flow.overlay",
+      "sha256": "41e33fcc236f0fda6600b00d8e5064b81342ec195903de1607b240da80d4cd5c"
+    },
+    {
+      "path": "tools/gfx_overlay_flow.script",
+      "sha256": "fa919139d72de0abca75d100e20123b2e86914d7f561c1bc4e5d424aa9e26501"
+    },
+    {
+      "path": "tools/hdmovies/build_movies.sh",
+      "sha256": "38bebb72fec2543e7865d563889953833c65a9aa0b989ee9796e46b1ac2dd00f"
+    },
+    {
+      "path": "tools/hdmovies/compare_shot.py",
+      "sha256": "826a8a22e3374e778498ddb6f6150468190554c50315faa3b365707e395c319f"
+    },
+    {
+      "path": "tools/hdmovies/iso_extract.py",
+      "sha256": "abfaadbd74fb7af424c7790ec3bab25c6119c90ff80fca5903620d8e1808eac6"
+    },
+    {
+      "path": "tools/hdmovies/match_frames.py",
+      "sha256": "59ffc32bb7e22812b605bd7c24c49fbf7b9cadca1d978b440ab17889567d42de"
+    },
+    {
+      "path": "tools/hdmovies/psmf_info.py",
+      "sha256": "7077723bb913e8f772b9c9c97fbde5a0429755694de014c49c880b6256685871"
+    },
+    {
+      "path": "tools/hotfuncs.py",
+      "sha256": "4d6348213c8074e23c67deb31f5f3cc7fc0999f2031483c89d6dd18c0749605f"
+    },
+    {
+      "path": "tools/hw/parse_core.py",
+      "sha256": "5c9be0ecf2c15edb950d0fc764c7386c8d5c65708d315502c83afac719107a64"
+    },
+    {
+      "path": "tools/hw/probe/CMakeLists.txt",
+      "sha256": "9dc0608e2d4d13613d592f11376e34d84bc91ffd4e48ad363a26d42af5b39990"
+    },
+    {
+      "path": "tools/hw/probe/probe.c",
+      "sha256": "5f5011a0da42b3b936a48ee0cf103717122ff424e0df3e51807b94bbf7a3fb14"
+    },
+    {
+      "path": "tools/hw/summarize_hw.py",
+      "sha256": "011aaae23a1274f83562ca78253bda18e82e45ac96f3d55ee95a693860f2b933"
+    },
+    {
+      "path": "tools/imports.tsv",
+      "sha256": "d935cd5cf1971449ac1a4ccaff43838fc7a6ec43a615aa504e8cf24d6b2787cc"
+    },
+    {
+      "path": "tools/iso_get.py",
+      "sha256": "c9672c2d7dc5ca19397b3b272ea634fffd0e3c25998d27908b2346be65bdfd67"
+    },
+    {
+      "path": "tools/menu_walk.script",
+      "sha256": "0b4367af2da7ba021252802fee665ee896a77a55df5494451acc7e17eb4b0c14"
+    },
+    {
+      "path": "tools/minimap_measure.sh",
+      "sha256": "fe1cee805ddda48e200b28038ef9466c8c9e8ba8fbe00f50024688c651fa2be8"
+    },
+    {
+      "path": "tools/minimap_record.sh",
+      "sha256": "df1f7b0506fda8786faf447f3a01643a2c93af94e510de071347e45ef08ed33a"
+    },
+    {
+      "path": "tools/minimap_summary.py",
+      "sha256": "7549b849112a2174381f6e80c7a1585f20107297bc98e64d1a0aa81879c81a22"
+    },
+    {
+      "path": "tools/name_nav.script",
+      "sha256": "daf7944f142ffeaabeb6f6917358bc6be66418ce2649119d380f1ade04267523"
+    },
+    {
+      "path": "tools/name_save.script",
+      "sha256": "de72723d1136d1b407c50c53e735ef189433f71df3ad3d46c3d5a55040f9bd82"
+    },
+    {
+      "path": "tools/name_start.script",
+      "sha256": "36384126c849116ee91b10abddf82c439d7e1ebecc3931bc0ab37ec92303a6b5"
+    },
+    {
+      "path": "tools/phases_120.txt",
+      "sha256": "67ed969213371e803dcfda17b5b5a7356d18091ab8352668798e66d741d30c5f"
+    },
+    {
+      "path": "tools/phases_200.txt",
+      "sha256": "41fabb66c1b80e96c0b315964db365cb45c5269741bca72aafe494dd79e642f0"
+    },
+    {
+      "path": "tools/rc/cmp_bot_stats.py",
+      "sha256": "dadaaea0ffddb8216f66081fc8065eb751350b6861f823c11f4ecc8f47538da6"
+    },
+    {
+      "path": "tools/rc/rc_allon.sh",
+      "sha256": "61403853d69003b0b5d074e8469e1a882f19c3110f3c4cde06ce05af11bc462a"
+    },
+    {
+      "path": "tools/rc/rc_replay_gl.sh",
+      "sha256": "4cc385027ae86a2efb033706ff493830e057c164e9677a9d0edf798bb1d307ca"
+    },
+    {
+      "path": "tools/rc/rebuild_all.sh",
+      "sha256": "4ee8dbb9ddd2ad3e54555eb02cc6f35d946d01f781a45f56d3a38fd74a027797"
+    },
+    {
+      "path": "tools/rc/regress_rc.sh",
+      "sha256": "9e981adeb2bc3b86c656c7af2a5979d4d541c9123b2217aaefe7f79ab7dccfac"
+    },
+    {
+      "path": "tools/rc/v3k_session.py",
+      "sha256": "f1f6699aa1bfe23c14b92742036a5dd618840e52c66aca7919308a9ec1879b46"
+    },
+    {
+      "path": "tools/run.sh",
+      "sha256": "b4b054a80f3e720020c363967950e91aef268061f6c3e7cf0700bf95ae53b6b9"
+    },
+    {
+      "path": "tools/shader_variants/variants_in_cache.cpp",
+      "sha256": "70ed2b33bedd5717082b7631870b8b92d392df8938afbfc2e86ba223b40ba7f9"
+    },
+    {
+      "path": "tools/sheet.py",
+      "sha256": "6458cacc688c7493def064f9730df965999a51ae026fce1f8573b8f3c7fb15e2"
+    },
+    {
+      "path": "tools/skip_cross.script",
+      "sha256": "4329a5fe0f7528f0452a0dd25b633cd134c390b3f3d83503653e5d9e48bd4077"
+    },
+    {
+      "path": "tools/skip_start.script",
+      "sha256": "44db56cbcaff2e1b6d5fb8cefa6fb6349fe07d9830f91828dfbf8f66d6d3a233"
+    },
+    {
+      "path": "tools/texpack/.gitignore",
+      "sha256": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793"
+    },
+    {
+      "path": "tools/texpack/README.md",
+      "sha256": "02eb3a32d85179c0ff277e95bdbc34242da2567afdeaf4007d0187d93df294ba"
+    },
+    {
+      "path": "tools/texpack/bc.py",
+      "sha256": "ccff010f2e6c0910f83f94e09af9ea36b55a2eda16a62815bd9f4dfe7d193311"
+    },
+    {
+      "path": "tools/texpack/bcenc/bcenc.cpp",
+      "sha256": "0eef02cfb0cced05d451d1495d755398bde79eb46aa6f7d8f213f1b0f1c11577"
+    },
+    {
+      "path": "tools/texpack/bcenc/build.sh",
+      "sha256": "a12c4ca845c294a8ba21d4db79d4d5bd9d1926e16cd25dfd15cda9f36b7bd6e1"
+    },
+    {
+      "path": "tools/texpack/build_packs.sh",
+      "sha256": "dfea07ce64d6fb6389114015a8c0d044abd6d9d5e90cbe93d9adcccb0c29b514"
+    },
+    {
+      "path": "tools/texpack/census.py",
+      "sha256": "fa484157bf3705e055d6563a763da1301a2fb8149455640a91f68d604ffd9e41"
+    },
+    {
+      "path": "tools/texpack/classify.py",
+      "sha256": "018ab2ee0796b1d6c7519555903054f23ffc2c3bae5a94bb3132229106c3bd35"
+    },
+    {
+      "path": "tools/texpack/compare.py",
+      "sha256": "e4625a55101670a5543851a12f34140061468a88c7e6c441cd537bc5d80ff3ea"
+    },
+    {
+      "path": "tools/texpack/corpus_report.py",
+      "sha256": "34aa13c572f235c1611770ca58895f39463da831b3778c9a8896429cd621c78f"
+    },
+    {
+      "path": "tools/texpack/coverage_run.py",
+      "sha256": "28bc83b462d3fc1458ee69b6c992a3456afb31f2c1bde96aefc17eee0d8b2c01"
+    },
+    {
+      "path": "tools/texpack/dither_test.py",
+      "sha256": "a0e8ca1289ebe000590b04c89a77e35b054699f98e9c69da197f6bab4032ae3a"
+    },
+    {
+      "path": "tools/texpack/eval_models.py",
+      "sha256": "72db7067c8950bf151ad6c11515798696be7cb2665ac052785057cf20d48ee9b"
+    },
+    {
+      "path": "tools/texpack/extract.py",
+      "sha256": "4d4232540bb2030c3e24c058c6e59cdb0dc5a13e09569a67b1a2a6cd9b221544"
+    },
+    {
+      "path": "tools/texpack/fetch_models.sh",
+      "sha256": "9935605fbb1f2dd47e0cb9f57ab9221a6daaae5ad9f37dd05b130685a5bbc60c"
+    },
+    {
+      "path": "tools/texpack/frame_crops.py",
+      "sha256": "20943d757771f1c6b66c118e72edb3088d62eab162576abbc9298168d329f533"
+    },
+    {
+      "path": "tools/texpack/iso_swap.py",
+      "sha256": "8426cf883ccdde8d66283551a5553853709a3ef2942709e3da389ae2a6259880"
+    },
+    {
+      "path": "tools/texpack/level_report.py",
+      "sha256": "4695ed1b8056aebdb01db934a7d3e100ea074f3fdbe1fe05d1314f4d54ef73f8"
+    },
+    {
+      "path": "tools/texpack/models.py",
+      "sha256": "c2f6b2296cec2cd8840aa143bddcef46e9c22e7d08366463c2f5ffb0b2e950a5"
+    },
+    {
+      "path": "tools/texpack/pack.py",
+      "sha256": "18b08b1d1fd3c3e71524ebe306f9fd98745ca34d75ae7848e684170622f1bf8a"
+    },
+    {
+      "path": "tools/texpack/pack_check.py",
+      "sha256": "a8ff5ae100b8df7ba5ea64151ca67bb8b639a97c3f0b1c015580f1adb12460e2"
+    },
+    {
+      "path": "tools/texpack/pack_verify.py",
+      "sha256": "10706dbb9243c0d739a4c82cd2d90b25cf480a66672f96698af0a571ed585b02"
+    },
+    {
+      "path": "tools/texpack/quality_scan.py",
+      "sha256": "b51e56cfdc5582936e4f55ae6d7737654c830bf83cf5958d9226cd5b49e0867d"
+    },
+    {
+      "path": "tools/texpack/rwstream.py",
+      "sha256": "9524763c5898262c177bf8809b5f61a3b2cd5d9661d9cbac675211bd15e5ff33"
+    },
+    {
+      "path": "tools/texpack/sheet.py",
+      "sha256": "45881de92711317f7383e6418268a4f7c84581aaeb3aa0a1453ef029780c47ee"
+    },
+    {
+      "path": "tools/texpack/upscale.py",
+      "sha256": "8cc0fa7c1319a7d409b925427d4f619815c924e6f36fca5bb7d768ab75789442"
+    },
+    {
+      "path": "tools/texpack/upscale_lib.py",
+      "sha256": "05bdd20f6dcec68c97eafbf8b1397f3dc0019097c1d6dfa0904b172f8247556d"
+    },
+    {
+      "path": "tools/to_level.script",
+      "sha256": "533ac47b0c82fe46a0481fc73ddbf431c831faa09d1552394807e5cd65f07b0e"
+    },
+    {
+      "path": "tools/to_mission.script",
+      "sha256": "09b66addc430b44da77b8ce4e57f2b206e6f1c082fb4b13d6e39427120c34cd3"
+    },
+    {
+      "path": "tools/to_mission2.script",
+      "sha256": "87cf6a31a3b4c70aa2bd84d8a006c9bfa1bdd3e5b8ca3921fe8db13292da55fb"
+    },
+    {
+      "path": "tools/to_movie.script",
+      "sha256": "9ad34c494f9d5474bf3256afa0fc928f340fb9eb3d74674ef42168407cef4c21"
+    },
+    {
+      "path": "tools/tune/bench.sh",
+      "sha256": "647947037b7d7550b496d37e5017bed9a9a950757b3df1ac1b66d1ae490e376d"
+    },
+    {
+      "path": "tools/tune/bench_one.sh",
+      "sha256": "77fe8880f748daa957b8bb81dbb83dfa75f364b35f0d08501225a750e71e3bbb"
+    },
+    {
+      "path": "tools/tune/bspext.py",
+      "sha256": "8ea15b71f6808485a161a3c683f24dda4d04f2d1fca8c752b559329771f65b93"
+    },
+    {
+      "path": "tools/tune/continue_flips.script",
+      "sha256": "0e3e052189bb8cc6539fe2a6ffa966f93cbae2ee826a0029cdddbd2ac9c5438a"
+    },
+    {
+      "path": "tools/tune/d.sh",
+      "sha256": "89ca6bde08f6e770797f766348afbb525e3b2bc6b279d5d96d7409ee4192b664"
+    },
+    {
+      "path": "tools/tune/density_bench.sh",
+      "sha256": "45e901dce1e3b9f3f10dcc4528b89b0c8a606e5db65ab27f215e253332b4de76"
+    },
+    {
+      "path": "tools/tune/ep1.plan",
+      "sha256": "faa9908278dd5dd39a7695fb0efb75a8f9e5a2d8ecb4c58f7aa594f2de343b2e"
+    },
+    {
+      "path": "tools/tune/ep1.script",
+      "sha256": "8e26e78b81b750cb5a66fadd539a32e5a62fed5be94db3e78cd83da6e64fe74f"
+    },
+    {
+      "path": "tools/tune/ep2.plan",
+      "sha256": "d437012d8e8a39d8b46e83a902b18a6874284596fd5823e59e50f85033fcdc92"
+    },
+    {
+      "path": "tools/tune/ep2.script",
+      "sha256": "cbd0bfa59523556cd5a1a1b384c98dd78b97c324a6e0637460bce2a7ccd87c9f"
+    },
+    {
+      "path": "tools/tune/ep3.plan",
+      "sha256": "f8a4d3d3455640e9c78b113ef8a9b9a6419d470f4bed428d80543204038c1a3d"
+    },
+    {
+      "path": "tools/tune/ep3.script",
+      "sha256": "c13a013edd7b0dcf60ef82f0189cc53a7a6186457e9367926849ed3dc5b8cd73"
+    },
+    {
+      "path": "tools/tune/ep4.plan",
+      "sha256": "7f99eb4de115c9fdfacf79e10dff41756f3a03e60dd3a0f84a13834ff4b16542"
+    },
+    {
+      "path": "tools/tune/ep4.script",
+      "sha256": "9dff8b2781d7236f893c907bc980bc4018ef30747c4387feead54ef0e7e582d6"
+    },
+    {
+      "path": "tools/tune/ep5.plan",
+      "sha256": "7021b5334c2c687f5a54c60d4c0d4ea3e85eba296709ddf4363c2a47c0b9dc4d"
+    },
+    {
+      "path": "tools/tune/ep5.script",
+      "sha256": "37ba31202849c5835c2fdb0e6a7d3b764194044e69f6345468aebc9150235782"
+    },
+    {
+      "path": "tools/tune/flow_a.script",
+      "sha256": "78601d9325438229c2b94f93a7a9f469d31b76c9d03cd2a9d854ccab7bf0c8e7"
+    },
+    {
+      "path": "tools/tune/flow_b.script",
+      "sha256": "3eab0ee003e1e98e079f9dd5896f85ddbe2ef87ad65603857eaded59ac8514c9"
+    },
+    {
+      "path": "tools/tune/flow_c.script",
+      "sha256": "3298582f350b52170c4db48687b07c24011b093d8cf01d8899f8a3644f40b165"
+    },
+    {
+      "path": "tools/tune/funcs.py",
+      "sha256": "6e448c97a9372102502251b61b3e0187ddbb37b04a11f15b85b129220ee6720a"
+    },
+    {
+      "path": "tools/tune/gl_chain.sh",
+      "sha256": "5ac781e061f83ff26c73947bb098f2b43ce74993dcbd19143d9e413c074aa7da"
+    },
+    {
+      "path": "tools/tune/gl_chain2.sh",
+      "sha256": "073c4487ab614bfc33be90f5a0d439c614e3bb91ec7243750f89dbfd1f6957cd"
+    },
+    {
+      "path": "tools/tune/gl_chain3.sh",
+      "sha256": "72bbd45cd98b67293252eb4483b4702164ccea8363c0faead5a4bde27887b2a8"
+    },
+    {
+      "path": "tools/tune/interp.sh",
+      "sha256": "1336c0c88c64f0c3b222f71336c7a09fcb829a67cc69268000888ad961f31fd3"
+    },
+    {
+      "path": "tools/tune/mkflow.py",
+      "sha256": "d28322fba48454406a880f6169f69bac0c49892c11b6f76c4e3e2f47bad23a39"
+    },
+    {
+      "path": "tools/tune/mkpad.py",
+      "sha256": "a09be74fcbac3a8dd298707fcbc76b531ff344b21e3a28cd20a7cf84f636736f"
+    },
+    {
+      "path": "tools/tune/mkplay.py",
+      "sha256": "e137b89c623f48548edd9b3e6ae759fa90af2ef4017856bf669a93403deb73d1"
+    },
+    {
+      "path": "tools/tune/o1.plan",
+      "sha256": "e32612c862c8393e56b139768b5969e651648ffdc3f1f2dc200507609bcc5d71"
+    },
+    {
+      "path": "tools/tune/o1.script",
+      "sha256": "57f94d474699252752bd3401aa87dff8f9492ffa534fd159dba8f0521dbd9494"
+    },
+    {
+      "path": "tools/tune/o2.plan",
+      "sha256": "3d5150f6e77fbb333a6788b606328d527211b66a43bcd41f25b8c55c3a7d515e"
+    },
+    {
+      "path": "tools/tune/o2.script",
+      "sha256": "dddbcd8de4505328f84cc7d7c99d49cc7d8014fe4b82dacd63d9587c1abc0775"
+    },
+    {
+      "path": "tools/tune/opt.script",
+      "sha256": "9f128d17873f22100c51af51ca6d1d06982104da30fa1bc6374208eeb8c39d9e"
+    },
+    {
+      "path": "tools/tune/play.sh",
+      "sha256": "905e7746c58527cebf0511bf28767c2feff05b3e2375bcead3481503727a961b"
+    },
+    {
+      "path": "tools/tune/play1.plan",
+      "sha256": "f4f62f89f1f59f6dad98a330dbd22f5d569c1b6fe70ce580b7c780e89f51e083"
+    },
+    {
+      "path": "tools/tune/play1.script",
+      "sha256": "6878f55af98e768f0bb60c74a9d01948c8eceedd7d86c2c749ed55c143e05d66"
+    },
+    {
+      "path": "tools/tune/play2.plan",
+      "sha256": "c9b50219ff6bcc99160ac9d7751b2f0670eb5bc833bc4a464b440516a7d83f7b"
+    },
+    {
+      "path": "tools/tune/play2.script",
+      "sha256": "416bb150be4c0db4087ce5fbba9eb5e04380f053ef486a0ff4513f273a8de2a2"
+    },
+    {
+      "path": "tools/tune/play3.plan",
+      "sha256": "eeccff9190134ab713f1b2a742aaf65c4f516879ec50b36c6be94ee1b0f3b734"
+    },
+    {
+      "path": "tools/tune/play3.script",
+      "sha256": "eb1f26548df4fca534c5cee4d3f900ca7ee3042913edef105eb888592c383ee4"
+    },
+    {
+      "path": "tools/tune/play4.plan",
+      "sha256": "93167789a60f891673432cc5c06ed79baef4cfc207c4457205b8852bb77d132f"
+    },
+    {
+      "path": "tools/tune/play4.script",
+      "sha256": "56321158013ceb4c19016a23f78c8560b4c6f6dbefe8aa98bc02eb746dec696d"
+    },
+    {
+      "path": "tools/tune/play5.plan",
+      "sha256": "f63b30057cdd1eb828064f7ac2adc766aa6e86528ed80dee853b7eaa7a5f3e9f"
+    },
+    {
+      "path": "tools/tune/play5.script",
+      "sha256": "af94d59d11a6f989b56e415be68ed86d1c11baaaa00679790d75170c3bc98f34"
+    },
+    {
+      "path": "tools/tune/play6.plan",
+      "sha256": "8e7be9d933ed2c27d769510ba144a5b778750edce66d8a388230fb1dccdc8e10"
+    },
+    {
+      "path": "tools/tune/play6.script",
+      "sha256": "fab71626d7b9c8ff90d5c4496d46312930effda050fb2115f0d9fee887da55b1"
+    },
+    {
+      "path": "tools/tune/pools.py",
+      "sha256": "ba8aee9dfbb4e4f349880e382ebeb142490dd466467012f32cd79c1ae1f52872"
+    },
+    {
+      "path": "tools/tune/probe.plan",
+      "sha256": "852dc24656a3b71def47bc3ad6d7c27c61696c0aa74539709881dbc54927a8c5"
+    },
+    {
+      "path": "tools/tune/probe.script",
+      "sha256": "7b7c6c3351240788203dbcd7e3a158c01115a39f0335d6d56a6ace3f51d53c54"
+    },
+    {
+      "path": "tools/tune/probe3.plan",
+      "sha256": "4656716c7f0fc860ae399660b847bf088c593cf5d829ebf12a898e673b5c2145"
+    },
+    {
+      "path": "tools/tune/probe3.script",
+      "sha256": "202eb275d192dbfc77903fec67c0b74131f70c55c1e49162ef1defcc784d0540"
+    },
+    {
+      "path": "tools/tune/probe4.plan",
+      "sha256": "ad2c495d8e3df8a630c0d2ca193b9da0d944e4e194bae401a4b2134fb7e207ec"
+    },
+    {
+      "path": "tools/tune/probe4.script",
+      "sha256": "317c4406c1eb8b54215a30dc3ba6e146d891f243ad51baf0cad2073103bcb750"
+    },
+    {
+      "path": "tools/tune/raw_bench.sh",
+      "sha256": "716083b5c743c12806b69b82254570c369c1797f91ab0a411678d236ca45ad63"
+    },
+    {
+      "path": "tools/tune/reloc_dis.py",
+      "sha256": "b27c61a7792aa36a072d5a3e40b2e0a0dbd12c9337cb4e78483d6f82bc64eda6"
+    },
+    {
+      "path": "tools/tune/run.sh",
+      "sha256": "8fdbc2322f0009137284becde8d21d5368c9ea72ccce447d6a7b4337c6697fe3"
+    },
+    {
+      "path": "tools/tune/rwsent.py",
+      "sha256": "9f235fbf78572628479c481d6441b2d4fffef5735b2e4429946fa5c999dc1a20"
+    },
+    {
+      "path": "tools/tune/sheet.py",
+      "sha256": "6c5d256dacbfa2543b3f327632ab875d09e31e846a4c1bf48661b80d66523bd8"
+    },
+    {
+      "path": "tools/tune/shots.sh",
+      "sha256": "b068814562b781ed1a72ab3489121ff62e9535f511e9b6d4499155859ee6e0d1"
+    },
+    {
+      "path": "tools/tune/stab.plan",
+      "sha256": "ab9fc18e9bff691217439cf18f82a6875276aa42690034d9dad1fcdaab13ef4b"
+    },
+    {
+      "path": "tools/tune/stab.script",
+      "sha256": "279943ccd3c3335caf48444df5d42deb5a70a71c985af8f625f761bbb2bb5e2f"
+    },
+    {
+      "path": "tools/tune/summ.py",
+      "sha256": "80e3ffb1967483dfcedcc55ed00b8b9a35ca227cd22d3cdf2fe3f3fdf47fd0a9"
+    },
+    {
+      "path": "tools/tune/sustain.sh",
+      "sha256": "cb24cf7737a7c25e3a0906f5abda0cea939229b8002b88e4ef7a3525216062bd"
+    },
+    {
+      "path": "tools/tune/sweep.sh",
+      "sha256": "affd2bcfc3e935fcef456833e6988b3404efbdad5ceec014b4b700b76be028e2"
+    },
+    {
+      "path": "tools/tune/trace.sh",
+      "sha256": "85f3ace7d9523543350a89f07bb44f2f30e976887b47c0a4092ad01c32d4c9bb"
+    },
+    {
+      "path": "tools/tune/xrefidx.py",
+      "sha256": "5c5f6ef9624d50bffe50b3f0df49962ae5c2b2f1933308dfa65a7200f25b7ea3"
+    },
+    {
+      "path": "vita/.gitignore",
+      "sha256": "2340b8db4e70915463cf31e2d1c9291a6dbc0c55089cc0fad6d63446f48083b4"
+    },
+    {
+      "path": "vita/CMakeLists.txt",
+      "sha256": "d461504b0c6ae8cf1362005fd70d802374fb9bf81868d55c75e47caa6ef7243a"
+    },
+    {
+      "path": "vita/app/CMakeLists.txt",
+      "sha256": "41deb7da55b4223efadd26e41655118fe048274c9722e2c3486d11d3f5fefd17"
+    },
+    {
+      "path": "vita/app/build.sh",
+      "sha256": "c89352500a74eb7f38271ed1f0cacd02d2461ce7e732e885a88d9ff62591ddd7"
+    },
+    {
+      "path": "vita/app/env.sh",
+      "sha256": "9d182992335cab4a514ef5e487af46f624c5342d6b09ea6c0f7449104e2b850d"
+    },
+    {
+      "path": "vita/app/src/app_bench.cpp",
+      "sha256": "331eaf6d2051d6045b8fa7a463aa1462bc52b6abb868b909f015565dfdf2815e"
+    },
+    {
+      "path": "vita/app/src/app_bench.h",
+      "sha256": "6cc07f03ef12c41bca282d9fdb280676c32c0280cf398b4841e02ca17767ff96"
+    },
+    {
+      "path": "vita/app/src/app_config.cpp",
+      "sha256": "040b05da114bdc385be66830ba2dcbb2fa26a334f2380af43c60722d06d03e99"
+    },
+    {
+      "path": "vita/app/src/app_config.h",
+      "sha256": "805e6c914b1882bab17bb1ba1319c3a6099c60b31f42a07c09e667b33d354238"
+    },
+    {
+      "path": "vita/app/src/app_fatal.cpp",
+      "sha256": "b16dc252ba0ec9e2b1f94284c27d5125393851e65e73c909f6dd6615bde96b11"
+    },
+    {
+      "path": "vita/app/src/app_fatal.h",
+      "sha256": "7c40b500a239ea51dc1d7073a5feb827800248d1e1ea5536a438b4edcf6b519b"
+    },
+    {
+      "path": "vita/app/src/app_glue.cpp",
+      "sha256": "0aa2b36fa9be0367d04df091477dfabb2fe7598d1cfbbb08b6817f1be8358441"
+    },
+    {
+      "path": "vita/app/src/app_hd_movie.cpp",
+      "sha256": "9c1b560151e4caa245bb9007526b2de1b9d34cbfe2e4e2d113903b550a1eabf6"
+    },
+    {
+      "path": "vita/app/src/app_hd_movie.h",
+      "sha256": "96c05e3b92e37f8e44870e5ef8cffeb954d379e6b65c53bd444847e07b7656fa"
+    },
+    {
+      "path": "vita/app/src/app_install.cpp",
+      "sha256": "8294aad89ab74566f2d735ec247324c1f7958946ce1a665a5153c7662e226e3a"
+    },
+    {
+      "path": "vita/app/src/app_install.h",
+      "sha256": "e199dbe05fd249dc7412b59e74a2beeac576feffb6ee12f9c223c9ca3b06732f"
+    },
+    {
+      "path": "vita/app/src/app_iso.cpp",
+      "sha256": "3ea7c543ced9f990277583286fa6be881673be2e2d961895939239fe8d4ff36b"
+    },
+    {
+      "path": "vita/app/src/app_iso.h",
+      "sha256": "478c330fea5785ac26c9852cf73a352c70aa031c543d3ba0f06b58ee92e3ce06"
+    },
+    {
+      "path": "vita/app/src/app_log.cpp",
+      "sha256": "385bf26bfe169a3c7c1f53bdc85412405fa950a2b3dd2738f628d920a6ec60ab"
+    },
+    {
+      "path": "vita/app/src/app_log.h",
+      "sha256": "b6d5f74ede1d5769d75f9997fc95882e988683643b12b8dedf4c0c0006f3d126"
+    },
+    {
+      "path": "vita/app/src/app_main.cpp",
+      "sha256": "dfda74a99b91d6d52f7e1768ac46d57c0e77efcb38d2d4374261d92fdea1a79b"
+    },
+    {
+      "path": "vita/app/src/app_memory.cpp",
+      "sha256": "456f0affe39d03400c21236b4ad8d9beb266bb79c079992a75cb91166086206f"
+    },
+    {
+      "path": "vita/app/src/app_memory.h",
+      "sha256": "c6b713e2da1e3020ddcb1a84c382e5bfcd3b8db4077cd67c8e666797150944be"
+    },
+    {
+      "path": "vita/app/src/app_pad_script.cpp",
+      "sha256": "c1633ae8f9315eb4d9d0c2fce3b45315de4f90c64f09be8794c9c51da4430c65"
+    },
+    {
+      "path": "vita/app/src/app_pad_script.h",
+      "sha256": "94b480d23d9fb1d2837aabbc53b598721a0e6f3eba859c89f78713969357ec24"
+    },
+    {
+      "path": "vita/app/src/app_platform_hooks.cpp",
+      "sha256": "aba47b218d853a625efd98951460ce150cea191fe4af498d1c4cad0e76b54f7f"
+    },
+    {
+      "path": "vita/app/src/app_platform_hooks.h",
+      "sha256": "bf15642f9fe8887e7f1142a2a9d436a83e946a0232cdc53a5e2f4f98c71e327c"
+    },
+    {
+      "path": "vita/app/src/app_settings.cpp",
+      "sha256": "464facf4c033e77472d2fd5eca0e31900ed7a5e9b0243d6b9c912fec7747feda"
+    },
+    {
+      "path": "vita/app/src/app_settings.h",
+      "sha256": "77f2f761c21212083ba35054d0de77bd5cafcc31ab17fb4591c92c545bf4c002"
+    },
+    {
+      "path": "vita/app/src/app_status.cpp",
+      "sha256": "0316ae3d9cbdb420344891f213d46316e212bcb0955ee4e5267cb19df1d17cca"
+    },
+    {
+      "path": "vita/app/src/app_status.h",
+      "sha256": "e83c57601bd169f1600d596b7fa5bc5eb7e9d3834cf1ae7b993c14e551c9e887"
+    },
+    {
+      "path": "vita/app/src/app_ui.cpp",
+      "sha256": "94e72d5ec6e03068d3ef04c7926ab06680aac214d70bb52b5ac379a267ca8dd0"
+    },
+    {
+      "path": "vita/app/src/app_ui.h",
+      "sha256": "c7a5400f83d9127685131686e7de3823a33dab843183e101d64363ecf7497a85"
+    },
+    {
+      "path": "vita/app/src/font8x8_basic.h",
+      "sha256": "77f7eecdf7bc8144a318b94d3c3b04512356814d41cd86b505d1b360437d752f"
+    },
+    {
+      "path": "vita/app/src/gl_platform_vita.cpp",
+      "sha256": "d945f1cd9dfb6d219350b035d81a259ffcbd0daf853168706192f123bbd5f2af"
+    },
+    {
+      "path": "vita/app/src/pad_layout.h",
+      "sha256": "45bef1984f28824665cefaf53ca6e68b549c4d27fe52473f478cf19c3d640857"
+    },
+    {
+      "path": "vita/app/src/sha256_stream.cpp",
+      "sha256": "e3755d62d29b2a007574f2b21676271c5207cb8fbe5d8a9b02e5141e8940ed09"
+    },
+    {
+      "path": "vita/app/src/sha256_stream.h",
+      "sha256": "d28c041e56a811d8cfbc8db24749a437cd84de5485660dd800cae5535f95fa06"
+    },
+    {
+      "path": "vita/app/src/text_pad.cpp",
+      "sha256": "0854938bdefbb37f98bfcc2e727a1a37133ed1242f9f3484ef9313308e5837ec"
+    },
+    {
+      "path": "vita/app/src/tiny_zlib.cpp",
+      "sha256": "be24018d805fa7c69119ca49c2f081bfaacef282ad5546bc7d2f2511fdf82e77"
+    },
+    {
+      "path": "vita/app/src/zlib_shim/zlib.h",
+      "sha256": "a402b68f9fcb6deedd14bcdc2ec01d539fe04dd079eab20ce7f6499da6a75667"
+    },
+    {
+      "path": "vita/platform/audio_rate.h",
+      "sha256": "69e345dc5102dc66efa0d16b9a3f48877394848cc007ef2ea377cf235cc87786"
+    },
+    {
+      "path": "vita/platform/audio_resample.h",
+      "sha256": "de0274e011d0072a3864c9677866e9ad442b510f0437540d2695fa12cc24157d"
+    },
+    {
+      "path": "vita/platform/desktop_headless/platform_desktop.cpp",
+      "sha256": "2eda0a8c3a7b9e97e618936e63efecefce76d45c9f2b1465ac328af76ff6e2ae"
+    },
+    {
+      "path": "vita/platform/platform.h",
+      "sha256": "01a46702ea37393881b560663365402375d6329193f2d53d74455c293d78ca80"
+    },
+    {
+      "path": "vita/platform/vita/audio_vita.cpp",
+      "sha256": "9747ab72526f8a6308af2c5b4ca7bde9d5d5fdbd56d1c652a46dde6316ab3fb0"
+    },
+    {
+      "path": "vita/platform/vita/gl_vita.cpp",
+      "sha256": "70ddd4f45df2f8b3acd15dfd146c9ff0fb468ed086dc687ad0cd57f13842afab"
+    },
+    {
+      "path": "vita/platform/vita/platform_vita.cpp",
+      "sha256": "4abd30fcce2d85a0c39c6b7b87d5f422cb339dd4f8360d549e3899ec16e04c37"
+    },
+    {
+      "path": "vita/psvshell/gen_profile.py",
+      "sha256": "9be815216355d84984b5606f65436b82e047bb71dbf356bf4b73bcbf98f05c64"
+    },
+    {
+      "path": "vita/release/config.txt.example",
+      "sha256": "930da1ba86a014b93e55a8008775e87322e42b300e5bd96426bb774efe38450a"
+    },
+    {
+      "path": "vita/release/make_release.sh",
+      "sha256": "78f765d6511ffe3b7984719e970200d0750ee12d2db10b5199e6d93459a707b0"
+    },
+    {
+      "path": "vita/scripts/build-ffmpeg.sh",
+      "sha256": "a48ff24090ebc5632cdddee9b9aeced15e8568f51ab8c7518b370a4ce626d549"
+    },
+    {
+      "path": "vita/scripts/build-selftest-desktop.sh",
+      "sha256": "9230e8c8a71f3c90479574f8c2642ffdbff0d8b0146bc04b4d3e2a9a2c257140"
+    },
+    {
+      "path": "vita/scripts/build-sysroot.sh",
+      "sha256": "5c5a9ecd0da96ca950af7fdbf2584f0e8fea227d46ce7e9a4895b1584eaba8fb"
+    },
+    {
+      "path": "vita/scripts/build-vitagl.sh",
+      "sha256": "7bba21cf02f9672d2bde835ac61f5d447fe7ab642b77f93918fd673bce18a00f"
+    },
+    {
+      "path": "vita/scripts/check-coro.sh",
+      "sha256": "99b75b6e0578f382f5e90b35b2d180275a5b13cd7ba202ff67cfbb49b66757fe"
+    },
+    {
+      "path": "vita/scripts/env.sh",
+      "sha256": "e10e2ebc8c5f3c10d5bc38caae47d184af818fedb45030dd933e1bcf1556135c"
+    },
+    {
+      "path": "vita/scripts/fetch-third-party.sh",
+      "sha256": "ef631898fc79decbdd519635e8ce5cafc5751e69992ed1700a9e8456ab73f370"
+    },
+    {
+      "path": "vita/scripts/gen_t9_streams.py",
+      "sha256": "bca41bde25a9373fd0509f16ae2c7b656c499f702062129b2d8b79e0448b4a28"
+    },
+    {
+      "path": "vita/scripts/patches/ffmpeg-tx-float-only.patch",
+      "sha256": "7be0cb378a8438dadecfbd0b1dca1e5d5a3281307be2c72068826de14db4ce4d"
+    },
+    {
+      "path": "vita/scripts/patches/vitagl-0001-circular-pool-align.patch",
+      "sha256": "65a684b63d55065ad44c134fe908132a013d4fb3126a17522ea8bc06851da976"
+    },
+    {
+      "path": "vita/scripts/patches/vitagl-0002-texsubimage-no-readback.patch",
+      "sha256": "3ae9501619079c41463dd9c4f33c8773079c5cc2c2b528b0d25e7372881a9929"
+    },
+    {
+      "path": "vita/scripts/patches/vitagl-0003-skip-redundant-state.patch",
+      "sha256": "b746d3bf94a990b18ae5a3e0ce7c22d05c9b8408c903ba57e2d12facd6ab77b0"
+    },
+    {
+      "path": "vita/scripts/patches/vitagl-0004-reserve-compressed-mips.patch",
+      "sha256": "7f112f19f9529a4173fa044dd874944467d3beff74e9269524eaaf512e2239f7"
+    },
+    {
+      "path": "vita/scripts/validate_coro_unicorn.py",
+      "sha256": "906489feed8a2cadda447734e3aa093524258713274a9b43502dee33c56af23a"
+    },
+    {
+      "path": "vita/selftest/coro_arm.S",
+      "sha256": "01401d0c59de5291256b1634be8e29b2064084f666c52b6ee5a4362c65e31332"
+    },
+    {
+      "path": "vita/selftest/coro_core.cpp",
+      "sha256": "8119ac9d86950ce14759e591d21269d51b3430d0fdf6b7a043902b8efb8d2019"
+    },
+    {
+      "path": "vita/selftest/font8x8_basic.h",
+      "sha256": "77f7eecdf7bc8144a318b94d3c3b04512356814d41cd86b505d1b360437d752f"
+    },
+    {
+      "path": "vita/selftest/st_common.h",
+      "sha256": "9aff253230ed44ff8527c9c7485d4891e0968aadc2c5c7225949f6fb06c41421"
+    },
+    {
+      "path": "vita/selftest/st_console_stub.cpp",
+      "sha256": "c1b779991da44e8b32ee5d297506844c298bf7bd5729819555d83f91910db542"
+    },
+    {
+      "path": "vita/selftest/st_console_vita.cpp",
+      "sha256": "e54d926c51c0fd731997c952c675a12a60aa1a6369aabc4254247f4a3fe38432"
+    },
+    {
+      "path": "vita/selftest/st_harness.cpp",
+      "sha256": "cd527b22462610ec7edb2f8302901d9c7a95e24e498f4bbe3c304d680e958767"
+    },
+    {
+      "path": "vita/selftest/t9_streams.h",
+      "sha256": "74f88fd35821639280266b56909a7efe019f181a85db057f972b14d4d006bf24"
+    },
+    {
+      "path": "vita/selftest/t_audio.cpp",
+      "sha256": "f6720ba6cb099deb383f30c5cedadfe1fbca9686627e6c6b1f3d2e59429b61c7"
+    },
+    {
+      "path": "vita/selftest/t_audio_rate_host.cpp",
+      "sha256": "28d4016b4663a2b9315b7ea0b7f57759bbafbcb2c68d719ba1e4527948a661fd"
+    },
+    {
+      "path": "vita/selftest/t_coro.cpp",
+      "sha256": "765974831aa242fdd1fa04429027ebda0e9dd3a37653b77e2a1edc947f5e2923"
+    },
+    {
+      "path": "vita/selftest/t_ffmpeg.cpp",
+      "sha256": "eb7a27d4df48d62901e5a2c18f3ae0371c09af372d946305660e4498b13d19b1"
+    },
+    {
+      "path": "vita/selftest/t_ffmpeg_stub.cpp",
+      "sha256": "7df48132f2bb255687e8ce76714e0fea00380e9d74ce6aff1985d409597d001f"
+    },
+    {
+      "path": "vita/selftest/t_gl.cpp",
+      "sha256": "0d3da0aac37a0eb12c6ac7d58593ac247c9ddc7a4dbb78c6542d6f7629ea4e4f"
+    },
+    {
+      "path": "vita/selftest/t_gl_stub.cpp",
+      "sha256": "39815eff5f1099d53dff5a052d193f1802b02c493edae158cec3a3c4fb82d299"
+    },
+    {
+      "path": "vita/selftest/t_pad_layout_host.cpp",
+      "sha256": "3e9f142b34d89b5200c5eda7d5c68d8d2627d9e09a18bc3aeab407efced9c9d9"
+    },
+    {
+      "path": "vita/selftest/t_resample_host.cpp",
+      "sha256": "159fc998607debccafe382366e0e0c05734aa5645c2917462444cffd4bb878c2"
+    },
+    {
+      "path": "vita/selftest/t_sys.cpp",
+      "sha256": "a15faca3cb951d0ac2ed5c77fe3c0202ce4f0a5885ebc0f40c9fd64c7b4c5b81"
+    },
+    {
+      "path": "vita/vita/assets/art_from_disc.py",
+      "sha256": "482a1a55ceb3198e7f70d7ac627f64daa88ab1d48f723fe92b0ba42e614c38ec"
+    },
+    {
+      "path": "vita/vita/assets/art_from_image.py",
+      "sha256": "ca8ab06e06cb47221a748f7fbb395779cc713e4e756193c67f3edbd77e61279c"
+    },
+    {
+      "path": "vita/vita/assets/gen_bubble.py",
+      "sha256": "a3e6bc04a84fb6c64427d0dad40f6b37f39c9f894adfb0d55b8e4eb05d5d10a4"
+    },
+    {
+      "path": "vita/vita/assets/gen_livearea.py",
+      "sha256": "00dc05e4c17fdfba6b9acec2b783f754eb4b93d5d02dbd7660b1dac36948ba6c"
+    },
+    {
+      "path": "vita/vita/build-all.sh",
+      "sha256": "8315e62eb83e529f1d5a9d7d8497f8d2e1317aa3898cccf2f54c0df7473f128b"
+    },
+    {
+      "path": "vita/vita/build.sh",
+      "sha256": "c81a333ec039245f98c12d39fd7d665866c756d8acb00e215e9a188be501e68e"
+    }
+  ]
+}

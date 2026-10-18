@@ -1,0 +1,17 @@
+diff --git a/source/textures.c b/source/textures.c
+index 0864ddf..e626c7c 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1000,7 +1000,11 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 			size = orig_h * VGL_ALIGN(orig_w, 8) * bpp;
+ 		}
+ 		void *texture_data = gpu_alloc_mapped_for_gpu(size);
+-		vgl_fast_memcpy(texture_data, tex->data, size);
++		// Infected port: an update that replaces the whole of a single-level texture does not need the old texels. The copy
++		// reads them back from GPU memory (usually CDRAM, uncached for the CPU: tens of ms for a 512x512 RGBA picture), so a
++		// movie or an animated texture paid it on every frame.
++		if (!(level == 0 && xoffset == 0 && yoffset == 0 && width == orig_w && height == orig_h && tex->mip_count <= 1))
++			vgl_fast_memcpy(texture_data, tex->data, size);
+ 		gpu_free_texture_data(tex);
+ 		sceGxmTextureSetData(&tex->gxm_tex, texture_data);
+ 		tex->data = texture_data;

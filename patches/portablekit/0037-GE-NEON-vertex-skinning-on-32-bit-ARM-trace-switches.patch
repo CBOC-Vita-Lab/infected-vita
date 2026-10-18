@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:34:07 +0000
+Subject: [PATCH] GE: NEON vertex skinning on 32-bit ARM, trace switches read
+ once per list
+
+Skinned vertices are blended four lanes at a time with NEON on the PS Vita (non-fused multiply-add, so the results match the scalar path bit for bit). The material and lighting trace switches were read from the environment for every vertex run; they are now read once when a list starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/ge_state.cpp b/host/gpu/ge_state.cpp
+index 31ac987..be8dcfc 100644
+--- a/host/gpu/ge_state.cpp
++++ b/host/gpu/ge_state.cpp
+@@ -1,3 +1,6 @@
++#if defined(__ARM_NEON) && defined(__arm__)
++#include <arm_neon.h>
++#endif
+ #include "../profile.hpp"
+ #include "ge_state.hpp"
+ 
+@@ -314,6 +317,44 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+             }
+         }
+         if constexpr (WeightType != 0u) {
++#if defined(__ARM_NEON) && defined(__arm__)
++            // The same sums with NEON, four lanes of which three are used: every product is rounded before it is added
++            // (ARMv7 NEON has no fused multiply-add), in the order of the scalar loop below, so the results are the same
++            // as its (a denormal is flushed to zero, as the Vita's VFP does in its default mode).
++            if (skinned) {
++                const std::uint8_t *at = base + layout.weight_offset;
++                float32x4_t position = vdupq_n_f32(0.0f);
++                float32x4_t normal = vdupq_n_f32(0.0f);
++                const float p0 = vertex.position[0], p1 = vertex.position[1], p2 = vertex.position[2];
++                const float n0 = vertex.normal[0], n1 = vertex.normal[1], n2 = vertex.normal[2];
++                for (std::uint32_t bone = 0; bone < bones; ++bone) {
++                    const float weight = read_field<WeightType, false>(at + bone * weight_size) * weight_scale;
++                    if (weight == 0.0f) continue;
++                    const float *m = bone_matrices + bone * 12u;
++                    // Columns m[0..2], m[3..5], m[6..8], m[9..11]; the fourth lane is whatever follows and is never used.
++                    float column[16];
++                    std::memcpy(column, m, 12u * sizeof(float));
++                    column[12] = column[13] = column[14] = column[15] = 0.0f;
++                    const float32x4_t c0 = vld1q_f32(column), c1 = vld1q_f32(column + 3), c2 = vld1q_f32(column + 6),
++                                      c3 = vld1q_f32(column + 9);
++                    float32x4_t p = vmulq_n_f32(c0, p0);
++                    p = vmlaq_n_f32(p, c1, p1);
++                    p = vmlaq_n_f32(p, c2, p2);
++                    p = vaddq_f32(p, c3);
++                    position = vmlaq_n_f32(position, p, weight);
++                    float32x4_t n = vmulq_n_f32(c0, n0);
++                    n = vmlaq_n_f32(n, c1, n1);
++                    n = vmlaq_n_f32(n, c2, n2);
++                    normal = vmlaq_n_f32(normal, n, weight);
++                }
++                vertex.position[0] = vgetq_lane_f32(position, 0);
++                vertex.position[1] = vgetq_lane_f32(position, 1);
++                vertex.position[2] = vgetq_lane_f32(position, 2);
++                vertex.normal[0] = vgetq_lane_f32(normal, 0);
++                vertex.normal[1] = vgetq_lane_f32(normal, 1);
++                vertex.normal[2] = vgetq_lane_f32(normal, 2);
++            }
++#else
+             if (skinned) {
+                 const std::uint8_t *at = base + layout.weight_offset;
+                 std::array<float, 3> position{};
+@@ -334,6 +375,7 @@ void decode_run(const std::uint8_t *data, std::uint32_t count, const VertexLayou
+                 vertex.position[2] = position[2];
+                 vertex.normal = normal;
+             }
++#endif
+         }
+         out[i] = vertex;
+     }
+@@ -597,8 +639,7 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+     // Which of 0x53..0x5C actually carries the colour the guest sets is worth
+     // reading off the game rather than recalling: <prefix>_TRACE_MATERIAL reports
+     // every distinct value each of them is given.
+-    if (static const bool trace = portablekit::env("TRACE_MATERIAL") != nullptr;
+-        trace && command >= 0x53u && command <= 0x5Cu) {
++    if (trace_material_ && command >= 0x53u && command <= 0x5Cu) {
+         static std::map<std::uint32_t, std::map<std::uint32_t, std::uint64_t>> seen;
+         auto &values = seen[command];
+         if (++values[data] == 1u && values.size() <= 24u)
+@@ -608,8 +649,7 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
+     // that lighting and fog may live in: the enables after 0x17, 0x50..0x52,
+     // 0x5D..0x9A and 0xC8..0xD0. Each value is also shown as a 24-bit float,
+     // since several of them carry one.
+-    if (static const bool trace = portablekit::env("TRACE_LIGHTING") != nullptr;
+-        trace && ((command >= 0x18u && command <= 0x20u) || (command >= 0x50u && command <= 0x52u) ||
++    if (trace_lighting_ && ((command >= 0x18u && command <= 0x20u) || (command >= 0x50u && command <= 0x52u) ||
+                   (command >= 0x5Du && command <= 0x9Au) || (command >= 0xC8u && command <= 0xD0u))) {
+         static std::map<std::uint32_t, std::map<std::uint32_t, std::uint64_t>> seen;
+         auto &values = seen[command];
+@@ -1434,6 +1474,13 @@ bool GeState::load_state(const std::uint8_t *data, std::size_t size) {
+ 
+ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std::uint32_t stall, bool &finished) {
+     finished = false;
++    // The trace switches, read once: handle_command() runs for every command word, and a function-local static is a
++    // guarded load with a barrier on ARM each time it is reached.
++    if (!trace_flags_read_) {
++        trace_material_ = portablekit::env("TRACE_MATERIAL") != nullptr;
++        trace_lighting_ = portablekit::env("TRACE_LIGHTING") != nullptr;
++        trace_flags_read_ = true;
++    }
+     if (world_[15] == 0.0f) {
+         identity(world_);
+         identity(view_);
+diff --git a/host/gpu/ge_state.hpp b/host/gpu/ge_state.hpp
+index 8fa9ff7..c2ebee2 100644
+--- a/host/gpu/ge_state.hpp
++++ b/host/gpu/ge_state.hpp
+@@ -305,6 +305,9 @@ public:
+     static void report_ignored_commands();
+ 
+ private:
++    bool trace_flags_read_{false};
++    bool trace_material_{false};
++    bool trace_lighting_{false};
+     // Resolves a display-list address operand against BASE and OFFSET_ADDR.
+     [[nodiscard]] std::uint32_t relative_address(std::uint32_t data) const noexcept {
+         return (offset_address_ + (base_extended_ | (data & 0x00FFFFFFu))) & 0x0FFFFFFFu;

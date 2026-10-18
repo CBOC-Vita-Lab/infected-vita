@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 09 Oct 2026 21:06:33 +0000
+Subject: [PATCH] Print the interpreter region histogram at the end of a run
+
+PSPRECOMP_INTERPRETER_REGION_HISTOGRAM=1 collected the counts but nothing
+reported them. Kernel::run_main prints them once the main thread is done.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+diff --git a/host/kernel/kernel.cpp b/host/kernel/kernel.cpp
+index 65d53b5..a23656c 100644
+--- a/host/kernel/kernel.cpp
++++ b/host/kernel/kernel.cpp
+@@ -493,6 +493,12 @@ void Kernel::run_main() {
+         psprecomp::exec_report(text);
+         std::cerr << text;
+     }
++    // Empty unless PSPRECOMP_INTERPRETER_REGION_HISTOGRAM is set.
++    {
++        std::string text;
++        psprecomp::report_interpreter_region_histogram(text);
++        std::cerr << text;
++    }
+ }
+ 
+ void Kernel::scheduler_loop() {

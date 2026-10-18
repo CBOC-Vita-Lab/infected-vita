@@ -6,8 +6,8 @@
   and read-only recovery of the installed app.
 - **Venomalia:** HDcube, an optional separately obtained texture model.
 - **VitaSDK, vitaGL, PortableKit and their contributors:** underlying tools
-  and runtime components. Exact revisions, authors and full notices must be
-  recovered with the current source export before release.
+  and runtime components. The source export now includes the pinned fetch
+  recipes and patch series; see [Third-party Notices](THIRD_PARTY_NOTICES.md).
 
 The preparation pipeline also uses other inference tools/models. Their
 individual licenses must be checked against the exported tool configuration;
