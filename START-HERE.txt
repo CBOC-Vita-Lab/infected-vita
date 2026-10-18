@@ -1,7 +1,6 @@
 INFECTED VITA
-For a new owner, build your own VPK using BUILDING.md. The private candidate
-below contains translated game code and is not a public download.
-Private candidate / INFC00001. Not cleared for redistribution.
+Private preview / INFC00001. Do not redistribute this package.
+New owners: use BUILDING.md to generate your VPK from your own disc.
 
 FIRST INSTALL
 1. Extract this entire install ZIP on your computer. Do not unzip the VPK.
@@ -21,8 +20,8 @@ Do not delete the bubble, replace eboot.bin by hand, replace the whole data
 folder, or recopy the ISO as an ordinary app update.
 
 KEEP: Infected.iso, ms0/ (saves), settings.txt, and your own compatible packs.
-INCLUDED: player VPK, matching shaders, separate release artwork, guides
-          and an optional offline checker. No compiler is needed.
+INCLUDED: the existing owner's VPK, matching shaders, release artwork,
+          source, texture tools, guides, notices and an offline checker.
 NOT INCLUDED: ISO, saves, shader compiler module, HDcube model or HD packs.
 
 OPTIONAL HD
@@ -30,6 +29,6 @@ HDcube runs on the computer, not the Vita. HD-TEXTURES.md explains the
 author's model download and where compatible user-generated packs go.
 Never copy the .pth model to the Vita. Normal installation does not need it.
 
-Keep the guides on your computer. INSTALL.md has the full folder map,
-backup advice and troubleshooting. Fresh-install and source/rights review
-remain open; this is not an approved public release.
+Keep the source, tools and guides on your computer. INSTALL.md has the
+folder map, backup advice and troubleshooting. Build details and test notes
+are separate in BUILDING.md and KNOWN-ISSUES.md.

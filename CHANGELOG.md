@@ -1,5 +1,11 @@
 # Changes
 
+## 2026-10-18: Simpler Setup
+
+- Shortened installation and put the automatic HD-model download first.
+- Included source, texture tools, dependency patches, linked guides and
+  notices in the private owner bundle; the VPK is unchanged.
+
 ## 2026-10-18: Source And Documentation
 
 - Imported the current prepared runtime, recompiler and all 64 PortableKit patches.

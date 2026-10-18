@@ -8,6 +8,9 @@
 - HDcube model redistribution permission is unresolved. No weights or
   game-derived packs/movies are shipped. Apple Silicon generation is unverified.
 - HD movie playback remains experimental. Start without it.
+- The complete HD generation workflow has not been rerun for this snapshot;
+  mixed-pack selection still needs current-device testing. A 2x pack has a
+  prior console-load check, not full gameplay acceptance.
 - The shader compiler module must be obtained separately and lawfully.
 - Older development scripts assume a lab layout. They are not installation
   steps and may modify files or run a console/emulator session.

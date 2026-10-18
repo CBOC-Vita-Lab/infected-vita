@@ -19,22 +19,17 @@ HD textures are optional. **HDcube is used on the computer to prepare them,
 not installed on the Vita.** [HD Textures](HD-TEXTURES.md) explains the model
 download and where generated packs belong.
 
-## Release Status
+## Included
 
-This repository is staying private. The recovered installed runtime matches
-the current package, and its retail artwork is kept out of shared files.
-The current source, recompiler, 64 PortableKit patches and HD preparation
-tools are now included. The dependency patch series was applied to its
-pinned upstream base and its exact resulting tree verified. The final clean
-VPK build and fresh-install test remain pending. No older runtime or loose
-speed-test executable is being substituted.
+Source, the recompiler, dependency patches, HD preparation tools, install
+guides and a download checker are together in this repository. The texture
+builder fetches its models directly from their authors; no manual model
+hunting is needed.
 
-The private ready-made candidate contains translated game code. It is not
-a redistributable public download; each owner must generate that code from
-their own supported disc. Game-derived HD packs are also not included.
-
-The current default-settings and HD workflows still need broader Vita
-testing. No whole-game completion or locked-30-FPS claim is made.
+This is a private preview. The existing owner's ready-made VPK contains
+translated game code and cannot be shared as the public installer. New
+owners use their own disc with [Building](BUILDING.md). Build and test details
+are kept in [Source Record](SOURCE.md) and [Known Issues](KNOWN-ISSUES.md).
 
 [Controls](CONTROLS.md) | [Building](BUILDING.md) | [Source Record](SOURCE.md)
 | [Technical Notes](TECHNICAL.md) | [Known Issues](KNOWN-ISSUES.md)

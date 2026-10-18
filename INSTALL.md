@@ -1,18 +1,16 @@
 # Install
 
-Private preparation guide: source is included; a complete clean rebuild
-and fresh-install test are still pending. There is no public VPK download.
-For the shortest path, open [Start Here](START-HERE.txt).
+Use your owner-built `INFC00001` VPK or your existing private-preview bundle.
+[Start Here](START-HERE.txt) is the short version.
 
 ## You Need
 
 - A homebrew-enabled PS Vita and VitaShell.
 - Your own **Infected USA, `ULUS-10054`, version 1.02** ISO.
 - Your [owner-built VPK](BUILDING.md), application ID **`INFC00001`**.
-  The already staged private candidate is only for the original owner's use.
+  The ready-made private candidate is for the original owner's use only.
 - A legitimately obtained shader compiler module at
-  `ur0:data/libshacccg.suprx`. It is not included. Use a documented lawful
-  user-side setup; do not download an unofficial firmware/module bundle.
+  `ur0:data/libshacccg.suprx`. It is not included.
 
 ## Installation
 
@@ -25,9 +23,7 @@ For the shortest path, open [Start Here](START-HERE.txt).
 2. Copy your ISO to **`ux0:data/infected/Infected.iso`**.
 3. Open the Infected bubble.
 
-Use the filename above for the simplest documented path. The current code
-can discover other `.iso` names, but that variant has not been
-verified, so this guide does not rely on it.
+Use the filename above to avoid folder and naming problems.
 
 ```text
 ux0:data/infected/
@@ -48,10 +44,8 @@ download. To add textures generated from your own dump, see
 [HD Textures](HD-TEXTURES.md). Put a compatible `texpack_2x.bin` or mixed
 Vita `texpack_4x.bin` in `ux0:data/infected/`, not in the app folder.
 
-The model runs on your computer. We have requested permission to include it;
-once permission is granted and its conditions are met, we will add it to the
-preparation package to make setup easier. This does not include permission
-to redistribute the game's textures or movies.
+The included builder downloads the model from its author. See the HD guide
+for the one-command preparation and optional manual setup.
 
 ## Update And Back Up
 
@@ -92,5 +86,4 @@ settings and saves stored there.
 
 Report the build and relevant error text, not your ISO, saves or an unreviewed
 full log. [Controls](CONTROLS.md) are checked against the recovered source.
-The module setup, RetroFlow copying and complete upgrade path still need
-final device verification.
+Build-specific notes are in [Known Issues](KNOWN-ISSUES.md).
