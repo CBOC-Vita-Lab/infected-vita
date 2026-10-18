@@ -1,5 +1,11 @@
 # Changes
 
+## 2026-10-18: Installed Artwork Preserved
+
+- Matched the private VPK's artwork to the existing Vita installation.
+- Kept its executable, shaders and other resources unchanged.
+- No console installation or public release.
+
 ## 2026-10-18: Simpler Setup
 
 - Shortened installation and put the automatic HD-model download first.

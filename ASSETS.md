@@ -1,10 +1,10 @@
 # Included And Required Files
 
-Shared artwork must come from the project's original green-virus art
-generator, not the retail title card installed on the owner's Vita. The
-current public-art package uses the same executable as the recovered
-installed app; seven artwork files differ. Installation-generated package
-records are private recovery inputs, not release source.
+The selected private VPK uses the installed executable and artwork, including
+the icon, LiveArea images, background and RetroFlow images. No rebuilt runtime
+or alternate artwork is substituted. Installed artwork is not automatically
+cleared for public sharing. Installation-generated package records stay out
+of the VPK.
 
 The eventual release should carry permitted runtime/shader resources,
 original artwork, current source, preparation tools and complete dependency

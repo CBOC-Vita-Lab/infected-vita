@@ -20,7 +20,7 @@ Do not delete the bubble, replace eboot.bin by hand, replace the whole data
 folder, or recopy the ISO as an ordinary app update.
 
 KEEP: Infected.iso, ms0/ (saves), settings.txt, and your own compatible packs.
-INCLUDED: the existing owner's VPK, matching shaders, release artwork,
+INCLUDED: the existing owner's VPK, matching shaders, installed artwork,
           source, texture tools, guides, notices and an offline checker.
 NOT INCLUDED: ISO, saves, shader compiler module, HDcube model or HD packs.
 
