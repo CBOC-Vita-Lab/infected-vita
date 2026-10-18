@@ -5,9 +5,11 @@ game dump; the game is not included.
 
 ## Install
 
+New to the package? Open [Start Here](START-HERE.txt).
+
 The normal setup is a VPK, your ISO and the required shader compiler module:
 
-1. Install the matching `infected.vpk` with VitaShell.
+1. Install `Infected-current-private-candidate.vpk` with VitaShell.
 2. Copy your own supported ISO to `ux0:data/infected/Infected.iso`.
 3. Open the Infected bubble.
 

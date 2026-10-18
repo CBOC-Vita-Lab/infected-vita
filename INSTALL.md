@@ -2,25 +2,42 @@
 
 Private preparation draft: current source/tool exports and a fresh-install
 test are still needed before this becomes a release guide.
+For the shortest path, open [Start Here](START-HERE.txt).
 
 ## You Need
 
 - A homebrew-enabled PS Vita and VitaShell.
 - Your own **Infected USA, `ULUS-10054`, version 1.02** ISO.
-- The matching `infected.vpk`, application ID **`INFC00001`**.
+- `Infected-current-private-candidate.vpk`, application ID **`INFC00001`**.
 - A legitimately obtained shader compiler module at
   `ur0:data/libshacccg.suprx`. It is not included. Use a documented lawful
   user-side setup; do not download an unofficial firmware/module bundle.
 
 ## Installation
 
-1. Check the VPK against the release checksum and install it in VitaShell.
+1. Extract the install ZIP on your computer and [check the download](CHECK-DOWNLOAD.md).
+   Leave the VPK intact. Copy it through VitaShell USB or FTP to `ux0:VPK/`
+   (create that folder if needed), then end the transfer. In VitaShell,
+   highlight the VPK, use the confirm button (usually Cross), and confirm
+   installation.
 2. Copy your ISO to **`ux0:data/infected/Infected.iso`**.
 3. Open the Infected bubble.
 
 Use the filename above for the simplest documented path. The current code
 is reported to discover other `.iso` names, but that variant has not been
 verified, so this guide does not rely on it.
+
+```text
+ux0:data/infected/
+  Infected.iso          your supported disc image
+  ms0/                  keep existing game saves
+  settings.txt          keep existing settings
+  texpack_2x.bin         optional compatible user-generated pack
+  texpack_4x.bin         optional mixed Vita pack, not the all-4x pack
+```
+
+The app creates its own save/settings files; do not download starter saves
+or copy these labels as empty files. Do not nest another `infected/` folder.
 
 ## Optional HD Textures
 
@@ -35,6 +52,17 @@ preparation package to make setup easier. This does not include permission
 to redistribute the game's textures or movies.
 
 ## Update And Back Up
+
+| Item | What To Do |
+| --- | --- |
+| Matching `INFC00001` VPK | Install with VitaShell; never copy individual app files by hand. |
+| `Infected.iso` | Keep your existing supported ISO; an app update does not need another copy. |
+| `ms0/` and `settings.txt` | Keep and back up; never replace with a test profile. |
+| Optional texture packs | Keep. Replace only for an intentional compatible pack update, after backup. |
+| `libshacccg.suprx` | Keep your legitimate module in `ur0:data/`; not part of this update. |
+
+If a computer copy operation asks to replace the whole data folder, cancel
+and check the destination. Do not use automatic folder synchronization.
 
 Exit the app, then back up **`ux0:data/infected/`**, particularly `ms0/`
 (game saves) and `settings.txt`. Install the new VPK with the same

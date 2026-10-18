@@ -1,0 +1,33 @@
+INFECTED VITA
+Private candidate / INFC00001. Not cleared for redistribution.
+
+FIRST INSTALL
+1. Extract this entire install ZIP on your computer. Do not unzip the VPK.
+   CHECK-DOWNLOAD.md explains the optional offline download check.
+2. Confirm your Vita already has a legitimately obtained shader compiler at
+   ur0:data/libshacccg.suprx. It is not supplied in this bundle.
+3. Using VitaShell USB or FTP, copy Infected-current-private-candidate.vpk
+   to ux0:VPK/ (create VPK if needed). End the transfer, then open that VPK
+   in VitaShell and install it.
+4. Copy your own USA ULUS-10054 version 1.02 ISO to exactly:
+     ux0:data/infected/Infected.iso
+5. Open the Infected bubble. Start without optional HD packs first.
+
+ALREADY INSTALLED?
+Back up ux0:data/infected/ first. Install only the matching new VPK.
+Do not delete the bubble, replace eboot.bin by hand, replace the whole data
+folder, or recopy the ISO as an ordinary app update.
+
+KEEP: Infected.iso, ms0/ (saves), settings.txt, and your own compatible packs.
+INCLUDED: player VPK, matching shaders, separate release artwork, guides
+          and an optional offline checker. No compiler is needed.
+NOT INCLUDED: ISO, saves, shader compiler module, HDcube model or HD packs.
+
+OPTIONAL HD
+HDcube runs on the computer, not the Vita. HD-TEXTURES.md explains the
+author's model download and where compatible user-generated packs go.
+Never copy the .pth model to the Vita. Normal installation does not need it.
+
+Keep the guides on your computer. INSTALL.md has the full folder map,
+backup advice and troubleshooting. Fresh-install and source/rights review
+remain open; this is not an approved public release.
