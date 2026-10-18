@@ -20,10 +20,11 @@ download and where generated packs belong.
 
 This repository is staying private. The recovered installed runtime matches
 the current package, and its retail artwork is kept out of shared files.
-The corresponding current source, preparation tools and clean-build record
-are still missing, so this is not a released installer or a fully verified
-install guide. No old source or loose speed-test executable is being used
-as a substitute.
+The current ready-made VPK is staged privately. HD preparation tools and
+guides were recovered from an older Claude bundle, but the matching current
+runtime source and clean-build record are still needed. No older runtime
+or loose speed-test executable is being substituted. Fresh-install testing
+is pending; this is not yet a public release.
 
 The current default-settings and HD workflows still need broader Vita
 testing. No whole-game completion or locked-30-FPS claim is made.

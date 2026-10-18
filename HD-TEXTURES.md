@@ -10,10 +10,14 @@ model**, not Vita software. Do not copy its `.pth` file to the console.
 2. Use **Download raw file** and keep the filename
    **`4xHDCube4Compact.pth`** on your computer. Do not save the GitHub web page
    as the model.
-3. Supply that model to the texture-preparation tool, together with your own
-   supported ISO. The exact model location and command still need checking
-   against the latest tool export; no working one-click HD builder is
-   supplied by this draft.
+3. Claude's recovered texture builder uses
+   `texpack-work/models/4xHDCube4Compact.pth` by default. Supply your own
+   supported ISO to `proj/tools/texpack/build_packs.sh`; its model-fetching
+   step obtains the required models directly from their authors.
+
+The builder and its guide have been recovered from the October 10 source
+bundle. They are being checked against the current runtime before inclusion
+here; this draft does not yet supply a verified one-click HD builder.
 
 Permission to bundle the model has been
 [requested](https://github.com/Venomalia/HDcube/issues/5), not granted. Once
