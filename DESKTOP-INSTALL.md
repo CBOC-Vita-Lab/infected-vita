@@ -8,9 +8,16 @@ Requires a homebrew-enabled Vita, VitaShell, your own **USA v1.02
 3. Select your ISO. Add the shader compiler only if prompted.
 4. Keep the default artwork or select your own, then click **Install**.
 
+Download the named ZIP from **Releases > Assets**, not **Code > Download ZIP**
+or the source-code archives. Leave it zipped; the installer opens it. Private
+releases need to be downloaded in your browser using an account with access.
+
 No Python or manual extraction is needed. The app shows the required space
 and any final VitaShell action. Existing saves, settings and texture packs
 are protected.
+
+Keep the computer and Vita awake through preparation, copying and checks.
+If disconnected, reconnect the same Vita and choose **Resume**.
 
 HD textures are optional, not required. HDCube permission is still pending;
 its files are not bundled. A compatible Vita texture pack can be added later
