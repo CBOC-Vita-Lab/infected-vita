@@ -19,6 +19,11 @@ are protected.
 Keep the computer and Vita awake through preparation, copying and checks.
 If disconnected, reconnect the same Vita and choose **Resume**.
 
+For compatible updates, choose **Update app** to skip ISO preparation and keep
+verified game data. It requires the completed install receipt on the same
+computer and Vita. Missing or changed data requires **Full setup**. An update
+still needs your confirmation; matching files are not recopied.
+
 HD textures are optional, not required. HDCube permission is still pending;
 its files are not bundled. A compatible Vita texture pack can be added later
 using the game's texture guide. Approved packs can be included once permission
