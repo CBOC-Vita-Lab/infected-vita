@@ -1,13 +1,14 @@
 INFECTED VITA
-Private preview / INFC00001. Do not redistribute this package.
-New owners: use BUILDING.md to generate your VPK from your own disc.
+Private source preview / INFC00001. No VPK or private artwork is included.
+Use BUILDING.md to generate your VPK from your own supported disc.
 
 FIRST INSTALL
-1. Extract this entire install ZIP on your computer. Do not unzip the VPK.
+1. Extract the source ZIP and build your VPK using BUILDING.md.
+   Owners with an existing private VPK can skip building. Do not unzip the VPK.
    CHECK-DOWNLOAD.md explains the optional offline download check.
 2. Confirm your Vita already has a legitimately obtained shader compiler at
    ur0:data/libshacccg.suprx. It is not supplied in this bundle.
-3. Using VitaShell USB or FTP, copy Infected-current-private-candidate.vpk
+3. Using VitaShell USB or FTP, copy your owner-built infected.vpk
    to ux0:VPK/ (create VPK if needed). End the transfer, then open that VPK
    in VitaShell and install it.
 4. Copy your own USA ULUS-10054 version 1.02 ISO to exactly:
@@ -20,9 +21,9 @@ Do not delete the bubble, replace eboot.bin by hand, replace the whole data
 folder, or recopy the ISO as an ordinary app update.
 
 KEEP: Infected.iso, ms0/ (saves), settings.txt, and your own compatible packs.
-INCLUDED: the existing owner's VPK, matching shaders, installed artwork,
-          source, texture tools, guides, notices and an offline checker.
-NOT INCLUDED: ISO, saves, shader compiler module, HDcube model or HD packs.
+INCLUDED: source, texture tools, guides, notices and an offline checker.
+NOT INCLUDED: VPK, private artwork, ISO, saves, shader compiler module,
+              HDcube model or HD packs.
 
 OPTIONAL HD
 HDcube runs on the computer, not the Vita. HD-TEXTURES.md explains the

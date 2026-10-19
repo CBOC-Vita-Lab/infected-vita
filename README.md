@@ -3,7 +3,14 @@
 A native PS Vita runtime for Infected. You supply your own supported PSP
 game dump; the game is not included.
 
-## Install
+## Downloads
+
+[Releases](https://github.com/CBOC-Vita-Lab/infected-vita/releases) contains
+`Infected-source-20261019.zip`: source, tools, guides and notices, **not a
+ready-made VPK**. The same files are available in this repository.
+The owner's private VPK and artwork are not uploaded.
+
+## Install From Your Disc
 
 New to the package? Open [Start Here](START-HERE.txt).
 
@@ -15,6 +22,8 @@ shader compiler module:
 3. Open the Infected bubble.
 
 See [Install](INSTALL.md) for requirements, backups and troubleshooting.
+This is the technical route; a shareable one-click package is not ready.
+The [desktop guide](DESKTOP-INSTALL.md) explains the separate owner-only setup.
 HD textures are optional. **HDcube is used on the computer to prepare them,
 not installed on the Vita.** [HD Textures](HD-TEXTURES.md) explains the model
 download and where generated packs belong.
