@@ -1,0 +1,17 @@
+Do not write a shader that failed to compile into the shader cache.
+
+compile_shader() serialised the shader even when the compiler returned no program, copying from a NULL
+program. Same change as upstream vitaGL 76f43e6 (22 Oct 2026, "Don't cache failed shader compilations. (#144)"),
+written against dca4b9d.
+
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -844,6 +844,8 @@
+ #endif
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
++	if (!s->prog)
++		return;
+ 	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 	size_t sz;
+ 	void *buf = serialize_shader(NULL, &sz, s, save_bindings);

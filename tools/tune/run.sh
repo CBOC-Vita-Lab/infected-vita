@@ -2,7 +2,7 @@
 # usage: run.sh BIN SECONDS NAME [VAR=val ...]   -> private/logs/NAME.out / .err ; data dir private/data_NAME
 # Restores the memory stick first so every run starts from the same state (private/ms0.pristine unless MS0=name).
 BIN=$1; T=$2; N=$3; shift 3
-W=/home/claude/ws/tune/private
+W=/work/ws/tune/private
 MS=${MS0:-ms0.pristine}
 D=$W/data_$N
 mkdir -p $D

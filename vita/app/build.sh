@@ -46,6 +46,7 @@ echo "== configure (vitaGL=$vgl ffmpeg=$ffm ATTRIBUTE2=$attr2)"
 extra=()
 [ -n "$heap" ] && extra+=("-DNEWLIB_HEAP_MIB=$heap")
 [ -n "$lean" ] && extra+=("-DLEAN_LIB=$lean")
+case "$lean" in *_lto.a) extra+=("-DINFECTED_LEAN_LTO=ON");; ?*) extra+=("-DINFECTED_LEAN_LTO=OFF");; esac   # build_lib.sh LEAN_LTO=1 names it so
 [ -n "$pk" ] && extra+=("-DPORTABLEKIT_DIR=$pk")
 [ -n "$shcache" ] && extra+=("-DINFECTED_SHADER_CACHE_DIR=$shcache")
 nice -n 10 cmake -S "$here" -B "$outdir" -DVITAGL_VARIANT="$vgl" -DFFMPEG_VARIANT="$ffm" -DVITA_ATTRIBUTE2="$attr2" \

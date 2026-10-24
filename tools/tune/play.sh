@@ -2,7 +2,7 @@
 # usage: play.sh NAME SECONDS [VAR=val ...]
 # Lean-only run with the libc hooks on and the deterministic virtual clock (CLOCKMODE=realtime for the real clock).
 # Environment: BIN (default build/bin/InfectedNative), PAD (pad script file, default tools/continue_flips.script), MS0 (memory stick image).
-S=/home/claude/ws/tune
+S=/work/ws/tune
 N=$1; T=$2; shift 2
 BIN=${BIN:-$S/build/bin/InfectedNative}
 PADF=${PAD:-$S/tools/continue_flips.script}

@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
     }
     // image
     std::vector<uint8_t> image;
-    { std::ifstream f(getenv("LEAN_IMAGE") ? getenv("LEAN_IMAGE") : "/home/claude/infected/work/image.bin", std::ios::binary); image.assign(std::istreambuf_iterator<char>(f), {}); }
+    { std::ifstream f(getenv("LEAN_IMAGE") ? getenv("LEAN_IMAGE") : "/work/infected/work/image.bin", std::ios::binary); image.assign(std::istreambuf_iterator<char>(f), {}); }
     if (image.empty()) { std::fprintf(stderr, "image not found\n"); return 2; }
     g_image_end = 0x08804000u + (uint32_t)image.size();
     for (auto& r : kRows) { g_entries.push_back(r.addr); g_entry_set.insert(r.addr); }

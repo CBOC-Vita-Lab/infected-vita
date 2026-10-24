@@ -1,21 +1,31 @@
-# Changes
+# What's New
 
-## 2026-10-18: Installed Artwork Preserved
+## Version 1.0 — October 23, 2026
 
-- Matched the private VPK's artwork to the existing Vita installation.
-- Kept its executable, shaders and other resources unchanged.
-- No console installation or public release.
+**The first public version.** The whole game runs natively on the Vita, at a steady 30 fps.
 
-## 2026-10-18: Simpler Setup
+**Smoother play**
+- A steady 30 fps in mission 1 on the default settings, measured on a real PS Vita.
+- The game now uses all four of the Vita's CPU cores. It unlocks the fourth one by itself, with nothing extra to install.
+- Music and voices are decoded ahead of time on a spare core, which frees about 3 ms of every frame on the game's own core.
+- The game's code is built as one optimized program, so it runs faster.
+- Shaders are prepared during the opening logos, so the game doesn't pause the first time an effect appears.
+- Effects the game has faded out completely are no longer drawn.
+- Frame skip: if the drawing falls behind, the action and the sound keep their pace.
+- Optional 500 MHz CPU mode with a PSVshellPlus profile.
 
-- Shortened installation and put the automatic HD-model download first.
-- Included source, texture tools, dependency patches, linked guides and
-  notices in the private owner bundle; the VPK is unchanged.
+**Better picture**
+- Full 960x544 rendering with smooth texture filtering and mipmaps.
+- Optional HD texture packs (2x, or a mixed 4x) made from your own disc, switched live from the menu.
+- Optional FXAA or MSAA anti-aliasing, per-pixel lighting and double-resolution glow effects.
+- HUD icons and button glyphs are enlarged as pixel art instead of being blurred.
 
-## 2026-10-18: Source And Documentation
+**Controls and gameplay**
+- A settings menu that opens any time: hold SELECT + START, or tap the top-right corner of the screen.
+- A Modern layout: R fires (hold for automatic fire), L locks on, and the right stick opens the map. Classic keeps the PSP layout.
+- Optional higher enemy density (up to 200 %) and view distance (up to 200 %).
 
-- Imported the current prepared runtime, recompiler and all 64 PortableKit patches.
-- Verified the patched dependency tree against its pinned base.
-- Included owner-side build, HD texture and movie tools with clear exclusions.
-- Added controls, provenance, technical notes and outstanding release checks.
-- Kept the current installed runtime selected; no rebuild or device change.
+**Under the hood**
+- Builds from your own disc in about 20 minutes. RetroFlow cover art is set up automatically, and you can use your own bubble art.
+
+The full engineering record, with every measurement and its date, is in [docs/STATUS.md](docs/STATUS.md) and the logs in [docs/history/](docs/history).

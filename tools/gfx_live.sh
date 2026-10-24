@@ -13,8 +13,8 @@
 # The data directory is made fresh for every run (the memory stick is restored, settings.txt removed), so every run starts from
 # the same state; the game's own files are never written. Virtual clock, audio device off, frame cap off, so the run is
 # deterministic and as fast as the host allows.
-S=${SRC:-/home/claude/ws/integ/private}
-G=${GFX:-/home/claude/ws/gfx}
+S=${SRC:-/work/ws/integ/private}
+G=${GFX:-/work/ws/gfx}
 W=${W:-$G/private/live}
 N=$1; T=$2; shift 2
 BIN=${BIN:-$G/build/bin/InfectedNative}

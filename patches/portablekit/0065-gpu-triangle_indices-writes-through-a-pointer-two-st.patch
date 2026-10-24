@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 13:38:46 +0000
+Subject: [PATCH] gpu: triangle_indices() writes through a pointer, two strip
+ triangles a step, no branch per index
+
+The split renderer's walker turns every transformed strip and fan into a triangle list in prepare_draw(). With push_back and
+an "indexed?" lambda per index that was about 16 ARM instructions an index: 1.12 M instructions a mission frame on the walker,
+13.9 % of it (tools/armprof, mission-1 dumps 4201-4210, --prepare). The list is now sized once and written in loops without a
+branch per index (strips two triangles a step, as append() does): 0.28 M. About 0.78 M instructions a frame less on the
+walker counting the vector's zero fill, roughly 2 ms of its ~25 ms on the console. The GL thread's general append path
+uses the same function.
+
+Verified: the same output as the old function for 300,000 random primitives (all five types, indexed or not, clamped
+indices, empty and short draws); ge_replay pictures of 24 mission frames byte-identical to the previous build, with and
+without --prepare; all 29 desktop test programs pass. Not measured on the console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/triangle_indices.hpp b/host/gpu/triangle_indices.hpp
+index 5904d82..438e56f 100644
+--- a/host/gpu/triangle_indices.hpp
++++ b/host/gpu/triangle_indices.hpp
+@@ -33,34 +33,63 @@ inline bool triangle_indices(PrimitiveType primitive, std::size_t count, const s
+     if (vertex_count == 0u) return primitive == PrimitiveType::Triangles ||
+                                    primitive == PrimitiveType::TriangleStrip ||
+                                    primitive == PrimitiveType::TriangleFan;
+-    const auto at = [&](std::size_t index) { return primitive_vertex(indices, vertex_count, index); };
++    if (primitive != PrimitiveType::Triangles && primitive != PrimitiveType::TriangleStrip &&
++        primitive != PrimitiveType::TriangleFan)
++        return false;
++    // Written through a pointer into a vector sized once, in loops without a branch per index (push_back and a lambda that
++    // asked "indexed?" for every index were some 16 instructions an index on the Vita's CPU, the split renderer's walker
++    // converting about 70,000 a mission frame). The indices are the same, in the same order.
++    const std::size_t total = primitive == PrimitiveType::Triangles ? count / 3u * 3u : count >= 3u ? (count - 2u) * 3u : 0u;
++    if (total == 0u) return true;
++    out.resize(total);
++    std::uint16_t *o = out.data();
++    const std::size_t last = vertex_count - 1u;
++    const std::uint16_t *in = indices.empty() ? nullptr : indices.data();
++    // A vertex number as primitive_vertex() gives it (indices and vertex numbers here are below 65536).
++    const auto pick = [last](std::size_t mapped) { return static_cast<std::uint16_t>(std::min(mapped, last)); };
+     switch (primitive) {
+     case PrimitiveType::Triangles:
+-        out.reserve(count / 3u * 3u);
+-        for (std::size_t i = 0; i + 2u < count; i += 3u) {
+-            out.push_back(at(i));
+-            out.push_back(at(i + 1u));
+-            out.push_back(at(i + 2u));
++        if (in != nullptr) {
++            const auto last16 = static_cast<std::uint16_t>(std::min<std::size_t>(last, 0xFFFFu));
++            for (std::size_t i = 0; i < total; ++i) o[i] = std::min(in[i], last16);
++        } else {
++            for (std::size_t i = 0; i < total; ++i) o[i] = pick(i);
+         }
+         return true;
+-    case PrimitiveType::TriangleStrip:
+-        if (count >= 3u) out.reserve((count - 2u) * 3u);
+-        for (std::size_t i = 0; i + 2u < count; ++i) {
+-            const bool odd = (i & 1u) != 0u;
+-            out.push_back(at(i));
+-            out.push_back(at(odd ? i + 2u : i + 1u));
+-            out.push_back(at(odd ? i + 1u : i + 2u));
+-        }
++    case PrimitiveType::TriangleStrip: {
++        // Triangle i is (i, i+1, i+2) when i is even and (i, i+2, i+1) when it is odd: two at a time, (a b c) (b d c).
++        const auto strip = [&](auto vertex) {
++            std::uint16_t a = vertex(0u), b = vertex(1u);
++            std::size_t i = 0;
++            for (; i + 3u < count; i += 2u, o += 6) {
++                const std::uint16_t c = vertex(i + 2u), d = vertex(i + 3u);
++                o[0] = a; o[1] = b; o[2] = c;
++                o[3] = b; o[4] = d; o[5] = c;
++                a = c;
++                b = d;
++            }
++            if (i + 2u < count) {
++                o[0] = a; o[1] = b; o[2] = vertex(i + 2u);
++            }
++        };
++        if (in != nullptr) strip([&](std::size_t i) { return pick(in[i]); });
++        else strip([&](std::size_t i) { return pick(i); });
+         return true;
+-    case PrimitiveType::TriangleFan:
+-        if (count >= 3u) out.reserve((count - 2u) * 3u);
+-        for (std::size_t i = 1u; i + 1u < count; ++i) {
+-            out.push_back(at(0));
+-            out.push_back(at(i));
+-            out.push_back(at(i + 1u));
+-        }
++    }
++    default: {  // a fan
++        const auto fan = [&](auto vertex) {
++            const std::uint16_t first = vertex(0u);
++            std::uint16_t previous = vertex(1u);
++            for (std::size_t i = 1u; i + 1u < count; ++i, o += 3) {
++                const std::uint16_t next = vertex(i + 1u);
++                o[0] = first; o[1] = previous; o[2] = next;
++                previous = next;
++            }
++        };
++        if (in != nullptr) fan([&](std::size_t i) { return pick(in[i]); });
++        else fan([&](std::size_t i) { return pick(i); });
+         return true;
+-    default: return false;
++    }
+     }
+ }
+ 

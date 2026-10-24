@@ -196,6 +196,14 @@ endif()
 # The lean library: g_lean_entry is only a WEAK reference of the runtime (exec.cpp), which does not pull an archive member by itself,
 # so the table is forced in with -u, and --whole-archive is not needed (every thunk is reached through the table).
 target_link_options(infected PRIVATE "LINKER:-u,g_lean_entry" "LINKER:-u,g_lean_entry_count")
+# INFECTED_LEAN_LTO: LEAN_LIB is the link-time-optimisation archive (build_lib.sh with LEAN_LTO=1). The link then compiles the
+# game's code as one program, with the lean flags (no fused multiply-add: the guest has none) and two jobs. Only the lean
+# objects carry GIMPLE; the rest of the application is linked as before.
+option(INFECTED_LEAN_LTO "LEAN_LIB holds LTO objects" OFF)
+if(INFECTED_LEAN_LTO)
+  target_link_options(infected PRIVATE -flto=2 -flto-partition=balanced -O2 -fno-math-errno -ffp-contract=off
+                      -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb)
+endif()
 # libgcc and libstdc++ decide whether the program has threads by a WEAK reference to pthread_cancel (gthr-posix.h,
 # __gthread_active_p). Nothing references it strongly, so in a static link it stayed 0 and the C++ runtime ran
 # single-threaded: std::mutex locked nothing, shared_ptr counts were not atomic, and thread_local (emulated TLS) was one
@@ -260,6 +268,14 @@ if(INFECTED_SHADER_CACHE_DIR AND IS_DIRECTORY "${INFECTED_SHADER_CACHE_DIR}")
   list(LENGTH _gxp _gxp_count)
   message(STATUS "shader cache: ${_gxp_count} compiled shaders from ${INFECTED_SHADER_CACHE_DIR} go into the VPK")
 endif()
+# The list of shader programs the game draws with (renderer flags, one per line; gl_renderer's prepare_variants()). Shipped as
+# shader_cache/variants.txt, it lets a first start compile and link every program while the game boots instead of at the
+# first draw that needs it, which was a 40-90 ms stall each, a dozen of them in the first seconds of a mission.
+set(INFECTED_SHADER_VARIANTS "${CMAKE_CURRENT_SOURCE_DIR}/shader_variants.txt" CACHE FILEPATH "the shader program list to ship (empty: none)")
+if(INFECTED_SHADER_VARIANTS AND EXISTS "${INFECTED_SHADER_VARIANTS}")
+  list(APPEND SHADER_CACHE_FILES FILE "${INFECTED_SHADER_VARIANTS}" "shader_cache/variants.txt")
+  message(STATUS "shader variants: ${INFECTED_SHADER_VARIANTS} goes into the VPK as shader_cache/variants.txt")
+endif()
 set(RETROFLOW_FILES "")
 foreach(kind COVERS BACKGROUNDS)
   string(TOLOWER "${kind}" _k)
@@ -268,7 +284,15 @@ foreach(kind COVERS BACKGROUNDS)
   endif()
 endforeach()
 vita_create_self(infected.self infected UNSAFE)
+# The package's own kernel module that lets helper threads use the fourth CPU core (vita/core3; loaded by the application itself).
+set(CORE3_MODULE "${CMAKE_CURRENT_BINARY_DIR}/module/infected_core3.skprx")
+add_custom_command(OUTPUT "${CORE3_MODULE}"
+  COMMAND ${CMAKE_COMMAND} -E env "VITASDK=$ENV{VITASDK}" "VITA_SYSROOT=${VITA_SYSROOT}" "${VITA_TREE}/core3/build.sh" "${CMAKE_CURRENT_BINARY_DIR}/module"
+  DEPENDS "${VITA_TREE}/core3/core3.c" "${VITA_TREE}/core3/exports.yml" "${VITA_TREE}/core3/build.sh"
+  COMMENT "infected_core3.skprx")
+add_custom_target(core3_module DEPENDS "${CORE3_MODULE}")
 vita_create_vpk(infected.vpk ${VITA_TITLEID} infected.self
+  FILE ${CORE3_MODULE} module/infected_core3.skprx
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE ${LIVEAREA_DIR}/sce_sys/icon0.png sce_sys/icon0.png
@@ -279,3 +303,4 @@ vita_create_vpk(infected.vpk ${VITA_TITLEID} infected.self
   FILE ${LIVEAREA_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
   ${RETROFLOW_FILES}
   ${SHADER_CACHE_FILES})
+add_dependencies(infected.vpk-vpk core3_module)

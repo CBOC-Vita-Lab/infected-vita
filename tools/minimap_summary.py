@@ -2,7 +2,7 @@
 """Summary of scripts/minimap_measure.sh: one line per run (tag, mode): recolours and their time, refusals, resident HD memory, the replay's
 per-flip time (mean, median, 95th percentile, worst) and how much of it the recolours are."""
 import glob, os, re, sys
-d = sys.argv[1] if len(sys.argv) > 1 else '/home/claude/ws/all/private/mm'
+d = sys.argv[1] if len(sys.argv) > 1 else '/work/ws/all/private/mm'
 rows = []
 for f in sorted(glob.glob(os.path.join(d, '*_*.txt'))):
     name = os.path.basename(f)[:-4]

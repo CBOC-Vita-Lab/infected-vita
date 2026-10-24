@@ -1,27 +1,33 @@
 # Controls
 
-These mappings come from `vita/app/src/pad_layout.h` and the settings code.
-They still need a complete current-build device check.
+Choose the layout in the settings menu (**Controls** page). **Modern** is the default.
 
-| Control | Modern layout |
+## Modern layout
+
+| Button | Action |
 | --- | --- |
 | Left stick | Move |
-| R | Fire pistol; repeats while held when auto-fire is enabled |
-| L | Lock on and strafe |
+| **R** | Fire. Hold it for automatic fire (ten shots a second) when **Hold to fire** is on |
+| **L** | Lock on and strafe |
 | Square | Viral gun |
-| Cross | Original pistol button, still available |
-| Right stick up/down | Map; not free camera aiming |
-| Start | Game pause |
-| Select + Start, held briefly | Port settings |
-| Top-right front touch | Port settings |
+| Cross | Fire (the original button, still works) |
+| Right stick up or down | Open the map |
+| Circle, Triangle, D-pad | As in the original game |
+| START | The game's pause menu |
 
-Classic leaves the PSP button layout unchanged: Cross fires, Square uses
-the viral gun, R locks on/strafes and L opens the map. Other face buttons,
-D-pad and menu actions follow the original game prompts.
+## Classic layout
 
-In port settings: Up/Down selects a row, Left/Right changes it, L/R changes
-page, Circle or Start closes and saves. [Settings](docs/SETTINGS.md) explains
-the options. Rear touch is not part of the documented layout.
+The PSP's own layout, unchanged: **Cross** fires, **Square** is the viral gun, **R** locks on and strafes, **L** opens the map.
 
-Start + Select + L + R requests an exit. Use it only when necessary; unsaved
-progress can be lost. It is not a normal way to close the settings menu.
+## Always available
+
+| Buttons | Action |
+| --- | --- |
+| Hold **SELECT + START** (half a second) | Open the settings menu |
+| Tap the **top-right corner** of the touch screen | Open the settings menu |
+| Hold **START + SELECT + L + R** (one second) | Leave the game (saves the log cleanly) |
+
+In the settings menu: **Up/Down** chooses a row, **Left/Right** changes it, **L/R** switches page and **Circle** or **START** closes and saves.
+[SETTINGS.md](SETTINGS.md) explains every option.
+
+Leaving the game doesn't save your progress. Save in the game first, as you would on a PSP.

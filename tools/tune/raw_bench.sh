@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: raw_bench.sh NAME RAWFACTOR [mission9a] : the bench_one window with the view factor forced (INFECTED_TUNE_VIEW_RAW, unclamped) to see what a far plane that really bites costs
-S=/home/claude/ws/tune
+S=/work/ws/tune
 N=$1; R=$2
 [ "$3" = mission9a ] && export DISC=$S/private/swap/iso9a.iso
 mkdir -p $S/private/stats/$N

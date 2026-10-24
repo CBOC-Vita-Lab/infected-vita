@@ -4,10 +4,10 @@
 # and checks the outcome: "mission complete" reached at the expected flip with the expected score board, the results screen
 # at the expected flip, and the score written to the save file (INFECTED.BIN u16 at 0x3283 / hazard pay at 0x329a, mission 1 record).
 # The observer (INFECTED_BOT_OBSERVE=1) only READS guest memory and prints "[bot] event ..." lines; it supplies no input.
-# Environment: TIMEOUT (seconds, default 900; a real-GL run needs more), NAME, BOT_WS (workspace, default /home/claude/ws/bot), BIN, MS0, DISC as for run.sh; STRICT=0 accepts any completion
+# Environment: TIMEOUT (seconds, default 900; a real-GL run needs more), NAME, BOT_WS (workspace, default /work/ws/bot), BIN, MS0, DISC as for run.sh; STRICT=0 accepts any completion
 # with the expected score (for a platform whose floating point is not bit-identical).
 HERE=$(dirname "$(realpath "$0")")
-W=${BOT_WS:-/home/claude/ws/bot}
+W=${BOT_WS:-/work/ws/bot}
 PAD=$(realpath "${1:-$HERE/mission1_win.pad}")
 EXP=${2:-$HERE/mission1_win.expect}
 . "$EXP"

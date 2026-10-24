@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
 
     // image
     std::vector<u8> image;
-    { std::ifstream f("/home/claude/infected/work/image.bin", std::ios::binary); image.assign(std::istreambuf_iterator<char>(f), {}); }
+    { std::ifstream f("/work/infected/work/image.bin", std::ios::binary); image.assign(std::istreambuf_iterator<char>(f), {}); }
     psprecomp::Runtime rt(32u << 20);
     const u32 kSentinel = 0x08FFFFF0u;
     rt.register_function(kSentinel, &noop_fn, "sentinel");

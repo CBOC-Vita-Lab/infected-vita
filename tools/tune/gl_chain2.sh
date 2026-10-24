@@ -1,7 +1,7 @@
 #!/bin/bash
 # after gl_chain.sh: the view distance pictures of two more levels (Mission_14B and Mission_4A through private/swap/isov.iso)
-S=/home/claude/ws/tune
-IS=/home/claude/ws/tex/proj/tools/texpack/iso_swap.py
+S=/work/ws/tune
+IS=/work/ws/tex/proj/tools/texpack/iso_swap.py
 SW=$S/private/swap/isov.iso
 while [ ! -f $S/private/shots9/sd200/flip_007000.png ]; do sleep 20; done
 sleep 30

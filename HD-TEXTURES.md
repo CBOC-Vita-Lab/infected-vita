@@ -6,7 +6,7 @@ model**, not Vita software. Do not copy its `.pth` file to the console.
 ## Easiest Method
 
 The texture builder is included. First prepare PortableKit using
-[Building](BUILDING.md), then run this from the repository/package root:
+[Building](docs/BUILDING.md), then run this from the repository/package root:
 
 ```sh
 tools/texpack/build_packs.sh /path/to/Infected.iso
@@ -27,7 +27,7 @@ Only use this section if you want to provide the model yourself.
 2. Use **Download raw file** and keep the filename
    **`4xHDCube4Compact.pth`** on your computer. Do not save the GitHub web page
    as the model.
-3. Claude's recovered texture builder uses
+3. The texture builder uses
    `texpack-work/models/4xHDCube4Compact.pth` by default. Supply your own
    supported ISO to `tools/texpack/build_packs.sh`; its model-fetching
    step obtains the required models directly from their authors.

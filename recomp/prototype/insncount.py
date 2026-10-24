@@ -3,7 +3,7 @@
 usage: insncount.py OBJ SYMREGEX   -> prints per-symbol 'insns bytes' and the total.
 Literal-pool words (.word / .short / .byte lines) are excluded from the instruction count but bytes are the symbol size."""
 import re, subprocess, sys
-env = {'PATH': '/home/claude/vitasdk-root/vitasdk/bin:/usr/bin:/bin'}
+env = {'PATH': '/work/vitasdk-root/vitasdk/bin:/usr/bin:/bin'}
 def symbols(obj, rx):
     out = subprocess.run(['arm-vita-eabi-nm', '-S', '--defined-only', obj], capture_output=True, text=True, env=env).stdout
     res = {}

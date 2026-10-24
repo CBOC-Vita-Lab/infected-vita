@@ -4,7 +4,7 @@
 import sys,re
 start=int(sys.argv[1],16); end=int(sys.argv[2],16); name=sys.argv[3]
 base=0x08804000; unit=(start-base)//0x4000
-path='/home/claude/assess/experiments/gen/generated_unit_%04d.cpp'%unit
+path='/work/assess/experiments/gen/generated_unit_%04d.cpp'%unit
 lines=open(path).read().split('\n')
 def find(addr):
     pat='L_%08X:'%addr

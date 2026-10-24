@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: m1_runs.sh [PHASE ...]   mission 1 from a pristine memory stick, one bot run per menu-timing phase (lean, virtual clock);
 # prints the mission_complete / death events, the save file result (score at 0x3283) and the results-screen flip.
-W=${BOT_WS:-/home/claude/ws/bot}
+W=${BOT_WS:-/work/ws/bot}
 PH=${@:-0 17 53 81}
 for p in $PH; do
   $W/proj/tools/bot/run.sh m1_ph$p 900 INFECTED_MAX_FRAMES=${FRAMES:-12500} INFECTED_BOT=1 INFECTED_BOT_PARAMS=phase=$p > /dev/null

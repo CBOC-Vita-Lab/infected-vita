@@ -1,7 +1,7 @@
 import subprocess, sys, json, re, os
 # usage: lean_measure.py <dir> <tag> [extra g++ flags...]
 d, tag = sys.argv[1], sys.argv[2]; extra = sys.argv[3:]
-env = dict(os.environ); env['PATH'] = '/home/claude/vitasdk-root/vitasdk/bin:' + env['PATH']
+env = dict(os.environ); env['PATH'] = '/work/vitasdk-root/vitasdk/bin:' + env['PATH']
 man = json.load(open(os.path.join(d, 'manifest.json')))
 funcs = json.load(open(os.path.join(d, 'funcs.json')))
 tot_text = 0; tot_sym = {}

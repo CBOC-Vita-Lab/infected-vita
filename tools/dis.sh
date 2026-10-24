@@ -3,7 +3,7 @@
 BASE=$((0x08804000))
 S=$(( $1 - BASE ))
 E=$(( ${2:-$(( $1 + 0x80 ))} - BASE ))
-llvm-objdump -d --triple=mipsel --no-show-raw-insn /home/claude/infected/work/image.o --start-address=$S --stop-address=$E 2>&1 | python3 -c '
+llvm-objdump -d --triple=mipsel --no-show-raw-insn /work/infected/work/image.o --start-address=$S --stop-address=$E 2>&1 | python3 -c '
 import sys,re
 base=0x08804000
 for l in sys.stdin:

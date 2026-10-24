@@ -3,7 +3,7 @@
 
 The emulated ux0:data/infected is shared with other users of the harness, so a session stages what a run needs (config.txt, settings.txt,
 pad script, memory stick, shader cache, ...) by moving the existing file aside, runs, collects the results, and puts everything back
-before the lock is released. Uses the harness module (/home/claude/ws/v3k/bin/v3k.py) as its own hdmov twin does.
+before the lock is released. Uses the harness module (/work/ws/v3k/bin/v3k.py) as its own hdmov twin does.
 
 SPEC.json:
  { "title": "INFC00001", "vpk": "...vpk" (installed first; optional), "elf": "...elf" (symbolise crashes; optional), "out": "dir",
@@ -15,7 +15,7 @@ SPEC.json:
 """
 import importlib.util, json, os, shutil, sys, time, zipfile
 
-H = "/home/claude/ws/v3k/bin/v3k.py"
+H = "/work/ws/v3k/bin/v3k.py"
 spec = importlib.util.spec_from_file_location("v3k", H)
 v = importlib.util.module_from_spec(spec)
 sys.modules["v3k"] = v

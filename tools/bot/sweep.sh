@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: sweep.sh FRAMES NAME=params [NAME=params ...]   (each run: lean, virtual clock, bot with the given INFECTED_BOT_PARAMS)
 # prints one summary line per run: deaths, completion events.
-W=${BOT_WS:-/home/claude/ws/bot}
+W=${BOT_WS:-/work/ws/bot}
 F=$1; shift
 for spec in "$@"; do
   n=${spec%%=*}; p=${spec#*=}

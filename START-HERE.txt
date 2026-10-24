@@ -1,35 +1,45 @@
-INFECTED VITA
-Private source preview / INFC00001. No VPK or private artwork is included.
-Use BUILDING.md to generate your VPK from your own supported disc.
+Infected for PS Vita - Version 1.0
+==================================
 
-FIRST INSTALL
-1. Extract the source ZIP and build your VPK using BUILDING.md.
-   Owners with an existing private VPK can skip building. Do not unzip the VPK.
-   CHECK-DOWNLOAD.md explains the optional offline download check.
-2. Confirm your Vita already has a legitimately obtained shader compiler at
-   ur0:data/libshacccg.suprx. It is not supplied in this bundle.
-3. Using VitaShell USB or FTP, copy your owner-built infected.vpk
-   to ux0:VPK/ (create VPK if needed). End the transfer, then open that VPK
-   in VitaShell and install it.
-4. Copy your own USA ULUS-10054 version 1.02 ISO to exactly:
-     ux0:data/infected/Infected.iso
-5. Open the Infected bubble. Start without optional HD packs first.
+Thanks for trying the native Vita port of Infected! It runs the game
+directly on the Vita (no emulator) at 30 frames a second.
 
-ALREADY INSTALLED?
-Back up ux0:data/infected/ first. Install only the matching new VPK.
-Do not delete the bubble, replace eboot.bin by hand, replace the whole data
-folder, or recopy the ISO as an ordinary app update.
 
-KEEP: Infected.iso, ms0/ (saves), settings.txt, and your own compatible packs.
-INCLUDED: source, texture tools, guides, notices and an offline checker.
-NOT INCLUDED: VPK, private artwork, ISO, saves, shader compiler module,
-              HDcube model or HD packs.
+What you need
+-------------
+- A Vita or PS TV with HENkaku or Enso, and VitaShell
+- libshacccg.suprx in ur0:data/ (the shader compiler vitaGL games use)
+- Your own Infected disc image: US version, ULUS-10054, 1.02 (.iso)
+- A PC to build the game package once (about 20 minutes)
 
-OPTIONAL HD
-HDcube runs on the computer, not the Vita. HD-TEXTURES.md explains the
-author's model download and where compatible user-generated packs go.
-Never copy the .pth model to the Vita. Normal installation does not need it.
+There is no ready-made VPK to download: the package contains code
+translated from your disc, so you build it yourself.
 
-Keep the source, tools and guides on your computer. INSTALL.md has the
-folder map, backup advice and troubleshooting. Build details and test notes
-are separate in BUILDING.md and KNOWN-ISSUES.md.
+
+Install in four steps
+---------------------
+1. Build infected.vpk from your disc: see docs/BUILDING.md
+2. Copy infected.vpk to the Vita, open it in VitaShell, press Cross
+3. Copy your ISO into ux0:data/infected/
+4. Open the Infected bubble
+
+
+Updating
+--------
+Install the new VPK over the old one. Your saves and settings stay.
+
+
+While you play
+--------------
+- Settings menu: hold SELECT + START, or tap the top-right corner
+- Leave the game: hold START + SELECT + L + R for a second
+- Fire with R, lock on with L, map on the right stick (Modern layout)
+
+
+Have fun
+--------
+Install details ......... INSTALL.md
+Every setting ........... SETTINGS.md
+Controls ................ CONTROLS.md
+Sharper textures ........ HD-TEXTURES.md
+Known issues ............ KNOWN-ISSUES.md

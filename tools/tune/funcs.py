@@ -2,9 +2,9 @@
 """funcs.py : build private/dis/funcs.txt = sorted function starts (jal targets plus stack-prologue heuristics) and answer queries.
 usage: funcs.py build | funcs.py find ADDR [ADDR..]  | funcs.py callers ADDR | funcs.py refs ADDR"""
 import sys, re, bisect, os
-DIS = '/home/claude/ws/tune/private/dis/image.txt'
-XR = '/home/claude/ws/tune/private/dis/xref.tsv'
-OUT = '/home/claude/ws/tune/private/dis/funcs.txt'
+DIS = '/work/ws/tune/private/dis/image.txt'
+XR = '/work/ws/tune/private/dis/xref.tsv'
+OUT = '/work/ws/tune/private/dis/funcs.txt'
 def build():
     starts = set()
     for l in open(XR):

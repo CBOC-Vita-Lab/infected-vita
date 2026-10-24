@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """summ.py NAME.. : summary of a sustain run (logs/NAME.err): last flip, per-cell cap / max alive, pool peaks, heap top, world transitions, warnings"""
 import re, sys
-L = '/home/claude/ws/tune/private/logs/'
+L = '/work/ws/tune/private/logs/'
 for n in sys.argv[1:]:
     try: lines = open(L + n + '.err', errors='replace').read().splitlines()
     except OSError: print(n, 'missing'); continue

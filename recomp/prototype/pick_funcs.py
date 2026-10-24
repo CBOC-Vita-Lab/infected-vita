@@ -1,6 +1,6 @@
 import struct, sys, collections
 BASE=0x08804000
-img=open('/home/claude/infected/work/image.bin','rb').read()
+img=open('/work/infected/work/image.bin','rb').read()
 N=0x2860D4//4  # code words
 words=struct.unpack('<%dI'%N, img[:N*4])
 seeds=set()

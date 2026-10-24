@@ -173,6 +173,7 @@ int main(int, char**) {
     // The fourth core, when a plugin lets the application have it: the helper threads (audio pump, movie decoder, GC thread of vitaGL,
     // watchdog) go there and leave core 2 to the display-list walker. config.txt core3=0 keeps them where they were.
     plat::core3_allow(app::cfg_bool("core3", true));
+    plat::core3_unlock_allow(app::cfg_bool("core3_unlock", true));
     plat::logf("cores: helper threads on core %d (core 3 %s)", plat::helper_core(), plat::core3_usable() ? "usable" : "not available");
 
     if (app::cfg_bool("clocks", true)) plat::clocks_set_max();
@@ -181,6 +182,15 @@ int main(int, char**) {
         // Compiled shaders shipped in the VPK (app0:shader_cache) are copied beside the ones this device compiled; none is overwritten.
         const int shipped = plat::dir_copy_tree("shader_cache", "shader_cache", false);
         plat::logf("shader cache: %d shipped file(s) copied to the data folder", shipped < 0 ? 0 : shipped);
+        // The shipped list of shader programs is the package's own: a newer package's list replaces an older one (the programs
+        // this console linked are in shader_variants.txt beside it, which the renderer reads as well).
+        void* list = nullptr;
+        size_t list_size = 0;
+        if (plat::file_read_all(plat::Root::App, "shader_cache/variants.txt", &list, &list_size)) {
+            const bool written = plat::file_write_all(plat::Root::Data, "shader_cache/variants.txt", list, list_size);
+            plat::logf("shader cache: the shipped program list (%u bytes) %s", (unsigned)list_size, written ? "is in place" : "could NOT be written");
+            free(list);
+        }
     }
     plat::logf("%s", app::memory_line().c_str());
 
