@@ -28,6 +28,10 @@ been run on another system, it says so. No step needs root.
 | Tools | `git`, `cmake` (3.16 or newer; 3.28 was used), `make`, `curl`, `xz`, `patch`, `tar`, a host `g++` with C++20, `python3` (3.10 or newer) |
 | Python packages | `Pillow` for the artwork scripts, `pycdlib` only for `art_from_disc.py`. The texture packs need more (section 5). |
 
+On Ubuntu or Debian the tools are one line: `sudo apt install git cmake make curl xz-utils patch g++ python3 python3-pip`, then
+`python3 -m pip install --user Pillow pycdlib`. **Windows:** use WSL with Ubuntu and run everything inside it (not tried yet, but it is the
+same Linux toolchain). **macOS:** see "What is not covered here" at the end.
+
 The commands below run from the root of this repository. `private/` is where everything made from your disc goes; git ignores it, and
 nothing in it should ever be committed, uploaded or attached to a report.
 

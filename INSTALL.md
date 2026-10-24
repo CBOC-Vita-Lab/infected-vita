@@ -16,10 +16,18 @@ disc is a one-time job on a PC: [`docs/BUILDING.md`](docs/BUILDING.md). The rest
 
 That is all.
 
+## Getting ready
+
+* **A hacked Vita.** [HENkaku](https://henkaku.xyz/) or Ensō, and [VitaShell](https://github.com/TheOfficialFloW/VitaShell/releases).
+  The guide at [vita.hacks.guide](https://vita.hacks.guide/) walks through it for every firmware.
+* **The ISO.** Make it from your own UMD, for example with a PSP running custom firmware (its USB connection can share the UMD as an
+  `.iso`). Only the US release works: ULUS-10054, version 1.02.
+
 ## Before the first start
 
-* The Vita needs **`libshacccg.suprx` in `ur0:data/`**: Sony's shader compiler, taken from your own console with one of the usual
-  community installers. Every game that runs on vitaGL needs it, so you may have it already.
+* The Vita needs **`libshacccg.suprx` in `ur0:data/`**: Sony's shader compiler, taken from your own console. The usual way is
+  [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D): install it, run it once, and it puts the file in place. Every game that
+  runs on vitaGL needs it, so you may have it already.
 * About **600 MB free on `ux0:`** for the ISO, plus 72 MB (2x pack) or 102 MB (4x pack) if you use HD textures.
 * The first start takes a little longer: the game prepares its shaders during the opening logos (about 1.5 s on a Vita) and keeps them in
   `ux0:data/infected/shader_cache`, so missions don't pause on them later.
