@@ -36,7 +36,7 @@ Everything wrong or unchecked in version 1.0.
 * **The intro movie shows horizontal tear lines.** The movie is a 512x512 texture that is re-uploaded every frame (about 15 ms
   each). Most likely the movie decoder writes the next picture while the GL thread still reads this one. Not checked against the
   single-thread renderer, not fixed.
-* **Fire and explosions show sharp horizontal bands** in some captures from the console (the capture on the front page shows them).
+* **Fire and explosions show sharp horizontal bands** in some captures from the console ([this one](docs/img/vita-capture-street.png) shows them).
   Not traced yet to the game or to the way the picture is captured.
 * **Occasional hitches.** Known causes: the first draw after a render-target switch takes about 8 ms (worst 16 to 20 ms), and a new
   texture's decode plus upload takes 3 to 12 ms. How low the worst frames go has not been measured yet.

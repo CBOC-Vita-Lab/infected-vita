@@ -5,8 +5,7 @@ and runs directly on the Vita's processor, and its graphics are drawn by the Vit
 all four of the Vita's CPU cores. It comes with sharper textures made from your own disc, a modern shooter control layout, and a settings menu
 you can open at any moment.
 
-![Mission 1 on a PS Vita](docs/img/vita-capture-street.png)
-<sub>Mission 1, captured on a PS Vita.</sub>
+![Mission 1 with the 2x HD textures](docs/img/gameplay-street.jpg)
 
 **[Build it from your disc](docs/BUILDING.md)** · [Install guide](INSTALL.md) · [Settings menu](SETTINGS.md) · [Controls](CONTROLS.md) · [What's new](CHANGELOG.md)
 
@@ -29,6 +28,18 @@ The first public version: the whole game, native, at 30 frames a second.
 - **Extra picture options:** FXAA or MSAA anti-aliasing, per-pixel lighting, finer glow effects, smooth texture filtering and mipmaps.
 - **500 MHz mode.** With a PSVshellPlus profile, the CPU runs above Sony's usual 444 MHz limit.
 
+## Screenshots
+
+| | |
+| --- | --- |
+| ![A street fight in mission 1](docs/img/gameplay-fight.jpg) | ![The viral gun](docs/img/pc-viral-gun.png) |
+| Street fighting in mission 1, 2x HD textures | The viral gun in action |
+| ![A burning street](docs/img/gameplay-fire.jpg) | ![The mission selection screen](docs/img/pc-mission-select.png) |
+| Fire and frost in Manhattan | Mission selection |
+
+<sub>All pictures are at the Vita's 960x544 and drawn by the port's own renderer. The shots above were rendered on a PC from recorded
+mission frames, with the same drawing code the Vita runs.</sub>
+
 ## What To Expect
 
 | | |
@@ -48,7 +59,7 @@ The first public version: the whole game, native, at 30 frames a second.
 | **Everything on** (4x textures, FXAA, pixel lighting, double effects) | 10 to 14 | Screenshots, not play |
 
 60 fps isn't possible: the game itself runs at 30. The frame limit is already 30 by default, which keeps the motion even.
-See [Known Issues](KNOWN-ISSUES.md) for everything that is still rough.
+See [Known Issues](KNOWN-ISSUES.md) for everything that is still rough, and [report a problem](https://github.com/CBOC-Vita-Lab/infected-vita/issues/new/choose) if you find something new.
 
 ## Install
 
@@ -86,6 +97,10 @@ Installer doesn't handle Infected yet, because there is no ready-made package to
 ### The settings menu
 
 Hold **SELECT + START** for half a second, or tap the **top-right corner** of the touch screen. The game pauses and the menu opens on top of it.
+
+| | | |
+| --- | --- | --- |
+| ![Graphics page](docs/img/settings-graphics.png) | ![Performance page](docs/img/settings-performance.png) | ![Controls page](docs/img/settings-controls.png) |
 
 | Page | What's on it |
 | --- | --- |

@@ -46,6 +46,8 @@ are estimates.
 
 ## Graphics page
 
+![The graphics page of the settings menu](docs/img/settings-graphics.png)
+
 | Option | Values (Vita default in bold) | What it does | Cost |
 | --- | --- | --- | --- |
 | **HD textures** | **Automatic**, Off, 2x pack, 4x pack | Replaces the game's textures with sharper ones from `texpack_2x.bin` or `texpack_4x.bin` in `ux0:data/infected/` (made from your own disc, see [`docs/BUILDING.md`](docs/BUILDING.md)). **Automatic** uses the 2x pack if it is there, else the 4x pack. Changes in a few seconds, no restart. Grey when no pack is installed. | 2x: Low (it holds 30 in mission 1). 4x: Medium |
@@ -59,6 +61,8 @@ are estimates.
 
 ## Performance page
 
+![The performance page of the settings menu](docs/img/settings-performance.png)
+
 | Option | Values (Vita default in bold) | What it does | Cost |
 | --- | --- | --- | --- |
 | **Frame limit** | 60 fps, **30 fps**, Off | The most pictures shown per second. **30** is the game's own rate on the PSP; a steady 30 looks smoother than a rate that jumps between 27 and 34. **60** lets the drawing run faster when it can, but the game itself still runs at 30, so the motion is no smoother. **Off** stops waiting for the screen's refresh, so the picture can tear; use it only to see what the Vita can do. | None |
@@ -71,6 +75,8 @@ are estimates.
 | **View distance** | **100%**, 150%, 200% | How far the world is drawn before the fog hides it. Changes at once. In mission 1 (a closed street) you mostly see less haze; in open levels more of the skyline stays visible. | 150 % and 200 %: Medium (estimate) |
 
 ## Controls page
+
+![The controls page of the settings menu](docs/img/settings-controls.png)
 
 | Option | Values (default in bold) | What it does |
 | --- | --- | --- |
