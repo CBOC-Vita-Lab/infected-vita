@@ -1,8 +1,8 @@
 import sys, glob, re, collections
-sys.path.insert(0, '/home/claude/assess/experiments')
+sys.path.insert(0, '/work/assess/experiments')
 import lean_gen as L
 cnt = collections.Counter()
-for p in sorted(glob.glob('/home/claude/infected/stats/s18/pc_f*.csv')):
+for p in sorted(glob.glob('/work/infected/stats/s18/pc_f*.csv')):
     n = int(re.search(r'pc_f(\d+)', p).group(1))
     if 3600 <= n <= 7600:
         for line in open(p):

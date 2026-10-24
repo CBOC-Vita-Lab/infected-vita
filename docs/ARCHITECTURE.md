@@ -2,8 +2,7 @@
 
 How the Vita port is put together, and the rules the parts agree on. This is the working contract the port was written to; it is kept as it was,
 so it uses the words of the development (workstreams, the recompiler's "lean" form) and describes the target as well as what exists:
-[Source Record](../SOURCE.md) and [Known Issues](../KNOWN-ISSUES.md) distinguish
-verified checks from pending work; [Building](BUILDING.md) explains the recipe.
+[`STATUS.md`](STATUS.md) says what has actually run, and [`BUILDING.md`](BUILDING.md) how the pieces are made.
 
 Target: the US version (ULUS-10054, 1.02) on a PS Vita at 960x544. The game's own rate is 30 fps (60 was the first goal and is out of reach: see `STATUS.md`).
 
@@ -144,8 +143,8 @@ file root, thread affinity, clock. No SDL, no Vulkan, no ImGui in the Vita build
 
 ## Rules for every workstream
 
-- Game-derived data (ISO, images, generated code, dumps, logs with game data) stays under `/home/claude/infected/`
-  or your own `/home/claude/ws/<name>/private/`. Never commit it.
+- Game-derived data (ISO, images, generated code, dumps, logs with game data) stays under `/work/infected/`
+  or your own `/work/ws/<name>/private/`. Never commit it.
 - Progress over ceremony: no evidence receipts. One meaningful check per milestone. But never fake a result: a stub
   that returns a plausible value is listed as a stub.
 - Keep a short factual log in a `LOG.md` of the workspace.

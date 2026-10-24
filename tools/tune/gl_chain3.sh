@@ -1,6 +1,6 @@
 #!/bin/bash
 # after gl_chain2.sh: the enemy density pictures of Mission_9A (private/swap/iso9a.iso)
-S=/home/claude/ws/tune
+S=/work/ws/tune
 while [ ! -f $S/private/shots9/s4A_200/flip_006100.png ]; do sleep 20; done
 sleep 20
 cd $S

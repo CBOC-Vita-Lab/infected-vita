@@ -3,7 +3,7 @@
 # Function starts: jal targets plus `addiu sp,sp,-N` prologues in the relocated image (work/image.bin).
 import sys, struct, bisect
 BASE = 0x08804000
-img = open('/home/claude/infected/work/image.bin', 'rb').read()
+img = open('/work/infected/work/image.bin', 'rb').read()
 n = len(img) // 4
 words = struct.unpack('<%dI' % n, img[:n*4])
 starts = set()

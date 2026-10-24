@@ -365,6 +365,7 @@ int thread_current_core() {
 }
 bool thread_set_core(Thread* t, int core) { pin(t ? t->th : pthread_self(), core); return true; }
 void core3_allow(bool) {}
+void core3_unlock_allow(bool) {}
 bool core3_usable() { return false; }
 int helper_core() { return 2; }
 bool thread_set_priority(Thread*, int) { return true; }   // no-op on the desktop

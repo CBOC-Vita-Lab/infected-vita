@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:58:42 +0000
+Subject: [PATCH 68/68] gl: a draw whose fragments all have alpha 0 and that
+ then changes nothing is not drawn
+
+Unlit draws whose vertex (or material) alpha is 0 everywhere, with a texture function that keeps
+or multiplies it, are skipped when the alpha test rejects alpha 0, or when they blend source
+alpha over the destination (1 - source alpha, or an additive fixed white) with no depth or stencil
+write and no alpha channel to change. prepare_draw() records an all-zero vertex alpha (3).
+settings.skip_invisible (on). Mission-1 dumps: 2.1 draws a frame skipped, 100 pictures
+byte-identical with the setting off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/gpu/gl/gl_renderer.cpp   | 60 ++++++++++++++++++++++++++++++++---
+ host/gpu/gl/gl_renderer.hpp   |  5 +++
+ tools/ge_replay/ge_replay.cpp |  1 +
+ 3 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 2e7e6de..45a98dd 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -2327,6 +2327,48 @@ struct GlRenderer::Impl {
+         return use_material ? (call.material_color >> 24u) == 0xFFu : vertices_opaque(call);
+     }
+ 
++    // ---- draws that change nothing (settings.skip_invisible) -------------------------------------------------------
++
++    // Every fragment of an unlit draw has alpha 0: the vertex colours' (or the material's) alpha is 0 everywhere, and the
++    // texture function multiplies it or keeps it (all but replace with the texel's alpha).
++    static bool fragment_alpha_is_0(const DrawCall &call) {
++        if (call.texture.enabled && call.texture.alpha_from_texture && call.texture.function == 3u) return false;
++        const bool use_material = !call.has_vertex_color && !call.lighting_enabled;
++        if (use_material) return (call.material_color >> 24u) == 0u;
++        return call.prepared_vertex_alpha == 3u;   // prepare_draw() saw every vertex alpha at 0 (raw vertices: not known)
++    }
++
++    // A draw whose fragments all have alpha 0 leaves every buffer as it was: the alpha test rejects alpha 0, or it
++    // blends source alpha / one minus source alpha (the destination unchanged), writes no depth or stencil, and the
++    // alpha it would write (GL writes the source's, 0) is masked or lands on a target with no alpha.
++    bool writes_nothing_at_alpha_0(const DrawCall &call, bool alpha_enabled, const Target &target) const {
++        if (alpha_enabled) {
++            const std::uint32_t ref = call.alpha_test.reference & call.alpha_test.mask;
++            bool rejects = false;
++            switch (call.alpha_test.function) {
++            case 0u: rejects = true; break;          // never
++            case 2u: rejects = ref != 0u; break;     // equal
++            case 3u: rejects = ref == 0u; break;     // not equal
++            case 4u: rejects = ref == 0u; break;     // less: 0 < ref
++            case 6u: rejects = true; break;          // greater: 0 > ref
++            case 7u: rejects = ref != 0u; break;     // greater or equal
++            default: break;                          // always, less or equal
++            }
++            if (rejects) return true;
++        }
++        if (!settings.blend || !call.blend.enabled || call.blend.equation != 0u) return false;
++        // Source SRC_ALPHA, destination 1 - SRC_ALPHA or a fixed white (additive): the destination comes out unchanged.
++        const bool keeps_destination = call.blend.destination_factor == 3u ||
++                                       (call.blend.destination_factor == 10u && (call.blend.fixed_destination & kWhite) == kWhite);
++        if (call.blend.source_factor != 2u || !keeps_destination) return false;
++        const bool depth_writes = settings.depth_test && call.depth.test_enabled && call.depth.write_enabled &&
++                                  (!call.through || settings.through_depth);
++        if (depth_writes) return false;
++        if (call.stencil.enabled) return false;
++        const bool alpha_kept = (call.pixel_mask_alpha & 0xFFu) == 0xFFu || target.format == 0u;   // 5650 has no alpha
++        return alpha_kept;
++    }
++
+     static bool texel_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured) {
+         if (!textured || !call.texture.alpha_from_texture || call.texture.function == 1u) return true;  // decal keeps the colour's
+         if (binding.opaque) return true;   // the shader sets the texel's alpha to 1
+@@ -2683,6 +2725,11 @@ struct GlRenderer::Impl {
+         }
+         bool alpha_test = alpha_enabled && call.alpha_test.function != 1u;
+         const bool lit = call.lighting_enabled && settings.lighting && !through;
++        if (settings.skip_invisible && !lit && fragment_alpha_is_0(call) && writes_nothing_at_alpha_0(call, alpha_enabled, target)) {
++            ++st().invisible_skipped;
++            ++st().skipped_draws;
++            return;
++        }
+         const bool fogged = call.fog.enabled && settings.fog && !through;
+ 
+         TextureBinding binding;
+@@ -3146,6 +3193,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "fill_test") settings.fill_test = flag;
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
++    else if (name == "skip_invisible") settings.skip_invisible = flag;
+     else if (name == "ui_upscale") settings.ui_upscale = flag;
+     else if (name == "prewarm") settings.prewarm = flag;
+     else if (name == "variant_dir") settings.variant_dir = value;
+@@ -3176,7 +3224,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+@@ -3268,9 +3316,13 @@ void GlRenderer::submit(const DrawCall &call, const GuestMemory &memory) { impl_
+ 
+ void GlRenderer::prepare_draw(DrawCall &call) const {
+     // Whether every vertex is opaque (for the alpha-test elision of submit()).
+-    std::uint32_t all = 0xFFFFFFFFu;
+-    for (const Vertex &vertex : call.vertices) all &= vertex.color;
+-    call.prepared_vertex_alpha = (all >> 24u) == 0xFFu ? 1u : 2u;
++    std::uint32_t all = 0xFFFFFFFFu, any = 0u;
++    for (const Vertex &vertex : call.vertices) {
++        all &= vertex.color;
++        any |= vertex.color;
++    }
++    // 1: all opaque, 3: all at alpha 0 (an invisible draw, see skip_invisible), 2: neither.
++    call.prepared_vertex_alpha = (all >> 24u) == 0xFFu ? 1u : ((any >> 24u) == 0u && !call.vertices.empty() ? 3u : 2u);
+     // Only transformed draws: through-mode strips keep their shape for the sprite and picture clamps of submit().
+     if (call.through || (call.primitive != PrimitiveType::TriangleStrip && call.primitive != PrimitiveType::TriangleFan))
+         return;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index d1d1d6e..fb24020 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -73,6 +73,10 @@ struct GlSettings {
+     // An alpha test that a draw's fragments cannot fail (every alpha is 255: opaque vertices or material, an opaque
+     // texture) is dropped, so the program has no discard. The picture is the same.
+     bool alpha_elide{true};
++    // A draw whose every fragment has alpha 0 and that then changes nothing (the alpha test rejects alpha 0, or it blends
++    // as source alpha / one minus source alpha onto a target whose alpha is not written or not kept) is not drawn.
++    // Games fade sprites and effects out by their alpha and keep sending them; the picture is the same.
++    bool skip_invisible{true};
+     // A small texture that only 2D draws sample (a HUD icon, a button glyph) and that looks like pixel art (a palette
+     // texture, or few colours) is uploaded at twice its size, made by MMPX (mmpx.hpp), so it is not blurred when the
+     // picture is drawn at 2x. The guest's texture and its coordinates are unchanged. Costs a CPU pass once per texture.
+@@ -198,6 +202,7 @@ struct GlStats {
+     std::uint64_t sharp_draws{};        // full-screen pictures enlarged bicubically (gfx.movie_filter=sharp)
+     std::uint64_t mip_draws{};          // 3D draws sampled with mips
+     std::uint64_t pixel_lit_draws{};    // draws lit per fragment
++    std::uint64_t invisible_skipped{};  // draws with every fragment at alpha 0 that changed nothing: not drawn
+     std::uint64_t alpha_elided{};       // alpha-tested draws whose every fragment has alpha 255: drawn without the test
+     std::uint64_t ui2x_textures{};      // textures uploaded at twice their size (settings.ui_upscale)
+     std::uint64_t ui2x_us{};            // ... and the microseconds the MMPX passes took
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 6b87775..0a9546f 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1054,6 +1054,7 @@ int main(int argc, char **argv) {
+         line("approximated blends", t.unsupported_blend);
+         line("3D draws made smooth", t.smooth_draws);
+         line("alpha tests dropped (alpha 255)", t.alpha_elided);
++        line("invisible draws skipped (alpha 0)", t.invisible_skipped);
+         line("textures uploaded at 2x (MMPX)", t.ui2x_textures);
+         line("... microseconds spent on them", t.ui2x_us);
+         line("... passes put off by the budget", t.ui2x_deferred);
+-- 
+2.43.0
+

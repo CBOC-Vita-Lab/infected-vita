@@ -2,7 +2,7 @@
 # minimap_measure.sh : replays the recorded flips of a level where the minimap palette animates (scripts/minimap_record.sh) with the
 # guard of the previous build ("before"), no guard ("off") and the new per-slot guard ("after"), at 2x, full 4x and the mixed pack as 4x.
 # Output private/mm/<tag>_<mode>.txt ; summary: scripts/minimap_summary.py
-cd /home/claude/ws/all/private
+cd /work/ws/all/private
 export EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1
 GE=${GE:-mm/ge_Mission_5A}
 OLD=./bin/ge_replay_before; NEW=../build/desktop/bin/ge_replay

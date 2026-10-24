@@ -5,7 +5,7 @@
 # Usage: run_synth.sh [TRIALS=60] [VFPU_SEEDS="1 2 3"]
 # Output: private/synth_*/  (generated corpora and harness binaries); the result lines go to stdout.
 set -e
-W=${LEAN_WS:-/home/claude/ws/lean}
+W=${LEAN_WS:-/work/ws/lean}
 REC=$W/proj/recomp
 TRIALS=${1:-60}
 SEEDS=${2:-"1 2 3"}

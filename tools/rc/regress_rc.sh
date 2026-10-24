@@ -2,11 +2,11 @@
 # regress_rc.sh SET... : release-candidate replay regression. Replays each GE dump set with the merged build at ORIGINAL options
 # (--port baseline: every option off), once on the calling thread and once with --threaded, and compares the md5 of every picture
 # with private/regress/<set>/integ.md5 (the integration baseline from before the options existed). Pictures are deleted afterwards.
-M=${M:-/home/claude/ws/all/build/desktop/bin/ge_replay}
+M=${M:-/work/ws/all/build/desktop/bin/ge_replay}
 for SET in "$@"; do
-  D=/home/claude/ws/render/private/dumps/$SET
-  OUT=/home/claude/ws/all/private/regress_rc/$SET
-  BASE=/home/claude/ws/all/private/regress/$SET/integ.md5
+  D=/work/ws/render/private/dumps/$SET
+  OUT=/work/ws/all/private/regress_rc/$SET
+  BASE=/work/ws/all/private/regress/$SET/integ.md5
   mkdir -p $OUT
   for mode in merged merged_thr; do
     opts=(--port baseline); [ $mode = merged_thr ] && opts+=(--threaded)

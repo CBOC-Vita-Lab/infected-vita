@@ -209,7 +209,7 @@ Determinism check: `bo200x100` run twice gives identical counters to the last di
   `INFECTED_TUNE_NPCS=flip:count`, `INFECTED_TUNE_DUMP=flip:addr:words`, `INFECTED_TUNE_VIEW_RAW=k` (unclamped view factor), `INFECTED_TUNE_GOD=1`, `INFECTED_TUNE_SUPPLY=k`, `INFECTED_TUNE_KILL=from:age[:per]`
   with `INFECTED_TUNE_KILL_DMG` and `INFECTED_TUNE_KILLWATCH`.
 * Another level through the mission-1 entry (the disc is not modified): `iso_swap.py` of the texture work (`--redirect .../Mission_1A.stream.zpm .../Mission_9A.stream.zpm` on a COPY of the disc), then `DISC=<copy>` for `tools/tune/run.sh`.
-* Reproduce (workspace `/home/claude/ws/tune`, build in `build/`, private data in `private/`; every command nice'd, one run at a time on this machine):
+* Reproduce (workspace `/work/ws/tune`, build in `build/`, private data in `private/`; every command nice'd, one run at a time on this machine):
   * `tools/sustain.sh g200 200 INFECTED_TUNE_GOD=1` then `python3 tools/summ.py g200` (mission 1, 30000 flips; no god: omit the variable; `Mission_9A`: `DISC=$PWD/private/swap/iso9a.iso FRAMES=20000 tools/sustain.sh m200 200 INFECTED_TUNE_GOD=1`)
   * `tools/bench_one.sh bo200x100 200 100` (density 200, view 100; add `mission9a` as 4th argument for `Mission_9A`), `tools/raw_bench.sh rbo0.25 0.25` (far forced to a quarter)
   * `tools/shots.sh sd200 5800,6200,6600,7000 7100 INFECTED_PERF_ENEMY_DENSITY=200 INFECTED_TUNE_GOD=1`, `tools/sheet.py OUT.png TITLE "label=a.png,b.png,c.png" --cols 100%,150%,200% --diff`

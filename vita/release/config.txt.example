@@ -53,9 +53,14 @@
 #perf.view_distance=200
 
 # ---- Other ------------------------------------------------------------------------------------------------------------
-# The Vita's fourth CPU core belongs to the system. With a plugin that lets games use it (CapUnlocker) the game puts its helper
-# threads (sound output, movie decoding, the graphics library's clean-up) there. Without the plugin nothing changes. 0 = never.
+# The Vita's fourth CPU core belongs to the system. The game unlocks it for itself (a small kernel module inside the package, loaded
+# when the game starts and unloaded when it quits; firmware 3.60 to 3.74 only; nothing to install) and puts its helper threads
+# (sound output, movie decoding, the graphics library's clean-up) there. A console with CapUnlocker installed needs no module.
+# core3=0: never use the fourth core. core3_unlock=0: use it only where a plugin already allows it (the package's module is not loaded).
+# If a start that loaded the module never finished, the file core3_unlock.pending stays in this folder and the module is not loaded
+# again until it is deleted.
 #core3=0
+#core3_unlock=0
 # The sound output follows the speed the game produces sound at, so a slightly fast or slow game never makes a gap. 0 = fixed rate.
 #audio_follow=0
 # The HUD's small pixel-art pictures (button glyphs, icons) are drawn from a copy made twice as large by the MMPX filter, so they
@@ -69,6 +74,12 @@
 # 3D draws leave out the vertex fields their shader does not read (24 or 36 bytes a vertex instead of 40: about 15 % fewer vertex bytes
 # in a mission). The picture is the same. On by default; 0 = write the whole vertex.
 #gl_compact_vertices=0
+# Draws whose every pixel is fully transparent (a sprite or effect the game has faded out) are not sent to the GPU. The picture is the
+# same. On by default; 0 = draw them anyway.
+#gl_skip_invisible=0
+# The game's ATRAC3plus music and voices are decoded one frame ahead on the helper core (core 3 when available), not on the game's own
+# core (about 3 ms a frame there). The sound is the same. On by default; 0 = decode on the game's core.
+#atrac_ahead=0
 # How many scenes a frame the GPU's render targets are created for (the game draws into some targets twice a frame). Default 4; 0 = the
 # library's own default of 1. If a version stutters or runs out of memory, 0 is the first thing to try.
 #gl_rt_scenes=4

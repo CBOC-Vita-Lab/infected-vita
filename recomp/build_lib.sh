@@ -12,6 +12,9 @@
 #   VITASDK      Vita SDK root (required for the vita target)
 #   LEAN_EXTRA   extra compiler flags, e.g. -DLEAN_NO_HOOKS or -DLEAN_CHECK_VFPU_ENTRY
 #   LEAN_OPT     optimisation level (default -O2)
+#   LEAN_LTO=1   vita: link-time optimisation objects (GCC GIMPLE, archived with gcc-ar as liblean_vita_lto.a). The application
+#                then links with -DINFECTED_LEAN_LTO=ON, which inlines across the 73 units at link time (the generated functions
+#                are small and call across units all the time). Objects go to OUT/lto.
 #
 # The flags are the contract: -ffp-contract=off (no fused multiply-add; the guest has none), -fno-math-errno, no exceptions/RTTI.
 # vita: Cortex-A9 + NEON + hard float, Thumb-2.  x86: the scalar fallback of the NEON forms (no LEAN_NEON_SHIM).
@@ -32,6 +35,11 @@ case $TARGET in
     CXX=$SDK/bin/arm-vita-eabi-g++
     AR=$SDK/bin/arm-vita-eabi-ar
     FLAGS="$COMMON -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb"
+    if [ "${LEAN_LTO:-0}" = 1 ]; then
+      AR=$SDK/bin/arm-vita-eabi-gcc-ar
+      FLAGS="$FLAGS -flto"
+      SUFFIX=_lto
+    fi
     ;;
   x86)
     CXX=${CXX:-g++}
@@ -40,6 +48,7 @@ case $TARGET in
     ;;
   *) echo "unknown target $TARGET" >&2; exit 2 ;;
 esac
+[ -n "${SUFFIX:-}" ] && OUT=$OUT/lto
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 for f in "$GEN"/lean_[0-9]*.cpp "$GEN"/lean_table.cpp; do
@@ -48,6 +57,6 @@ for f in "$GEN"/lean_[0-9]*.cpp "$GEN"/lean_table.cpp; do
     echo "$f"
   fi
 done | nice -n 10 xargs -P "$JOBS" -I{} sh -c 'f={}; o='"$OUT"'/$(basename $f .cpp).o; s=$(date +%s); '"$CXX $FLAGS"' -c $f -o $o || exit 255; echo "$(basename $f) $(( $(date +%s) - s ))s" >> '"$OUT"'/compile_times.txt'
-rm -f "$OUT/liblean_$TARGET.a"
-"$AR" rcs "$OUT/liblean_$TARGET.a" "$OUT"/lean_[0-9]*.o "$OUT"/lean_table.o
-echo "built $OUT/liblean_$TARGET.a"
+rm -f "$OUT/liblean_$TARGET${SUFFIX:-}.a"
+"$AR" rcs "$OUT/liblean_$TARGET${SUFFIX:-}.a" "$OUT"/lean_[0-9]*.o "$OUT"/lean_table.o
+echo "built $OUT/liblean_$TARGET${SUFFIX:-}.a"

@@ -1,92 +1,69 @@
-# Install
+# Install Infected on a PS Vita
 
-For the desktop app and matching ZIP, see [Desktop Install](DESKTOP-INSTALL.md).
-The manual method below remains available. Private preview access is required.
+You need a Vita (or PS TV) with HENkaku or ensō and VitaShell, your own copy of the PSP game **Infected** (US version, ULUS-10054,
+1.02) as an ISO file, and an `infected.vpk` that you built from that copy.
 
-Use your owner-built `INFC00001` VPK or your existing private-preview bundle.
-[Start Here](START-HERE.txt) is the short version.
+**There is no VPK to download.** The package contains code translated from the game, so it cannot be shared. Building one from your own
+disc is a one-time job on a PC: [`docs/BUILDING.md`](docs/BUILDING.md). The rest of this page starts from a finished `infected.vpk`.
 
-## You Need
+## Three steps
 
-- A homebrew-enabled PS Vita and VitaShell.
-- Your own **Infected USA, `ULUS-10054`, version 1.02** ISO.
-- Your [owner-built VPK](BUILDING.md), application ID **`INFC00001`**.
-  The ready-made private candidate is for the original owner's use only.
-- A legitimately obtained shader compiler module at
-  `ur0:data/libshacccg.suprx`. It is not included.
+1. **Install the app.** Copy `infected.vpk` to the Vita (USB or FTP), open it in VitaShell and press **CROSS**. An **Infected** bubble
+   appears on the home screen (original artwork by default, or pictures made from your own disc: `docs/BUILDING.md`).
+2. **Add your game.** Copy your Infected ISO into **`ux0:data/infected/`**. Any file name that ends in `.iso` works.
+   (If the folder is not there yet, start the app once. It makes the folder and tells you what is missing.)
+3. **Play.** Open the bubble.
 
-## Installation
+That is all.
 
-1. Build `dist/infected.vpk`, or use your existing private install bundle.
-   If using that bundle, extract the ZIP and [check it](CHECK-DOWNLOAD.md).
-   Leave the VPK intact. Copy it through VitaShell USB or FTP to `ux0:VPK/`
-   (create that folder if needed), then end the transfer. In VitaShell,
-   highlight the VPK, use the confirm button (usually Cross), and confirm
-   installation.
-2. Copy your ISO to **`ux0:data/infected/Infected.iso`**.
-3. Open the Infected bubble.
+## Getting ready
 
-Use the filename above to avoid folder and naming problems.
+* **A hacked Vita.** [HENkaku](https://henkaku.xyz/) or Ensō, and [VitaShell](https://github.com/TheOfficialFloW/VitaShell/releases).
+  The guide at [vita.hacks.guide](https://vita.hacks.guide/) walks through it for every firmware.
+* **The ISO.** Make it from your own UMD, for example with a PSP running custom firmware (its USB connection can share the UMD as an
+  `.iso`). Only the US release works: ULUS-10054, version 1.02.
 
-```text
-ux0:data/infected/
-  Infected.iso          your supported disc image
-  ms0/                  keep existing game saves
-  settings.txt          keep existing settings
-  texpack_2x.bin         optional compatible user-generated pack
-  texpack_4x.bin         optional mixed Vita pack, not the all-4x pack
-```
+## Before the first start
 
-The app creates its own save/settings files; do not download starter saves
-or copy these labels as empty files. Do not nest another `infected/` folder.
+* The Vita needs **`libshacccg.suprx` in `ur0:data/`**: Sony's shader compiler, taken from your own console. The usual way is
+  [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D): install it, run it once, and it puts the file in place. Every game that
+  runs on vitaGL needs it, so you may have it already.
+* About **600 MB free on `ux0:`** for the ISO, plus 72 MB (2x pack) or 102 MB (4x pack) if you use HD textures.
+* The first start takes a little longer: the game prepares its shaders during the opening logos (about 1.5 s on a Vita) and keeps them in
+  `ux0:data/infected/shader_cache`, so missions don't pause on them later.
 
-## Optional HD Textures
+## Optional
 
-Normal installation does **not** require HDcube, model weights or an HD
-download. To add textures generated from your own dump, see
-[HD Textures](HD-TEXTURES.md). Put a compatible `texpack_2x.bin` or mixed
-Vita `texpack_4x.bin` in `ux0:data/infected/`, not in the app folder.
+* **Sharper textures.** Copy `texpack_2x.bin` (and, if you like, `texpack_4x.bin`, the mixed 4x pack) into `ux0:data/infected/`. You make
+  them from your own disc with `tools/texpack/build_packs.sh` (a couple of hours on a PC; see `tools/texpack/README.md`). The game
+  picks them up by itself (settings menu, "HD textures").
+* **500 MHz.** The Vita's retail limit is 444 MHz. With PSVshellPlus installed, copy `vita/psvshell/INFC00001` to
+  `ur0:data/PSVshell/profiles/INFC00001` (see `vita/psvshell/README.md`); the log then says `the ARM core measures 49x MHz`. Without it the game
+  runs at 444 MHz. 500 MHz is outside Sony's specification: your choice.
+* **RetroFlow.** If you use the RetroFlow launcher, the app puts its cover and background into `ux0:data/RetroFlow/` the first time it
+  starts (only if RetroFlow is installed and you have no picture of your own for it). RetroFlow shows them the next time it refreshes
+  its list. To use the game's own art instead, see `docs/BUILDING.md` (`art_from_disc.py`, made from your own disc, kept on your machine).
 
-The included builder downloads the model from its author. See the HD guide
-for the one-command preparation and optional manual setup.
+## If something is wrong
 
-## Update And Back Up
+The boot screen says what is missing:
 
-| Item | What To Do |
+| It says | Do this |
 | --- | --- |
-| Matching `INFC00001` VPK | Install with VitaShell; never copy individual app files by hand. |
-| `Infected.iso` | Keep your existing supported ISO; an app update does not need another copy. |
-| `ms0/` and `settings.txt` | Keep and back up; never replace with a test profile. |
-| Optional texture packs | Keep. Replace only for an intentional compatible pack update, after backup. |
-| `libshacccg.suprx` | Keep your legitimate module in `ur0:data/`; not part of this update. |
+| *No disc image found* | Step 2: the ISO must be inside `ux0:data/infected/` and end in `.iso`. |
+| *not the one this build was generated from* | Your ISO is another version or game. You need the US version, ULUS-10054, 1.02, and the VPK must have been built from that same disc. |
+| *libshacccg.suprx not found* | Put Sony's shader compiler, `libshacccg.suprx`, into `ur0:data/`. |
 
-If a computer copy operation asks to replace the whole data folder, cancel
-and check the destination. Do not use automatic folder synchronization.
+Anything else: play for a minute, leave the game (hold **START + SELECT + L + R** for a second) and look at `ux0:data/infected/log.txt`.
+It lists the settings, the clock, the memory, and ends with `clean exit` after a normal run.
 
-Exit the app, then back up **`ux0:data/infected/`**, particularly `ms0/`
-(game saves) and `settings.txt`. Install the new VPK with the same
-`INFC00001` ID. Keep the backup until the game starts, your settings remain
-and a saved game loads. Do not delete saves or apply a test config as an
-update step.
+## Controls
 
-This runtime has a one-time migration from an older 444 MHz setting to a
-500 MHz request. Check the CPU clock option after updating and preserve
-`cpu_clock_500.done` with your backup. See [Settings](docs/SETTINGS.md).
-No kernel-plugin or clock-profile installation is part of these instructions.
+The Modern layout (default) fires with **R**, locks on with **L** and opens the map with the right stick; [CONTROLS.md](CONTROLS.md) has it all.
+Hold **SELECT + START** for half a second (or tap the top-right corner of the touch screen) for the settings menu
+([SETTINGS.md](SETTINGS.md)). Hold **START + SELECT + L + R** to leave the game.
 
-Removing the bubble is separate from deleting the data folder. Back up
-before either operation; deleting the data folder removes the ISO, packs,
-settings and saves stored there.
+## Update, remove
 
-## Troubleshooting
-
-| Boot Problem | Check |
-| --- | --- |
-| No disc image | Exact folder and `Infected.iso` filename; not a compressed archive. |
-| Wrong executable | Use your supported USA 1.02 dump; renaming another revision will not fix it. |
-| Missing shader compiler | Check the legitimate module setup and exact `ur0:` path above. |
-| HD option unavailable | First run without HD, then check the compatible pack's name and location. |
-
-Report the build and relevant error text, not your ISO, saves or an unreviewed
-full log. [Controls](CONTROLS.md) are checked against the recovered source.
-Build-specific notes are in [Known Issues](KNOWN-ISSUES.md).
+* **Update:** install the new `infected.vpk` over the old one. Your saves and settings are in `ux0:data/infected/`, which the package does not touch.
+* **Remove:** delete the bubble in VitaShell. To remove the game's files and saves too, delete `ux0:data/infected/`.

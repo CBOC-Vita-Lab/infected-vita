@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
@@ -20,6 +21,8 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/modulemgr.h>
+#include <taihen.h>
 #include <psp2/power.h>
 #include <psp2/touch.h>
 
@@ -36,6 +39,9 @@ static int prio_abs(int rel) { return 0x10000100 + clampi(rel, -32, 31); }
 static const int kCpu3Mask = 0x80000;   // CPU 0..2 are 0x10000 << n (SCE_KERNEL_CPU_MASK_USER_n); CPU 3 follows the same pattern
 static int g_core3_state = -1;           // -1: not probed yet, 0: no, 1: usable
 static bool g_core3_allowed = true;
+static bool g_core3_unlock_allowed = true;
+static SceUID g_core3_module = -1;        // infected_core3.skprx while this application has it loaded
+static bool g_core3_wrote_pending = false;
 static int core_mask(int core);
 
 // Starts a thread on the CPU 3 mask and reads back where it ran: the plugin lifting the restriction lets the call through, without
@@ -65,10 +71,80 @@ static bool core3_probe() {
     return usable;
 }
 
+// The package's own kernel module (vita/core3/core3.c) that lets the CPU 3 mask through: loaded from app0: through taiHEN, which every
+// HENkaku/Ensō console has, so nothing has to be installed. It starts only on firmware 3.60 to 3.74 (it checks the real version itself)
+// and is unloaded by shutdown(). A console that already allows core 3 (CapUnlocker installed) never loads it.
+// A start that loads the module leaves core3_unlock.pending in the data folder until the fourth core has been seen working; a start that
+// finds the file (the previous one never got that far) does not load the module again, so a console the module upsets keeps starting.
+// Deleting the file tries again.
+static const char kCore3Pending[] = "core3_unlock.pending";
+static bool core3_unlock() {
+    if (file_exists(Root::Data, kCore3Pending)) {
+        logf("core3: %s is there (an earlier start loaded the core-3 module and did not finish): not loading it", kCore3Pending);
+        return false;
+    }
+    // The module patches one firmware build's code: it is only offered to the systems it was made for (3.60-3.74, which the
+    // module checks again itself). Anything else (another firmware, or an emulator that answers with nothing) is left alone.
+    SceKernelSystemSwVersion version;
+    memset(&version, 0, sizeof(version));
+    version.size = sizeof(version);
+    const int vrc = sceKernelGetSystemSwVersion(&version);
+    version.versionString[sizeof(version.versionString) - 1] = '\0';
+    if (vrc < 0 || version.version < 0x03600000u || version.version >= 0x03750000u) {
+        logf("core3: system software 0x%08X (rc 0x%08X) is not one the core-3 module is made for: not loading it",
+             (unsigned)version.version, (unsigned)vrc);
+        return false;
+    }
+    logf("core3: system software %s (0x%08X)", version.versionString, (unsigned)version.version);
+    g_core3_wrote_pending = file_write_all(Root::Data, kCore3Pending, "1\n", 2);
+    // The kernel cannot see app0: (a mount of this process only: 23 Oct console, 0x80010013), so the module is loaded from the
+    // application's real folder, ux0:app/<title id>/.
+    char title[16] = {0};
+    char path[96];
+    SceIoStat st;
+    if (sceAppMgrAppParamGetString(0, 12, title, sizeof(title)) >= 0 && title[0] != '\0') {
+        snprintf(path, sizeof(path), "ux0:app/%s/module/infected_core3.skprx", title);
+        if (sceIoGetstat(path, &st) < 0) snprintf(path, sizeof(path), "app0:module/infected_core3.skprx");
+    } else {
+        snprintf(path, sizeof(path), "app0:module/infected_core3.skprx");
+    }
+    logf("core3: loading %s", path);
+    const SceUID id = taiLoadStartKernelModule(path, 0, nullptr, 0);
+    if (id < 0) {
+        logf("core3: the package's core-3 module did not start (0x%08X): helper threads stay on core 2", (unsigned)id);
+        return false;
+    }
+    g_core3_module = id;
+    logf("core3: the package's core-3 module is loaded (id 0x%08X)", (unsigned)id);
+    return true;
+}
+
+static void core3_release() {
+    if (g_core3_module < 0) return;
+    int status = 0;
+    const int rc = taiStopUnloadKernelModule(g_core3_module, 0, nullptr, 0, nullptr, &status);
+    logf("core3: the package's core-3 module is unloaded (rc 0x%08X)", (unsigned)rc);
+    g_core3_module = -1;
+}
+
 void core3_allow(bool allowed) { g_core3_allowed = allowed; }
+void core3_unlock_allow(bool allowed) { g_core3_unlock_allowed = allowed; }
 bool core3_usable() {
     if (!g_core3_allowed) return false;
-    if (g_core3_state < 0) g_core3_state = core3_probe() ? 1 : 0;
+    if (g_core3_state < 0) {
+        bool usable = core3_probe();
+        if (!usable && g_core3_unlock_allowed && core3_unlock()) {
+            usable = core3_probe();
+            if (!usable) core3_release();   // loaded but the mask is still refused: nothing gained, nothing left behind
+        }
+        // This start loaded the module and lived through the probe: the next one may load it again. (A file an earlier start left
+        // behind stays: core3_unlock() saw it and loaded nothing.)
+        if (g_core3_wrote_pending) {
+            file_remove(Root::Data, kCore3Pending);
+            g_core3_wrote_pending = false;
+        }
+        g_core3_state = usable ? 1 : 0;
+    }
     return g_core3_state == 1;
 }
 int helper_core() { return core3_usable() ? 3 : 2; }
@@ -754,6 +830,7 @@ bool init(const InitParams& p) {
 
 void shutdown() {
     audio_close();
+    core3_release();
     logf("platform shutdown");
     log_lock();
     if (g_log_fd >= 0) { sceIoClose(g_log_fd); g_log_fd = -1; }

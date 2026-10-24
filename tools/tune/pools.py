@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pools.py: print the allocator pool table the game builds at 0x08892BF0 (name id elem count align)."""
 import re,struct,sys
-img=open('/home/claude/infected/work/image.bin','rb').read(); base=0x08804000
+img=open('/work/infected/work/image.bin','rb').read(); base=0x08804000
 def cstr(a):
     o=a-base; e=img.index(b'\0',o); return img[o:e].decode('latin1')
 start=int(sys.argv[1],16) if len(sys.argv)>1 else 0x08892bf0
@@ -9,7 +9,7 @@ end=int(sys.argv[2],16) if len(sys.argv)>2 else 0x08893000
 name=None; ids=None; idv=None; elem=None; cnt=None; lui5=None
 rx=re.compile(r'^([0-9a-f]{8}): (\S+)\s*(.*)$')
 cur=[]
-for l in open('/home/claude/ws/tune/private/dis/image.txt'):
+for l in open('/work/ws/tune/private/dis/image.txt'):
     m=rx.match(l)
     if not m: continue
     a=int(m.group(1),16)

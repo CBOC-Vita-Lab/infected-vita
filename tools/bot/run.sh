@@ -7,7 +7,7 @@
 #              PACKS (directory with texpack_2x.bin / texpack_4x.bin, linked into the data directory), SETTINGS (text for the data directory's
 #              settings.txt, e.g. "gfx.hd_textures=4x\nperf.enemy_density=200"), HDMOVIES (a movies_hd directory, linked as movies_hd),
 #              THREADED=0 (INFECTED_PERF_THREADED_RENDERER=off; the default is the threaded renderer, as the port ships).
-W=${BOT_WS:-/home/claude/ws/bot}
+W=${BOT_WS:-/work/ws/bot}
 N=$1; T=$2; shift 2
 BIN=${BIN:-$W/build/bin/InfectedNative}
 MS=${MS0:-ms0.pristine}

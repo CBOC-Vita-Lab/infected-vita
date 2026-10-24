@@ -3,13 +3,13 @@
 agent recorded under the interpreter (stats/s18/pc_f*.csv, one file per 200 flips; counts are executed guest instructions).
 usage: dyn_profile.py FIRST_FLIP LAST_FLIP   (phase files whose label lies in [FIRST, LAST])"""
 import bisect, collections, glob, json, os, re, sys
-sys.path.insert(0, '/home/claude/assess/experiments')
+sys.path.insert(0, '/work/assess/experiments')
 import lean_gen as L
 import insncount
 
 lo, hi = int(sys.argv[1]), int(sys.argv[2])
 files = []
-for p in sorted(glob.glob('/home/claude/infected/stats/s18/pc_f*.csv')):
+for p in sorted(glob.glob('/work/infected/stats/s18/pc_f*.csv')):
     n = int(re.search(r'pc_f(\d+)', p).group(1))
     if lo <= n <= hi: files.append((n, p))
 flips = 200 * len(files)
@@ -52,7 +52,7 @@ for k, v in dyn.most_common(): print('  %-48s %6.2f%%  (%d)' % (k, 100.0 * v / t
 
 # ARM cost per function from the nomask objects
 armi = {}; armb = {}
-for o in sorted(glob.glob('/home/claude/assess/experiments/lean_all/lean_*_nomask.o')):
+for o in sorted(glob.glob('/work/assess/experiments/lean_all/lean_*_nomask.o')):
     per, _, _ = insncount.count(o, r'f_[0-9A-F]{8}')
     for name, (n, b) in per.items():
         m = re.search(r'f_([0-9A-F]{8})', name)
@@ -91,4 +91,4 @@ rows = [(c, s) for s, c in dyn_fn.items() if s in good]
 for c, s in sorted(rows, reverse=True)[:12]:
     print('  %08x %6.2f%%  words=%d arm_insns=%s' % (s, 100.0 * c / total, len(fns[s].pcs), armi.get(s)))
 json.dump(dict(flips=flips, total=total, per_flip=total / flips, cover={k: v / total for k, v in dyn.items()}, mix={k: v / total for k, v in cls.items()}),
-          open('/home/claude/assess/experiments/dyn_profile_%d_%d.json' % (lo, hi), 'w'), indent=1)
+          open('/work/assess/experiments/dyn_profile_%d_%d.json' % (lo, hi), 'w'), indent=1)

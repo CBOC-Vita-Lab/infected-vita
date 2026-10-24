@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:58:42 +0000
+Subject: [PATCH 67/68] atrac: the frame after the one DecodeData handed out is
+ decoded ahead on the decode-ahead thread
+
+The next DecodeData then copies samples instead of running FFmpeg's ATRAC3plus decoder on the
+guest's core (about 3 ms a frame on the Vita in mission 1). The job uses the context's own decoder
+in order, so its state is the one decoding in the caller makes; any other request, or bytes that
+changed since the job copied them, take the old path, which reseeds the decoder. The thread
+comes from the movie decoder's platform (core 3 when the system allows it). <PREFIX>_ATRAC_AHEAD=0
+decodes in the caller as before. TRACE_ATRAC lines carry a hash of the samples handed out.
+
+Desktop, mission-1 bot, virtual clock: 83,709 DecodeData calls with identical sample hashes with
+and without decoding ahead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/hle/hle_atrac.cpp     | 220 ++++++++++++++++++++++++++++++++++---
+ host/movie/avc_decoder.cpp |   1 +
+ host/movie/avc_decoder.hpp |   2 +
+ 3 files changed, 210 insertions(+), 13 deletions(-)
+
+diff --git a/host/hle/hle_atrac.cpp b/host/hle/hle_atrac.cpp
+index 4129deb..8e417f2 100644
+--- a/host/hle/hle_atrac.cpp
++++ b/host/hle/hle_atrac.cpp
+@@ -15,11 +15,15 @@
+ #include "hle_common.hpp"
+ 
+ #include "audio/atrac_decoder.hpp"
++#include "movie/avc_decoder.hpp"
+ 
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <cstring>
++#include <mutex>
+ #include <cstdlib>
+ #include <iostream>
+ #include <memory>
+@@ -79,6 +83,122 @@ struct TrackInfo {
+     std::uint32_t skip{};         // decoded samples before position 0
+ };
+ 
++// ---- decode-ahead
++// After DecodeData has handed out a frame, the frame after it is decoded on the
++// decode-ahead core (the movie decoder's thread platform: core 3 when the system
++// allows it, else beside the display-list walker) while the guest runs on. The
++// next DecodeData then only copies samples. The job decodes with the context's
++// own decoder, in order, so its state is exactly what decoding in the guest's
++// thread would have made; a request for any other frame, or bytes that changed
++// since the job copied them, take the ordinary path (which reseeds the decoder
++// when the request is not the frame after the last one decoded).
++// <PREFIX>_ATRAC_AHEAD=0 decodes in the guest's thread as before.
++struct AheadJob {
++    enum State : int { Idle = 0, Queued = 1, Done = 2 };
++    std::atomic<int> state{Idle};
++    audio::AtracDecoder *decoder{};
++    std::int64_t frame{-1};
++    std::vector<std::uint8_t> bytes;
++    std::vector<std::int16_t> out;
++    bool decoded{};
++};
++
++bool ahead_enabled() {
++    static const bool enabled = [] {
++        const char *text = portablekit::env("ATRAC_AHEAD");
++        return !(text != nullptr && text[0] == '0');
++    }();
++    return enabled;
++}
++
++class AheadWorker {
++public:
++    static AheadWorker &instance() {
++        static AheadWorker worker;
++        return worker;
++    }
++    // False when no thread could be started (the caller decodes itself).
++    bool submit(AheadJob &job) {
++        if (!start()) return false;
++        job.state.store(AheadJob::Queued, std::memory_order_release);
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            for (AheadJob *&slot : queue_) {
++                if (slot == nullptr) {
++                    slot = &job;
++                    platform_.event_signal(wake_);
++                    return true;
++                }
++            }
++        }
++        job.state.store(AheadJob::Idle, std::memory_order_release);
++        return false;
++    }
++    void wait(AheadJob &job) {
++        while (job.state.load(std::memory_order_acquire) == AheadJob::Queued) platform_.event_wait(done_, 2'000u);
++    }
++
++private:
++    bool start() {
++        if (thread_ != nullptr) return true;
++        if (failed_) return false;
++        platform_ = movie::decode_thread_platform();
++        if (platform_.event_create == nullptr || platform_.event_wait == nullptr || platform_.event_signal == nullptr ||
++            platform_.thread_start == nullptr) {
++            failed_ = true;
++            return false;
++        }
++        wake_ = platform_.event_create();
++        done_ = platform_.event_create();
++        thread_ = platform_.thread_start(&AheadWorker::main, this, "atrac-ahead", platform_.core, 256u * 1024u);
++        if (thread_ == nullptr) failed_ = true;
++        std::cout << "Audio: ATRAC frames are decoded one ahead on their own thread (core " << platform_.core << ")"
++                  << (thread_ == nullptr ? ": the thread did not start, decoding in the caller" : "") << "\n";
++        return thread_ != nullptr;
++    }
++    AheadJob *take() {
++        std::lock_guard<std::mutex> lock(mutex_);
++        for (AheadJob *&slot : queue_) {
++            if (slot != nullptr) {
++                AheadJob *job = slot;
++                slot = nullptr;
++                return job;
++            }
++        }
++        return nullptr;
++    }
++    static void main(void *self) {
++        auto &worker = *static_cast<AheadWorker *>(self);
++        for (;;) {
++            AheadJob *job = worker.take();
++            if (job == nullptr) {
++                worker.platform_.event_wait(worker.wake_, 50'000u);
++                continue;
++            }
++            job->decoded = job->decoder->decode(job->bytes, job->out.data()) != 0u;
++            job->state.store(AheadJob::Done, std::memory_order_release);
++            worker.platform_.event_signal(worker.done_);
++        }
++    }
++    // The thread lives as long as the program (it sleeps when there is nothing to decode).
++    movie::DecodeThreadPlatform platform_{};
++    void *thread_{};
++    void *wake_{};
++    void *done_{};
++    bool failed_{};
++    std::mutex mutex_;
++    std::array<AheadJob *, 8> queue_{};
++};
++
++// Owns a context's job; waits for it before the decoder it uses goes away. The
++// last member of AtracContext, so it is destroyed first.
++struct AheadSlot {
++    AheadJob job;
++    ~AheadSlot() {
++        if (job.state.load(std::memory_order_acquire) == AheadJob::Queued) AheadWorker::instance().wait(job);
++    }
++};
++
+ struct AtracContext {
+     // False for an id sceAtracGetAtracID has handed out with no data yet.
+     bool loaded{};
+@@ -118,6 +238,9 @@ struct AtracContext {
+     bool low_level{};
+     std::uint32_t low_level_frame_bytes{};
+     std::uint32_t low_level_out_channels{2u};
++
++    // Last: destroyed first, waiting for a job still using `decoder`.
++    AheadSlot ahead;
+ };
+ 
+ std::array<std::unique_ptr<AtracContext>, kMaxAtracIds> &contexts() {
+@@ -236,26 +359,71 @@ std::uint64_t play_order(const AtracContext &context, std::uint32_t offset, std:
+     return offset + static_cast<std::uint64_t>(passes) * loop_bytes;
+ }
+ 
++// Copies frame `index` of the stream into `bytes` (block_align of them), from
++// the bytes stored as the game added them, or from the guest buffer for a track
++// that is all in memory; false when they are not there.
++bool frame_bytes(const psprecomp::GuestMemory &memory, const AtracContext &context, std::int64_t index,
++                 std::vector<std::uint8_t> &bytes) {
++    const TrackInfo &track = context.track;
++    if (index < 0) return false;
++    bytes.resize(track.block_align);
++    const std::uint64_t offset = track.data_offset + static_cast<std::uint64_t>(index) * track.block_align;
++    if (context.streaming) {
++        if (offset < context.stored_from || offset + track.block_align > context.stored_from + context.stored.size())
++            return false;
++        const auto start = context.stored.begin() + static_cast<std::ptrdiff_t>(offset - context.stored_from);
++        std::copy(start, start + track.block_align, bytes.begin());
++        return true;
++    }
++    if (offset + track.block_align > std::min<std::uint64_t>(context.buffer_size, track.data_offset + track.data_size))
++        return false;
++    memory.copy_out(context.buffer + static_cast<std::uint32_t>(offset), bytes);
++    return true;
++}
++
++// Waits for the context's decode-ahead job, if one is out. The decoder is then
++// past the job's frame (next_frame already says so); its samples stay in the
++// job until load_frame takes them or another request discards them.
++void settle_ahead(AtracContext &context) {
++    AheadJob &job = context.ahead.job;
++    if (job.state.load(std::memory_order_acquire) == AheadJob::Queued) AheadWorker::instance().wait(job);
++}
++
++// Settles the job and forgets its samples, for a caller about to reposition.
++void drop_ahead(AtracContext &context) {
++    settle_ahead(context);
++    context.ahead.job.state.store(AheadJob::Idle, std::memory_order_relaxed);
++}
++
+ // Decodes stream frame `frame` into the cache, reseeding the decoder when the
+ // request is not the frame that follows the last one it decoded.
+ bool load_frame(const psprecomp::GuestMemory &memory, AtracContext &context, std::int64_t frame) {
+     if (frame == context.cached_frame) return true;
+     const TrackInfo &track = context.track;
+     const std::size_t frame_samples = audio::atrac_frame_samples(track.codec);
+-    context.cached.assign(frame_samples * 2u, 0);
+     std::vector<std::uint8_t> bytes(track.block_align);
++
++    AheadJob &job = context.ahead.job;
++    settle_ahead(context);
++    if (job.state.load(std::memory_order_relaxed) == AheadJob::Done) {
++        job.state.store(AheadJob::Idle, std::memory_order_relaxed);
++        // The decoder state after the job is the straight-through one only if
++        // the job's bytes are still that frame's bytes.
++        const bool same_bytes = frame_bytes(memory, context, job.frame, bytes) && bytes == job.bytes;
++        if (!same_bytes) {
++            context.next_frame = -1;
++        } else if (job.frame == frame) {
++            context.cached.swap(job.out);
++            context.cached.resize(frame_samples * 2u);
++            if (!job.decoded) std::fill(context.cached.begin(), context.cached.end(), std::int16_t{0});
++            context.cached_frame = frame;
++            return job.decoded;
++        }
++    }
++
++    context.cached.assign(frame_samples * 2u, 0);
+     const auto decode = [&](std::int64_t index) {
+-        const std::uint64_t offset = track.data_offset + static_cast<std::uint64_t>(index) * track.block_align;
+-        if (context.streaming) {
+-            if (offset < context.stored_from ||
+-                offset + track.block_align > context.stored_from + context.stored.size())
+-                return false;
+-            const auto start = context.stored.begin() + static_cast<std::ptrdiff_t>(offset - context.stored_from);
+-            std::copy(start, start + track.block_align, bytes.begin());
+-            return context.decoder.decode(bytes, context.cached.data()) != 0u;
+-        }
+-        if (offset + track.block_align > std::min(context.buffer_size, track.data_offset + track.data_size)) return false;
+-        memory.copy_out(context.buffer + static_cast<std::uint32_t>(offset), bytes);
++        if (!frame_bytes(memory, context, index, bytes)) return false;
+         return context.decoder.decode(bytes, context.cached.data()) != 0u;
+     };
+     if (frame != context.next_frame) {
+@@ -273,6 +441,24 @@ bool load_frame(const psprecomp::GuestMemory &memory, AtracContext &context, std
+     return decoded;
+ }
+ 
++// Starts decoding the frame the next DecodeData starts in, when it follows the
++// one just decoded and its bytes are there.
++void decode_ahead(const psprecomp::GuestMemory &memory, AtracContext &context) {
++    if (!ahead_enabled() || context.low_level || !context.decoder.is_open()) return;
++    AheadJob &job = context.ahead.job;
++    if (job.state.load(std::memory_order_relaxed) != AheadJob::Idle) return;
++    const TrackInfo &track = context.track;
++    if (context.position > track.end_sample) return;
++    const auto frame_samples = static_cast<std::int64_t>(audio::atrac_frame_samples(track.codec));
++    const std::int64_t frame = (static_cast<std::int64_t>(context.position) + track.skip) / frame_samples;
++    if (frame == context.cached_frame || frame != context.next_frame) return;
++    if (!frame_bytes(memory, context, frame, job.bytes)) return;
++    job.decoder = &context.decoder;
++    job.frame = frame;
++    job.out.resize(static_cast<std::size_t>(frame_samples) * 2u);
++    if (AheadWorker::instance().submit(job)) context.next_frame = frame + 1;
++}
++
+ void release_context(std::uint32_t id) {
+     if (id < kMaxAtracIds) contexts()[id].reset();
+ }
+@@ -495,6 +681,7 @@ void register_atrac_functions(HleRegistrar &hle) {
+             return;
+         }
+         AtracContext &context = *contexts()[id];
++        drop_ahead(context);
+         const auto &memory = rt.memory();
+         const std::uint32_t params = arg(ctx, 1);
+         if (!memory.contains(params, 12u)) {
+@@ -534,6 +721,7 @@ void register_atrac_functions(HleRegistrar &hle) {
+             return;
+         }
+         AtracContext &context = *contexts()[id];
++        drop_ahead(context);
+         auto &memory = rt.memory();
+         const std::uint32_t source = arg(ctx, 1);
+         const std::uint32_t consumed = arg(ctx, 2);
+@@ -633,12 +821,17 @@ void register_atrac_functions(HleRegistrar &hle) {
+         }
+         const bool ended = context->position > track.end_sample;
+         if (context->streaming) trim_stored(*context);
++        decode_ahead(memory, *context);
+         write_s32(memory, count_address, count);
+         write_s32(memory, end_address, ended ? 1 : 0);
+         write_s32(memory, remain_address, remain_frames(*context));
+         if (trace_atrac()) {
+             std::ostringstream details;
+-            details << "at=" << played << " count=" << count << " next=" << context->position
++            std::uint32_t pcm = 2166136261u;   // FNV-1a of the samples handed out, to compare runs
++            const std::int16_t *source = context->cached.data() + first * 2;
++            for (std::int32_t i = 0; i < count * 2; ++i) pcm = (pcm ^ static_cast<std::uint16_t>(source[i])) * 16777619u;
++            details << "at=" << played << " count=" << count << " next=" << context->position << " pcm=" << std::hex << pcm
++                    << std::dec
+                     << (decoded ? "" : " (silent)") << (ended ? " end" : "");
+             finish_traced(ctx, "sceAtracDecodeData", 0u, details.str());
+             return;
+@@ -886,6 +1079,7 @@ void register_atrac_functions(HleRegistrar &hle) {
+             finish_traced(ctx, "sceAtracResetPlayPosition", atrac_error::kBadSample);
+             return;
+         }
++        drop_ahead(*context);
+         if (context->streaming) {
+             // The game has refilled the buffer from where
+             // GetBufferInfoForResetting said.
+diff --git a/host/movie/avc_decoder.cpp b/host/movie/avc_decoder.cpp
+index b42a5b7..f8c4935 100644
+--- a/host/movie/avc_decoder.cpp
++++ b/host/movie/avc_decoder.cpp
+@@ -65,6 +65,7 @@ DecodeThreadPlatform g_decode_platform{&default_event_create, &default_event_des
+ } // namespace
+ 
+ void set_decode_thread_platform(const DecodeThreadPlatform &platform) noexcept { g_decode_platform = platform; }
++const DecodeThreadPlatform &decode_thread_platform() noexcept { return g_decode_platform; }
+ 
+ #if defined(PORTABLEKIT_HAS_FFMPEG)
+ 
+diff --git a/host/movie/avc_decoder.hpp b/host/movie/avc_decoder.hpp
+index 12ac790..02d28a5 100644
+--- a/host/movie/avc_decoder.hpp
++++ b/host/movie/avc_decoder.hpp
+@@ -32,6 +32,8 @@ struct DecodeThreadPlatform {
+     int core = -1;
+ };
+ void set_decode_thread_platform(const DecodeThreadPlatform &platform) noexcept;
++// The platform set above (or the std::thread default), for other decoders that work ahead on the same core (ATRAC).
++[[nodiscard]] const DecodeThreadPlatform &decode_thread_platform() noexcept;
+ 
+ // H.264 pictures decoded with FFmpeg's libavcodec. Without FFmpeg the class
+ // still exists but open() fails.
+-- 
+2.43.0
+

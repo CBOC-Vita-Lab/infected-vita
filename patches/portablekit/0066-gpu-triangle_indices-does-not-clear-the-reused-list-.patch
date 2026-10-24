@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 13:52:21 +0000
+Subject: [PATCH] gpu: triangle_indices() does not clear the reused list before
+ sizing it (only what it grows by is zeroed)
+
+Measured with tools/armprof on the mission-1 dumps (--prepare, ui_upscale off for steady counts): the walk with the renderer
+inline is 6.54 M instructions a frame against 7.29 M before 825a800 and this change, the GL side unchanged within noise
+(2.55 M / 2.58 M). Same output for 300,000 random primitives; replay pictures of 24 frames byte-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/host/gpu/triangle_indices.hpp b/host/gpu/triangle_indices.hpp
+index 438e56f..9161381 100644
+--- a/host/gpu/triangle_indices.hpp
++++ b/host/gpu/triangle_indices.hpp
+@@ -29,18 +29,27 @@ inline std::uint16_t primitive_vertex(const std::vector<std::uint16_t> &indices,
+ // Returns false, leaving `out` empty, for any other primitive.
+ inline bool triangle_indices(PrimitiveType primitive, std::size_t count, const std::vector<std::uint16_t> &indices,
+                              std::size_t vertex_count, std::vector<std::uint16_t> &out) {
+-    out.clear();
+-    if (vertex_count == 0u) return primitive == PrimitiveType::Triangles ||
++    if (vertex_count == 0u) {
++        out.clear();
++        return primitive == PrimitiveType::Triangles ||
+                                    primitive == PrimitiveType::TriangleStrip ||
+                                    primitive == PrimitiveType::TriangleFan;
++    }
+     if (primitive != PrimitiveType::Triangles && primitive != PrimitiveType::TriangleStrip &&
+-        primitive != PrimitiveType::TriangleFan)
++        primitive != PrimitiveType::TriangleFan) {
++        out.clear();
+         return false;
++    }
+     // Written through a pointer into a vector sized once, in loops without a branch per index (push_back and a lambda that
+     // asked "indexed?" for every index were some 16 instructions an index on the Vita's CPU, the split renderer's walker
+     // converting about 70,000 a mission frame). The indices are the same, in the same order.
+     const std::size_t total = primitive == PrimitiveType::Triangles ? count / 3u * 3u : count >= 3u ? (count - 2u) * 3u : 0u;
+-    if (total == 0u) return true;
++    if (total == 0u) {
++        out.clear();
++        return true;
++    }
++    // Not cleared first: resize() then zero-fills only what the vector grows by (every element is written below), so a vector
++    // reused from draw to draw is not zeroed again each time.
+     out.resize(total);
+     std::uint16_t *o = out.data();
+     const std::size_t last = vertex_count - 1u;

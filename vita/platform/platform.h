@@ -147,6 +147,9 @@ bool thread_set_priority(Thread* t_or_null_for_self, int priority);  // same rel
 // where they share the display-list walker's core as before. core3_allow(false) (config.txt core3=0) keeps everything off core 3.
 // Desktop: core3_usable() is false and helper_core() is 2.
 void core3_allow(bool allowed);
+// Whether core3_usable() may load the package's own kernel module (vita/core3) when the system refuses the CPU 3 mask; config.txt
+// core3_unlock=0 turns that off (core 3 is then used only where a plugin such as CapUnlocker already allows it).
+void core3_unlock_allow(bool allowed);
 bool core3_usable();
 int helper_core();
 

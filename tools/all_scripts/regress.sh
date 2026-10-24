@@ -1,11 +1,11 @@
 #!/bin/bash
 # regress.sh SET [FLIPS] : replay one GE dump set with the predecessors' binaries and the merged one, compare the PNGs by md5.
-#   integ  = /home/claude/ws/integ/build/bin/ge_replay                  (before the options existed)
-#   gfx    = /home/claude/ws/gfx/build/bin/ge_replay --port baseline    (every option off)
+#   integ  = /work/ws/integ/build/bin/ge_replay                  (before the options existed)
+#   gfx    = /work/ws/gfx/build/bin/ge_replay --port baseline    (every option off)
 #   merged = build/desktop/bin/ge_replay --port baseline                (this tree), and the same with --threaded
-D=/home/claude/ws/render/private/dumps/$1; F=${2:-}
-OUT=/home/claude/ws/all/private/regress/$1
-M=/home/claude/ws/all/build/desktop/bin/ge_replay
+D=/work/ws/render/private/dumps/$1; F=${2:-}
+OUT=/work/ws/all/private/regress/$1
+M=/work/ws/all/build/desktop/bin/ge_replay
 mkdir -p $OUT
 run() { # name binary options...
   n=$1; b=$2; shift 2
@@ -18,8 +18,8 @@ run() { # name binary options...
   echo "$1 $n rc=$rc $(( $(date +%s) - s )) s $(wc -l < $OUT/$n.md5) pictures"
   rm -rf $OUT/$n/*.png.keep
 }
-run integ /home/claude/ws/integ/build/bin/ge_replay
-run gfx /home/claude/ws/gfx/build/bin/ge_replay --port baseline
+run integ /work/ws/integ/build/bin/ge_replay
+run gfx /work/ws/gfx/build/bin/ge_replay --port baseline
 run merged $M --port baseline
 run merged_thr $M --port baseline --threaded
 for v in gfx merged merged_thr; do

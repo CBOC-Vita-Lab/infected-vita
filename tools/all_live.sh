@@ -17,13 +17,13 @@
 # state with the DEFAULT settings. Virtual clock, audio device off, so the run is deterministic and as fast as the host allows.
 here=$(cd "$(dirname "$0")" && pwd)
 ws=$(cd "$here/../.." && pwd)
-S=${SRC:-/home/claude/ws/integ/private}
+S=${SRC:-/work/ws/integ/private}
 W=${W:-$ws/private/live}
 N=$1; T=$2; shift 2
 BIN=${BIN:-$ws/build/desktop/bin/InfectedNative}
 PADF=${PAD:-$here/all_live_flow.script}
 OVRF=${OVR:-$here/all_live.overlay}
-PK=${PACKS:-/home/claude/ws/tex/private/packs}
+PK=${PACKS:-/work/ws/tex/private/packs}
 FL=${FLIPS:-3890,3960,4090,4160,4290,4360,4480,4500}
 D=$W/data_$N
 mkdir -p "$D" "$W/logs" "$W/shots/$N"

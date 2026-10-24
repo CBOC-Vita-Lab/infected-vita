@@ -3,8 +3,8 @@
 python3 - "$@" <<'PY'
 import sys,os,pickle,bisect
 a=int(sys.argv[1],16); n=int(sys.argv[2]) if len(sys.argv)>2 else 64
-fn='/home/claude/ws/tune/private/dis/image.txt'
-idxf='/home/claude/ws/tune/private/dis/image.idx'
+fn='/work/ws/tune/private/dis/image.txt'
+idxf='/work/ws/tune/private/dis/image.idx'
 if not os.path.exists(idxf):
     addrs=[];offs=[];p=0
     with open(fn,'rb') as f:

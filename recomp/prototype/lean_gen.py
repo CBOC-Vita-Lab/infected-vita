@@ -2,7 +2,7 @@
 """
 Prototype of the LEAN generator (experiment only; the emitted C++ is compiled for size, never run on a guest runtime).
 
-Reads the relocated Infected image (/home/claude/infected/work/image.bin, base 0x08804000), splits it into
+Reads the relocated Infected image (/work/infected/work/image.bin, base 0x08804000), splits it into
 functions (jal targets + prologue heuristic), builds an instruction-granular CFG with delay slots, runs an
 interprocedural register-liveness analysis to derive TYPED function signatures
         RET f_ADDR(sp?, int args..., float args...)
@@ -21,7 +21,7 @@ usage: lean_gen.py stats                      -> analysis statistics (json)
 import struct, sys, collections, json, os
 
 BASE = 0x08804000
-IMG = open('/home/claude/infected/work/image.bin', 'rb').read()
+IMG = open('/work/infected/work/image.bin', 'rb').read()
 NW = 0x2860D4 // 4
 W = struct.unpack('<%dI' % NW, IMG[:NW * 4])
 END = BASE + NW * 4

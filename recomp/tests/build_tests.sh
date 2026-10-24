@@ -8,7 +8,7 @@
 #   $W/private/x86    objects, liblean_x86.a, difftest
 #   $W/private/pk     PortableKit objects (interpreter oracle)
 set -e
-W=${LEAN_WS:-/home/claude/ws/lean}
+W=${LEAN_WS:-/work/ws/lean}
 R=$W/PortableKit
 REC=$W/proj/recomp
 GEN=$W/private/${LEAN_GEN:-gen}

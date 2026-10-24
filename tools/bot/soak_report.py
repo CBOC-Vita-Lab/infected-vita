@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """soak_report.py NAME : summary of a soak run (private/logs/NAME.err and .out): events, heap headroom, pool use, audio gaps, fatal/stall lines."""
 import re, sys
-W = '/home/claude/ws/bot/private/logs/'
+W = '/work/ws/bot/private/logs/'
 n = sys.argv[1]
 err = open(W + n + '.err', errors='replace').read().split('\n')
 out = open(W + n + '.out', errors='replace').read().split('\n')
