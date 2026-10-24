@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Settings and performance guide
+    url: https://github.com/CBOC-Vita-Lab/infected-vita/blob/main/SETTINGS.md
+    about: What every option does and what it costs on the Vita.
+  - name: Known issues
+    url: https://github.com/CBOC-Vita-Lab/infected-vita/blob/main/KNOWN-ISSUES.md
+    about: Check here first, it may already be listed.

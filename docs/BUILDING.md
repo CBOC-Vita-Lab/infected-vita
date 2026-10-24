@@ -104,7 +104,11 @@ The result is **`dist/infected.vpk`** (and `dist/infected.elf`, the unstripped p
 
 ### Artwork for the bubble and RetroFlow (optional)
 
-The default is original artwork drawn by a script, which is what any copy of this repository builds. To use pictures of your own:
+The default is original artwork drawn by a script, which is what any copy of this repository builds:
+
+![The default bubble, start screen and RetroFlow cover](img/bubble-art.png)
+
+To use pictures of your own:
 
 ```sh
 # from your disc: its icon and menu picture (needs Pillow and pycdlib; optionally a screenshot for RetroFlow's background)

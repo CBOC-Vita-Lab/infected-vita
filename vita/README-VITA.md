@@ -55,8 +55,8 @@ in `.iso` works there. The rest of this section is the detail for people who bui
 
 That is enough to learn whether the port runs at all and how fast. `docs/history/release-candidate/HARDWARE-TEST.md` (the original test sheet) then goes through the costly options one at a time with `bench=play`.
 
-The first start shows a boot screen (arena, executable, system), then the game's logos and movies. The first time a shader is used the
-picture can stop for one to two seconds while it is compiled (the cache removes this on later runs).
+The first start shows a boot screen (arena, executable, system), then the game's logos and movies. During the logos the game prepares
+the shader programs the package lists (about 1.5 s the first time; kept in `shader_cache` for later starts).
 
 ## Controls and leaving the game
 
