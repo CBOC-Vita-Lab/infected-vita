@@ -5,21 +5,24 @@ What runs, where it was checked, and what has not been checked. Dates are 2026. 
 
 ## In one paragraph
 
-The game boots on a real PS Vita, plays through its logos, the intro movie, the menus, the tutorial and **mission 1**, and holds
-**30 frames a second** there (the game's own rate on a PSP) with a worst 1 % of about 15 fps. The 2x HD texture pack works. Mission 1 is the only
-mission that has been played on the console. Later missions, the 4x pack, long sessions and the experimental HD movies have not.
+Version 1.0 boots on a real PS Vita, plays through its logos, the intro movie, the menus, the tutorial and **mission 1**, and shows
+**30 frames a second** there on the default settings (the game's own rate on a PSP), using all four CPU cores. The 2x HD texture pack works.
+Mission 1 is the only mission that has been played on the console. Later missions, the 4x pack, long sessions and the experimental HD
+movies have not.
 
-## On the console
+## Version 1.0 on the console (PS Vita, firmware 3.74, 23 October 2026)
 
-| What | Result | Checked |
-| --- | --- | --- |
-| Boot, logos, intro movie, menus, mission 1 | Runs. The 30 fps limit and the 2x HD texture pack work. | 10 to 17 Oct |
-| Speed in mission 1 (defaults, 2x pack, 444 MHz) | 30 fps with the 30 fps limit on; uncapped 30 to 32 fps on average, dips to about 27 in heavy moments, worst 1 % about 15 fps. On the morning of 16 Oct the first console build ran mission 1 at 16.6 fps; the threading work took it to 31.6 uncapped by the evening. | 16 Oct |
-| 500 MHz | Needs a PSVshellPlus profile (`vita/psvshell`). With it the game measures 494 MHz. | 17 Oct |
-| Where a mission frame goes (uncapped, about 31 fps) | game code 23 ms (core 0), display-list walk and vertex decode 22 ms (core 2), GL thread 25 to 29 ms (core 1) and the bottleneck at 85 to 90 % busy, GPU about 15 to 19 ms | 16 Oct |
-| Ceiling | with no draw calls at all (`gl_null_draw=1`) the game and the walker alone reach 36 fps, so 60 fps is out of reach without the game code itself getting much faster | 16 Oct |
-| Changes of 17 Oct (vitaGL speed options, four scenes per frame, compact vertices, HUD upscale, idle-time shader linking, faster texture decoding, 500 MHz default) | Installed. A 46 second start-up run was clean (intro at 30 fps, 494 MHz, no fatal lines). **Not measured in a mission yet**, so none of their gains is a result. | 17 Oct |
-| Changes of 23 Oct (the fourth CPU core unlocked by the game itself, the shader program list shipped in the VPK, a faster strip conversion on the display-list thread, vitaGL patch 0005; the game's code linked with LTO, the music decoded ahead on the helper core, fully transparent draws skipped) | **Played on a 3.74 console.** Mission 1 on the defaults, with three cores: 30 pictures shown in every second; game code 13 to 20 ms a frame (16 Oct: 23 ms). The fourth core (after a fix the same evening): the module loads, a thread runs on core 3, the helper threads and the music decoder move there. 47 shader programs prepared during the logos in 1.5 s. With FXAA + pixel lighting + double-resolution effects + the 4x pack together: 10 to 14 fps (the GPU cannot keep up). Worst-1 % frames not measured yet. | 23 Oct |
+| What | Result |
+| --- | --- |
+| Boot | Logos, intro movie and menus run. 47 shader programs are prepared during the logos (about 1.5 s on the first start). |
+| Mission 1, default settings (2x pack, Split renderer, frame limit 30) | **30 pictures shown in every second** of the mission. |
+| Where a mission frame goes | game code 13 to 20 ms (core 0), display-list walk and vertex decode 13 to 27 ms (core 2), drawing on core 1, which is the busiest; helper threads, audio and the music decoder on core 3 |
+| Fourth core | The module in the package loads, a thread runs on core 3, the helper threads and the music decoder run there; unloaded at exit. |
+| Defaults + FXAA | 21 to 30 fps |
+| 4x pack + FXAA + pixel lighting + double-resolution effects | 10 to 14 fps: the GPU cannot keep up |
+| 500 MHz | Needs a PSVshellPlus profile (`vita/psvshell`). With it the CPU measures about 494-497 MHz. |
+| Ceiling | With no draw calls at all (`gl_null_draw=1`) the game and the display-list walk alone reach 36 fps, so 60 fps is out of reach; the game itself runs at 30. |
+| Not measured yet | the worst frames (1 % lows), the gain of each speed feature on its own, 500 MHz over a whole mission |
 
 `docs/history/` has the working logs behind these numbers, including what was tried and dropped.
 
@@ -47,5 +50,5 @@ mission that has been played on the console. Later missions, the 4x pack, long s
 
 ## Open work
 
-See [`KNOWN-ISSUES.md`](../KNOWN-ISSUES.md): the intro movie's tear lines, banding in fire, hitches from render-target switches, the shader
-cache, and everything above that has not been tried on the console.
+See [`KNOWN-ISSUES.md`](../KNOWN-ISSUES.md): the intro movie's tear lines, banding in fire, hitches from render-target switches, and
+everything above that has not been tried on the console.

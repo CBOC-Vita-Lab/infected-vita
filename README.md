@@ -34,10 +34,18 @@ The first public version: the whole game, native, at 30 frames a second.
 | | |
 | --- | --- |
 | **Gameplay** | 30 fps in mission 1 on the default settings, measured on a PS Vita. A short stutter can still happen in the heaviest moments. |
-| **Picture** | 960x544 with smooth filtering. FXAA, MSAA, pixel lighting and double-resolution effects look nicer but cost frames: with all of them on it drops to 10-14 fps. The defaults are tuned for a steady 30. |
+| **Picture** | 960x544 with smooth filtering. FXAA, MSAA, pixel lighting and double-resolution effects look nicer but cost frames (see below). The defaults are tuned for a steady 30. |
 | **Menus and movies** | All the game's menus and movies work. The intro movie can show thin horizontal lines. |
 | **Saves** | The game's own saves, kept in `ux0:data/infected/`. Updates never touch them. |
 | **Missions** | Mission 1 has been played start to finish on a Vita. The later missions run in the PC build and should work, but haven't been played on a console yet. |
+
+**Pick your style** (measured on a PS Vita in mission 1):
+
+| Setup | Frames per second | For |
+| --- | --- | --- |
+| **Defaults** (smooth filtering; the 2x textures if you made the pack) | **30, steady** | Playing. This is the recommended setup. |
+| Defaults + **FXAA** | 21 to 30, mostly in the mid-20s | Smoother edges if you don't mind the odd dip |
+| **Everything on** (4x textures, FXAA, pixel lighting, double effects) | 10 to 14 | Screenshots, not play |
 
 60 fps isn't possible: the game itself runs at 30. The frame limit is already 30 by default, which keeps the motion even.
 See [Known Issues](KNOWN-ISSUES.md) for everything that is still rough.

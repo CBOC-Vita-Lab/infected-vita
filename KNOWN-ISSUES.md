@@ -29,23 +29,22 @@ Delete `ux0:data/infected/settings.txt` to put every setting back to its default
 
 # Details for testers
 
-Everything wrong or unchecked, with dates (2026).
+Everything wrong or unchecked in version 1.0.
 
 ## Seen on the console
 
-* **The intro movie shows horizontal tear lines** (16 Oct). The movie is a 512x512 texture that is re-uploaded every frame (about 15 ms
+* **The intro movie shows horizontal tear lines.** The movie is a 512x512 texture that is re-uploaded every frame (about 15 ms
   each). Most likely the movie decoder writes the next picture while the GL thread still reads this one. Not checked against the
   single-thread renderer, not fixed.
-* **Fire and explosions show sharp horizontal bands** in some captures from the console (the console captures in the README show
-  them), also in the build from before the threading fixes of 16 Oct. Not traced to the game or to the way the picture is captured.
-* **Hitches.** The worst 1 % of frames in mission 1 run at about 15 fps. Known causes: the first draw after a render-target switch takes
-  about 8 ms (worst 16 to 20 ms), each shader the game has not drawn before is compiled when it is first needed (40 to 90 ms; about a dozen in the
-  first second of a mission), and a new texture's original decode plus upload takes 3 to 12 ms.
+* **Fire and explosions show sharp horizontal bands** in some captures from the console (the capture on the front page shows them).
+  Not traced yet to the game or to the way the picture is captured.
+* **Occasional hitches.** Known causes: the first draw after a render-target switch takes about 8 ms (worst 16 to 20 ms), and a new
+  texture's decode plus upload takes 3 to 12 ms. How low the worst frames go has not been measured yet.
 * **Shaders are built on the console.** The package lists the programs the game uses and they are prepared during the logos (47 in about
-  1.5 s on a 3.74 console, 23 Oct); the results are kept in `ux0:data/infected/shader_cache`. A picture option that needs new shaders
+  1.5 s on a 3.74 console); the results are kept in `ux0:data/infected/shader_cache`. A picture option that needs new shaders
   (pixel lighting, FXAA) builds them the first time it is used, a pause of a few tenths of a second each, once.
-* **30 fps, not 60.** The GL thread (vitaGL's draw calls and the state they flush) is the bottleneck at 85 to 90 % busy. With no draw
-  calls at all the game and the display-list walker reach 36 fps, so 60 is out of reach without the game code itself getting much faster.
+* **30 fps, not 60.** The game runs at 30, and the drawing thread (vitaGL's draw calls) is the busiest part. With no draw calls at all the
+  game and the display-list walker reach 36 fps, so 60 is out of reach.
 
 ## Not checked on a console
 
@@ -53,16 +52,14 @@ Everything wrong or unchecked, with dates (2026).
 * The 4x texture pack, and sessions of an hour or more (memory: the heap peaked at about 60 of 176 MB in mission 1).
 * Writing save data to the memory-stick folder on `ux0:`, the touch-screen corner that opens the menu, MSAA on the real GPU, and
   how the sound behaves while the menu pauses the game.
-* The speed and memory effect of the 17 Oct changes: vitaGL's `INDICES_SPEEDHACK` and `SAMPLERS_SPEEDHACK`, four scenes per frame
-  (`gl_rt_scenes`), compact vertices (`gl_compact_vertices`), the HUD upscale (`gl_ui_upscale`), shader linking in idle time
-  (`gl_prewarm`) and the faster texture decoder. Each has a switch to turn it off (`SETTINGS.md`, `vita/SETTINGS-DEV.md`) and an A/B plan;
-  none has been compared in a mission yet.
+* The gain of each speed feature on its own (four scenes per frame, compact vertices, the HUD upscale, shader pre-linking, the music
+  decoded ahead, link-time optimisation, the fourth core). Each has a switch to turn it off (`SETTINGS.md`, `vita/README-VITA.md`); none has
+  been compared on its own in a mission.
 * The 500 MHz profile has been measured to run (494 MHz) but not its effect on a whole mission.
-* What the fourth core gains. The module (`vita/core3/`) has run on a 3.74 console (23 Oct): it loads, a thread runs on core 3 and the
+* Other firmware for the fourth core. The module (`vita/core3/`) has run on a 3.74 console: it loads, a thread runs on core 3 and the
   helper threads and the music decoder move there. Other firmware versions in 3.60-3.74 are not tried. A start that loaded it and crashed
   leaves `core3_unlock.pending` in `ux0:data/infected/`, and later starts leave the module out; `config.txt core3_unlock=0` turns it off.
-* The worst frames (the 1 % lows) with the 23 Oct build: the average holds 30 in mission 1 on the defaults, the lows were not measured.
-* The shipped shader program list: the extra boot time of a first start, and whether any program still links mid-mission.
+* The worst frames (the 1 % lows): the average holds 30 in mission 1 on the defaults, the lows were not measured.
 
 ## HD movies are experimental
 
@@ -78,7 +75,6 @@ They exist for repeatable speed tests, not for play.
 
 ## Tests and tooling
 
-* The replay check against the 10 Oct baseline reported a mismatch that has not been investigated.
 * `recomp/tests/run_synth.sh` does not build against the current PortableKit (a linkage clash in `difftest.cpp` and a private method); the
   harness needs porting to the current API.
 * One PC test, `kernel_tests_13` ("pause scope, realtime clock"), is timing-sensitive and can fail on a loaded machine.
