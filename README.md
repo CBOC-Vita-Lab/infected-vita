@@ -40,6 +40,20 @@ The first public version: the whole game, native, at 30 frames a second.
 <sub>All pictures are at the Vita's 960x544 and drawn by the port's own renderer. The shots above were rendered on a PC from recorded
 mission frames, with the same drawing code the Vita runs.</sub>
 
+## By The Numbers
+
+| | |
+| --- | --- |
+| **30 fps** | every second of mission 1 on the default settings, on a real Vita |
+| **4 CPU cores** | the game, its graphics, the drawing, and the sound and music each get their own |
+| **4x the pixels** | 960x544 instead of the PSP's 480x272 |
+| **9,577** | game functions translated into native code, in 73 C++ files, checked against the original with 57,462 random tests and 10,562 recorded game states |
+| **13-20 ms** | the game's own work per frame, out of the 33 ms a 30 fps frame has |
+| **2,625** | textures in the 2x HD pack, built from your disc |
+| **1.5 seconds** | to prepare every shader during the opening logos, so effects never pause the game later |
+| **3 menu pages, 18 options** | picture, speed and controls, changeable mid-game |
+| **About 20 minutes** | to build your own copy on a PC |
+
 ## What To Expect
 
 | | |
