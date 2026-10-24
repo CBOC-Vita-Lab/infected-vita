@@ -6,11 +6,11 @@
 
 **Smoother play**
 - A steady 30 fps in mission 1 on the default settings, measured on a real PS Vita.
-- The game now uses all four of the Vita's CPU cores. It unlocks the fourth one by itself, with nothing extra to install.
-- Music and voices are decoded ahead of time on a spare core, which frees about 3 ms of every frame on the game's own core.
-- The game's code is built as one optimized program, so it runs faster.
+- All four of the Vita's CPU cores at work. The game unlocks the fourth one by itself, with nothing extra to install.
+- Music and voices are decoded ahead of time on a spare core, leaving the game's own core free for the game.
+- The game's code is built as one optimized program.
 - Shaders are prepared during the opening logos, so the game doesn't pause the first time an effect appears.
-- Effects the game has faded out completely are no longer drawn.
+- Effects the game has faded out completely are skipped instead of drawn.
 - Frame skip: if the drawing falls behind, the action and the sound keep their pace.
 - Optional 500 MHz CPU mode with a PSVshellPlus profile.
 

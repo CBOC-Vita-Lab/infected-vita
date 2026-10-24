@@ -99,7 +99,7 @@ A text file `ux0:data/infected/config.txt` with `name=value` lines changes thing
 | --- | --- |
 | `gfx.anything=value`, `perf.anything=value`, `controls.anything=value` | Fixes a menu setting for the run (for example `gfx.antialiasing=off`). The menu shows that value and can't change it, and it isn't saved. |
 | `core3_unlock=0` / `core3=0` | Doesn't load the fourth-core module (core 3 is then used only if another plugin already allows it) / never uses core 3. |
-| `atrac_ahead=0` | Decodes the music on the game's own core, as before. |
+| `atrac_ahead=0` | Decodes the music on the game's own core (for comparisons). |
 | `gl_skip_invisible=0` | Draws the fully transparent sprites anyway. |
 | `gl_compact_vertices=0`, `gl_vgl_skip_redundant=0`, `gl_rt_scenes=0` | Turn off the other drawing speed-ups, to compare. |
 | `log_sync=1` | Saves every log line as it is written. Slower; use it when the game crashes, so the last lines are kept. |
