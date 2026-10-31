@@ -183,6 +183,32 @@ var errCancelled = errors.New("cancelled")
 
 func hasSpace(s string) bool { return strings.ContainsAny(s, " \t") }
 
+// plainName: a name the kit's programs can use. Only Windows is picky (see plainPath).
+func plainName(s string) bool { return runtime.GOOS != "windows" || isASCII(s) }
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// plainPath returns a spelling of the folder p that the kit's programs can open. On Windows they are MinGW programs: arguments, environment
+// and the makefile of the LTO link are in the ANSI code page and files are opened by ANSI names, so a folder with a letter outside plain
+// ASCII ("C:\Users\Иван\Downloads\kit") cannot be used, and its 8.3 short name ("C:\Users\5BA0~1\...") can, where the volume has short
+// names. Elsewhere, or when p is plain already, it is p itself. ok is false when there is no plain spelling.
+func plainPath(p string, windows bool, short func(string) string) (plain string, ok bool) {
+	if !windows || isASCII(p) {
+		return p, true
+	}
+	if s := short(p); isASCII(s) {
+		return s, true
+	}
+	return p, false
+}
+
 // makeProgram chooses the value of $MAKE: GCC's lto-wrapper silently skips make (and links serially, twice as slowly) when the
 // path of make has a space in it, and players' folders do ("C:\Users\John Smith\..."). In order of preference:
 //   - the path of this program, when it has no space;
@@ -193,13 +219,13 @@ func hasSpace(s string) bool { return strings.ContainsAny(s, " \t") }
 //
 // copy makes the copy (nil: no copy possible), short returns the short name or its argument.
 func makeProgram(self, kitDir, tmpDir string, copyTo func(dst string) error, short func(string) string) string {
-	if !hasSpace(self) {
+	if !hasSpace(self) && plainName(self) {
 		return self
 	}
-	if rel, err := filepath.Rel(kitDir, self); err == nil && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) && !hasSpace(rel) {
+	if rel, err := filepath.Rel(kitDir, self); err == nil && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) && !hasSpace(rel) && plainName(rel) {
 		return "./" + filepath.ToSlash(rel)
 	}
-	if tmpDir != "" && !hasSpace(tmpDir) && copyTo != nil {
+	if tmpDir != "" && !hasSpace(tmpDir) && plainName(tmpDir) && copyTo != nil {
 		name := "make"
 		if runtime.GOOS == "windows" {
 			name = "make.exe"
@@ -209,7 +235,7 @@ func makeProgram(self, kitDir, tmpDir string, copyTo func(dst string) error, sho
 			return dst
 		}
 	}
-	if s := short(self); s != self && !hasSpace(s) {
+	if s := short(self); s != self && !hasSpace(s) && plainName(s) {
 		return s
 	}
 	return ""
@@ -224,7 +250,7 @@ func spacelessDir(cands []string, short func(string) string, usable func(string)
 			continue
 		}
 		for _, p := range []string{c, short(c)} {
-			if !hasSpace(p) && usable(p) {
+			if !hasSpace(p) && plainName(p) && usable(p) {
 				return p
 			}
 		}

@@ -232,12 +232,12 @@ func splitWords(s string, winBackslash bool) ([]shellWord, error) {
 		case c == ' ' || c == '\t' || c == '\n':
 			flush()
 		case c == '\'':
-			j := strings.IndexByte(s[i+1:], '\'')
+			j := closingQuote(s, i, winBackslash)
 			if j < 0 {
 				return nil, errors.New("unterminated quote")
 			}
-			cur.WriteString(s[i+1 : i+1+j])
-			i += j + 1
+			cur.WriteString(s[i+1 : j])
+			i = j
 			have, quoted = true, true
 		case c == '"':
 			have, quoted = true, true
@@ -251,11 +251,6 @@ func splitWords(s string, winBackslash bool) ([]shellWord, error) {
 			if i >= len(s) {
 				return nil, errors.New("unterminated quote")
 			}
-		case c == '\\' && winBackslash && i > 0 && s[i-1] == '\'' && i+2 < len(s) && s[i+1] == '\'' && s[i+2] == '\'':
-			// GCC writes an apostrophe inside a quoted argument as quote, backslash, quote, quote even on Windows: close, escaped apostrophe, open again
-			cur.WriteByte('\'')
-			i++ // the escaped apostrophe; the next one opens the quote again
-			have, quoted = true, true
 		case c == '\\' && !winBackslash:
 			if i+1 < len(s) {
 				i++
@@ -269,6 +264,34 @@ func splitWords(s string, winBackslash bool) ([]shellWord, error) {
 	}
 	flush()
 	return out, nil
+}
+
+// closingQuote finds the apostrophe that ends the single-quoted text opened at s[open] (-1: none). GCC's lto-wrapper writes every argument
+// as '%s' without escaping, so a folder named "John Smith's kit" gives '-ffile-prefix-map=/x/John Smith's kit=/kit': an apostrophe that
+// is followed by a letter, a digit or another character of a name is part of the text. The quote also ends before an escaped apostrophe
+// (written quote, backslash, quote, quote, as a shell does; not on Windows, where the backslash is only a path separator).
+func closingQuote(s string, open int, winBackslash bool) int {
+	for k := open + 1; k < len(s); k++ {
+		if s[k] != '\'' {
+			continue
+		}
+		if k+1 >= len(s) {
+			return k
+		}
+		switch n := s[k+1]; {
+		case n == ' ' || n == '\t' || n == '\n':
+			return k
+		case n == '\\':
+			if !winBackslash {
+				return k
+			}
+		case n >= '0' && n <= '9', n >= 'a' && n <= 'z', n >= 'A' && n <= 'Z', n >= 0x80, strings.IndexByte("_-.,+@~", n) >= 0:
+			// part of a name
+		default:
+			return k
+		}
+	}
+	return -1
 }
 
 // simpleCommand is one program (or builtin) with its arguments.
@@ -397,7 +420,10 @@ func (rr *recipeRunner) run(line string) error {
 		return rr.runShell(line, ignoreErr || strings.HasPrefix(strings.TrimLeft(line, " \t@"), "-"))
 	}
 	if err != nil {
-		return err
+		if len(line) > 800 {
+			line = line[:800] + "..."
+		}
+		return fmt.Errorf("%v in the command: %s", err, line)
 	}
 	for _, c := range cmds {
 		if e := rr.runSimple(c.words); e != nil {
@@ -579,6 +605,10 @@ func (m *maker) buildOnce(t string) error {
 	}
 	for _, line := range rule.recipe {
 		if err := m.rr.run(line); err != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) { // not a program that failed: say what went wrong (the build log has it)
+				fmt.Fprintf(m.rr.stderr, "make: %v\n", err)
+			}
 			m.mu.Lock()
 			if !m.failed {
 				m.failed, m.failTgt, m.failErr = true, t, err

@@ -294,7 +294,7 @@ func TestQuoteLeadingProgram(t *testing.T) {
 		os.MkdirAll(dir, 0o755)
 		prog := filepath.Join(dir, "gcc")
 		os.WriteFile(prog, []byte("x"), 0o755)
-		line := prog + "  '-xlto' '-c' '-o' 'out file.o' '-fmap=" + strings.ReplaceAll(dir, "'", `'\''`) + "=/kit'"
+		line := prog + "  '-xlto' '-c' '-o' 'out file.o' '-fmap=" + dir + "=/kit'" // as GCC writes it: no escaping
 		cmds, _, err := parseRecipeLine("@"+line, win)
 		if err != nil || len(cmds) != 1 || len(cmds[0].words) != 6 || cmds[0].words[0] != prog || cmds[0].words[1] != "-xlto" || cmds[0].words[4] != "out file.o" ||
 			cmds[0].words[5] != "-fmap="+dir+"=/kit" {
@@ -310,15 +310,28 @@ func TestQuoteLeadingProgram(t *testing.T) {
 	}
 }
 
-// GCC writes an apostrophe inside a quoted argument as quote, backslash, quote, quote on every system; on Windows a backslash outside quotes is otherwise an
-// ordinary character.
-func TestWindowsApostropheArgument(t *testing.T) {
-	words, err := splitWords(`'-fmap=C:\Users\O'\''Brien\kit=/kit' 'C:\x y\z'`, true)
-	if err != nil || len(words) != 2 || words[0].text != `-fmap=C:\Users\O'Brien\kit=/kit` || words[1].text != `C:\x y\z` {
-		t.Fatalf("%v %+v", err, words)
+// GCC writes an argument as '%s' without escaping, so an apostrophe in a folder name sits inside the quotes.
+func TestApostropheInQuotedArgument(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		win  bool
+		want []string
+	}{
+		{`'-fmap=/x/John Smith's kit=/kit' '-g0'`, false, []string{"-fmap=/x/John Smith's kit=/kit", "-g0"}},
+		{`'-fmap=C:\Users\O'Brien\kit=/kit' 'C:\x y\z'`, true, []string{`-fmap=C:\Users\O'Brien\kit=/kit`, `C:\x y\z`}},
+		{`'it'\''s' ''`, false, []string{"it's", ""}},
+		{`'a'  'b c'`, false, []string{"a", "b c"}},
+	} {
+		words, err := splitWords(tc.in, tc.win)
+		var got []string
+		for _, w := range words {
+			got = append(got, w.text)
+		}
+		if err != nil || fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: %v %q, want %q", tc.in, err, got, tc.want)
+		}
 	}
-	words, err = splitWords(`'it'\''s'`, false)
-	if err != nil || len(words) != 1 || words[0].text != "it's" {
-		t.Fatalf("%v %+v", err, words)
+	if _, err := splitWords(`'oops`, false); err == nil {
+		t.Error("unterminated quote")
 	}
 }
