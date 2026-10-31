@@ -14,8 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux,   runner: ubuntu-22.04, exe: '' }
-          - { name: windows, runner: windows-2022, exe: '.exe' }
+          - { name: linux,     runner: ubuntu-22.04,   exe: '', gokey: linux }
+          - { name: windows,   runner: windows-2022,   exe: '.exe', gokey: windows }
+          - { name: mac-intel, runner: macos-15-intel, exe: '', gokey: mac }
+          - { name: mac-arm,   runner: macos-14,       exe: '', gokey: mac }
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -32,23 +34,38 @@ jobs:
         with:
           go-version: '1.20.14'
           cache: false
-      - name: Build infected-build from this tree
+      - name: Build infected-build from this tree, kit.json with vita-elf-create -s
         run: |
-          cd builder && go build -trimpath -ldflags='-s -w' -o "$T/smoke test/the kit/infected-build${{ matrix.exe }}" ./cmd/infected-build
-      - name: Link with -save-temps and a map
+          S="$T/smoke test"
+          (cd builder && go build -trimpath -ldflags='-s -w' -o "$S/the kit/infected-build${{ matrix.exe }}" ./cmd/infected-build)
+          python3 -I - "$S/the kit/kit.json" <<'PY'
+          import json, sys
+          p = sys.argv[1]; r = json.load(open(p))
+          if '-s' not in r['elfCreate']['args']: r['elfCreate']['args'].insert(0, '-s')
+          json.dump(r, open(p, 'w'), indent=1)
+          print(r['elfCreate'])
+          PY
+      - name: infected-build --progress
         run: |
           S="$T/smoke test"; P="$S/the kit/infected-build${{ matrix.exe }}"
           rm -rf "$S/o"
-          IB_DIAG_LINKARGS="-save-temps;;-Wl,-Map=$S/work dir/link.map;;-Wl,--trace-symbol=main" "$P" --gen .github/smoke/gen --work "$S/work dir" --out "$S/o" --jobs 2 --keep
-          sha256sum "$S/work dir/eboot.bin"
-          mkdir -p "$S/temps"; cd "$S/the kit"; ls | head -50; cp -v *.ltrans* *.wpa* *.ltrans.o* "$S/temps/" 2>/dev/null || true
-          ls -l "$S/temps"
-          cp "$S/work dir/link.map" "$S/temps/"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: diag-${{ matrix.name }}
-          path: |
-            ${{ runner.temp }}/smoke test/temps
-            ${{ runner.temp }}/smoke test/work dir/*.elf
-            ${{ runner.temp }}/smoke test/work dir/*.log
-          retention-days: 1
+          "$P" --progress --gen .github/smoke/gen --work "$S/work dir" --out "$S/o" --jobs 2 --keep | tee "$T/progress.txt" | head -60
+          echo "EBOOT $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest())' "$S/o/infected.vpk")"
+          cat "$S/work dir/build.log" | grep -c "partitions\|ltrans" || true
+      - name: Kill the program while it compiles (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $T = $env:RUNNER_TEMP; $S = Join-Path $T 'smoke test'; $kit = Join-Path $S 'the kit'; $exe = Join-Path $kit 'infected-build.exe'
+          $gen = Join-Path $env:GITHUB_WORKSPACE '.github\smoke\gen'
+          Remove-Item -Recurse -Force (Join-Path $S 'killwork') -ErrorAction SilentlyContinue
+          $p = Start-Process -PassThru -FilePath $exe -ArgumentList @('--gen', "`"$gen`"", '--work', "`"$S\killwork`"", '--out', "`"$S\killout`"", '--jobs', '2') -RedirectStandardOutput (Join-Path $T 'kill.out') -RedirectStandardError (Join-Path $T 'kill.err')
+          Start-Sleep -Milliseconds 2500
+          $kitl = $kit.ToLower()
+          function Kids { Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($kitl) -and $_.ProcessId -ne $p.Id } }
+          "before kill: $((Kids | ForEach-Object { $_.Name }) -join ' ')"
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Seconds 3
+          $left = @(Kids)
+          "after kill, processes of the kit left: $($left.Count) $((($left | ForEach-Object { $_.Name })) -join ' ')"
+          if ($left.Count -gt 0) { $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; exit 1 }

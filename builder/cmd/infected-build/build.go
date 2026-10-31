@@ -433,11 +433,7 @@ func (b *Builder) vars() Vars {
 }
 
 func (b *Builder) env() []string {
-	e := childEnv(b.kit, b.tmp, b.makeProg, b.progFile, os.Getenv)
-	if d := os.Getenv("IB_DIAG_ENV"); d != "" { // TEMPORARY experiment hook
-		e = append(e, strings.Split(d, ";;")...)
-	}
-	return e
+	return childEnv(b.kit, b.tmp, b.makeProg, b.progFile, os.Getenv)
 }
 
 func (b *Builder) newRunner(ctx context.Context) *Runner {
@@ -584,9 +580,6 @@ func (b *Builder) runLink(ctx context.Context, padObject, elf string) error {
 			e = padObject
 		}
 		args = append(args, e)
-	}
-	if d := os.Getenv("IB_DIAG_LINKARGS"); d != "" { // TEMPORARY experiment hook
-		args = append(args, strings.Split(d, ";;")...)
 	}
 	os.Remove(b.progFile)
 	stop := b.watchPartitions(ctx)

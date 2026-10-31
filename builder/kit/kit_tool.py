@@ -241,7 +241,12 @@ def cmd_recipe(a):
                             'tool': 'cxx', 'args': padflags + ['-DINFECTED_TEXT_PAD={pad}', '-c', 'game/link/text_pad.cpp', '-o', '{padObject}'],
                             'then': 'link again with {padObject} in place of textPad.object'},
                     'note': 'hint = the pad the reference build ended with; link.args already uses an object made with it, so normally there is one link.'},
-        'elfCreate': {'tool': 'elfCreate', 'args': velf[1:-2] + ['{elf}', '{velf}']},
+        # -s: no section headers, symbol table or debug sections in the Sony ELF. vita-make-fself takes the module NID from a hash of
+        # the WHOLE velf file, and the symbol table order that ld gives depends on the computer that ran it (the 'unsigned long' of its
+        # symbol hash is 32 bits wide on Windows, 64 on Linux and macOS, so symbols with long C++ names change places): the same program
+        # would get a different NID, and so a different eboot.bin, on Windows. The Vita loads the program segments only.
+        'elfCreate': {'tool': 'elfCreate', 'args': (velf[1:-2] if '-s' in velf[1:-2] else ['-s'] + velf[1:-2]) + ['{elf}', '{velf}'],
+                      'why': 'see kit_tool.py: -s keeps the host-dependent symbol table order out of the file whose hash vita-make-fself turns into the module NID'},
         'fself': {'tool': 'fself', 'args': fself[1:-2] + ['{velf}', '{eboot}']},
         'vpk': {'zip': 'infected.vpk', 'method': 'deflate', 'entries': vpk['entries'], 'fromKit': 'game/vpk/', 'eboot': 'eboot.bin',
                 'paramSfoMadeWith': {'program': 'vita-mksfoex', 'args': vpk['mksfoex']['args'] + [vpk['mksfoex']['name'], 'param.sfo']}},
