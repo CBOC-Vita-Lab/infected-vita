@@ -783,6 +783,12 @@ func (b *Builder) packageVPK(ctx context.Context, elf string) (string, error) {
 			}
 			return "", userErrorf("%s Details: {log}", st.fail)
 		}
+		if st.tool == "elfCreate" && b.kit.ElfCreate.StripSections {
+			if err := stripVelf(velf); err != nil {
+				b.log.Printf("strip the Sony ELF: %v", err)
+				return "", userErrorf("%s Details: {log}", st.fail)
+			}
+		}
 	}
 	out := filepath.Join(b.Opt.OutDir, b.kit.Vpk.Zip)
 	if err := writeVPK(b.kit, eboot, out); err != nil {

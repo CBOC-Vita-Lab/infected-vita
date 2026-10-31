@@ -75,6 +75,8 @@ type Kit struct {
 	ElfCreate struct {
 		Tool string   `json:"tool"`
 		Args []string `json:"args"`
+		// StripSections: after vita-elf-create, keep only the header and the segments of the Sony ELF (velf.go)
+		StripSections bool `json:"stripSections"`
 	} `json:"elfCreate"`
 	Fself struct {
 		Tool string   `json:"tool"`

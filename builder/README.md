@@ -91,7 +91,7 @@ the compiles, which run in the **work folder** (see Determinism). Tool names are
 | `link` | `argsFile` (`game/link/link.args`, one argument per line) and `extraArgs` appended to it (`-ffile-prefix-map=...`, `-g0`) |
 | `postLinkCheck` | run `nm`; fail if a line matches `failIfLineMatches` (weak pthread functions) |
 | `textPad` | `object` (the text-pad object in link.args), `minFreeBytes`, `check` (readelf), `fix` (how to recompile the pad object when the code segment leaves too little room, then link again) |
-| `elfCreate`, `fself` | arguments of `vita-elf-create` and `vita-make-fself` |
+| `elfCreate`, `fself` | arguments of `vita-elf-create` and `vita-make-fself`; `elfCreate.stripSections` (see Determinism) |
 | `vpk` | the output name and the ordered `entries`; every entry but `eboot` comes from `game/vpk/` |
 | `minDiskBytes` | free space to require in the work folder |
 | `files` | every file under `game/`, `toolchain/`, `licenses/` with `sha256` and `size` |
@@ -160,18 +160,15 @@ CI builds the synthetic corpus (`.github/smoke/gen`, no game data) with the unpa
   the builder expands `{kit}` and `{work}` with forward slashes; a map written with backslashes matches nothing there. (The working
   directory that GCC streams into the LTO objects is not mapped on Windows; there, two work folders of different length gave the same
   `eboot.bin` in the test.)
-- **`vita-elf-create -s`.** `vita-make-fself` computes the module NID of the program from a hash of the *whole* Sony ELF file, not only of the
-  segments the Vita loads, and that file carried the linker's symbol table. `ld` writes global symbols in the order of its hash table
-  (`bfd_hash_hash`, table size 16381), and its hash is an `unsigned long`: 64 bits on Linux and macOS, 32 bits in the Windows build. Symbols with long C++ names
-  (mostly `std::_Hashtable<...>` instantiations) get another bucket there, so the `.symtab`/`.strtab`/`.rel.*` sections differ
-  (30 of 10,180 global symbols moved in the test), the NID differs, and so does `eboot.bin` (4 bytes of the code segment, its compressed
-  tail and the header digest), although every loadable segment is the same. `-s` leaves the Sony ELF without sections, so nothing that depends on the
-  linker's symbol order is left in the file; `kit_tool.py` puts it into `elfCreate.args` of `kit.json`. (The eboot.bin has no section headers anyway.)
-
-Against the normal CMake build (`vita/app/build.sh`) the `eboot.bin` is **not** identical: the kit links stripped objects named
-`game/link/obj/...` with `-g0`, CMake links `CMakeFiles/.../*.obj` with `-g`. With the same game library, a kit link with `-g` (before `-g0` was added) and the CMake link
-differed in 209 of 11,082,844 bytes of the code segment, in 81 places (branch stubs); the rest of the package was identical. `recomp/build_lib.sh` applies the same prefix map and
-`PWD` rule, so the game library itself is the same object for object.
+- **The Sony ELF is stripped to what the Vita loads.** `vita-make-fself` computes the module NID of the program from a hash of the *whole* Sony
+  ELF file, not only of the segments, and that file carried the linker's symbol table. `ld` writes the global symbols in the order of its hash
+  table (`bfd_hash_hash`, table size 16381), and its hash is an `unsigned long`: 64 bits on Linux and macOS, 32 bits in the Windows build.
+  Symbols with long C++ names (mostly `std::_Hashtable<...>` instantiations) get another bucket there, so `.symtab`, `.strtab` and `.rel.*` differ
+  (29 of 10,180 global symbols moved in the test), the NID differs, and so does `eboot.bin` (4 bytes of the code segment, its compressed tail and
+  the header digest), although every loadable segment is the same. `kit.json` therefore says `"stripSections": true` in `elfCreate`, and the program
+  (`velf.go`) keeps the ELF header, the program headers and the segments of the `.velf` and zeroes the rest (section header fields included) before
+  `vita-make-fself` runs. (`vita-elf-create -s` strips the file too, but the Windows build of it ignores `-s`.) Nothing the Vita loads changes: the
+  `eboot.bin` made with a stripped Sony ELF differs from the one made with the full file in the module NID and the header digest only.
 
 ## Making a kit
 

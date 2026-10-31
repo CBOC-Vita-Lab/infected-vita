@@ -37,6 +37,28 @@ def segments_sha256(path):
         log('segment %d type=%#x vaddr=%#x filesz=%d memsz=%d flags=%#x sha256=%s' % (i, t, va, fsz, msz, fl, hashlib.sha256(d[off:off + fsz]).hexdigest()[:16]))
     return h.hexdigest()
 
+def strip_velf(path):
+    """kit.json elfCreate.stripSections (builder/cmd/infected-build/velf.go does the same): keep the ELF header, the program headers and
+    the bytes of the segments, zero everything else, cut the file after the last segment. vita-make-fself hashes the whole file into the
+    module NID, and the symbol table inside it is in another order when ld ran on Windows."""
+    import struct
+    d = open(path, 'rb').read()
+    assert d[:6] == b'\x7fELF\x01\x01', 'not a 32-bit little-endian ELF'
+    phoff, = struct.unpack_from('<I', d, 28)
+    phentsize, phnum = struct.unpack_from('<HH', d, 42)
+    keep = [(0, 52), (phoff, phoff + phnum * phentsize)]
+    for i in range(phnum):
+        off, = struct.unpack_from('<I', d, phoff + i * phentsize + 4)
+        fsz, = struct.unpack_from('<I', d, phoff + i * phentsize + 16)
+        if fsz:
+            keep.append((off, off + fsz))
+    out = bytearray(max(b for _, b in keep))
+    for a, b in keep:
+        out[a:b] = d[a:b]
+    struct.pack_into('<I', out, 32, 0)
+    struct.pack_into('<HHH', out, 46, 0, 0, 0)
+    open(path, 'wb').write(bytes(out))
+
 def main():
     args = sys.argv[1:]
     keep = False
@@ -154,6 +176,8 @@ def main():
     # with backslashes would give "\infected.elf" instead of "infected.elf", so these three paths are given with forward slashes
     # (Windows accepts them). The builder must do the same.
     run('elf-create', [tool('elfCreate')] + [x.replace('{elf}', fw(elf)).replace('{velf}', fw(velf)) for x in r['elfCreate']['args']], kit)
+    if r['elfCreate'].get('stripSections'):
+        strip_velf(velf)
     run('fself', [tool('fself')] + [x.replace('{velf}', fw(velf)).replace('{eboot}', fw(eboot)) for x in r['fself']['args']], kit)
 
     # ---- the package
