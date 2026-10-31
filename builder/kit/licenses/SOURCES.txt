@@ -1,0 +1,86 @@
+Infected-Vita builder kit: what is in it, under which licence, and where the exact source is.
+===========================================================================================
+
+This kit holds programs and libraries that other people wrote. Most of them are covered by the GNU GPL or LGPL, which means
+you may ask for, and are entitled to, their source code. Every item below names the upstream source and the exact version or
+commit the files in this kit were built from. Where an item says "see the generated section", make-kit.sh wrote the precise
+facts about the VitaSDK copy it used at the end of this file.
+
+If something you need is not reachable from here, open an issue at https://github.com/CBOC-Vita-Lab/infected-vita and ask for
+the source of the item.
+
+The kit contains nothing from the game. The game's code is generated on your computer, from your disc, when you build.
+
+The licence texts are in the licenses/ folder next to this file.
+
+
+1. Toolchain (toolchain/): VitaSDK, build "sdk-snapshot-20260926.790.1" (built 2026-09-26 08:30:00), https://vitasdk.org
+   Built by https://github.com/vitasdk/autobuilds at that tag, from the sources below. Only the parts the build steps touch
+   are included (see lists/ in the kit maker; the kit.json "files" table lists every file with its SHA-256).
+
+   Program / files                               Source                                                        Licence (text in licenses/)
+   --------------------------------------------  ------------------------------------------------------------  --------------------------------
+   arm-vita-eabi-g++ / -gcc, cc1plus, lto1,      GCC 15.2.0, https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/           GPL-3.0 (GPL-3.0.txt), with the GCC
+   collect2, lto-wrapper, liblto_plugin,         (git tag releases/gcc-15.2.0 of git://gcc.gnu.org/git/gcc.git;  Runtime Library Exception 3.1 for the
+   libgcc.a, libstdc++.a, libsupc++.a, crt*.o,   VitaSDK patches: vitasdk/autobuilds at the tag above)        files that end up in your program
+   the libstdc++ and libgcc headers                                                                            (GCC-RUNTIME-LIBRARY-EXCEPTION-3.1.txt)
+   arm-vita-eabi-as, arm-vita-eabi-ld,           GNU binutils (version printed by `ld --version`: 2.46.1),     GPL-3.0
+   arm-vita-eabi-ar, -nm, -readelf,              https://ftp.gnu.org/gnu/binutils/
+   gcc-ar, ld scripts (arm-vita-eabi/lib/ldscripts)
+   libc.a, libm.a, libg.a, newlib headers,       VitaSDK newlib,                                               newlib licences, BSD-style and
+   crt0.o                                        https://github.com/vitasdk/newlib                             similar (NEWLIB-COPYING.NEWLIB.txt)
+                                                 commit 2e428297c0b6aefd830c5a75a7daa7e774562a42
+   libpthread.a, pthread headers                 VitaSDK pthread-embedded,                                     LGPL-2.1 (PTHREAD-EMBEDDED-COPYING.txt,
+                                                 https://github.com/vitasdk/pthread-embedded                   LGPL-2.1.txt)
+                                                 commit 11d2e5722d98c86f33c908fc47b2cf6e55205db5
+   vita-elf-create, vita-make-fself,             vita-toolchain,                                               MIT (MIT-vita-toolchain.txt)
+   (vita-pack-vpk and vita-mksfoex are not       https://github.com/vitasdk/vita-toolchain
+   shipped)                                      commit e8bc8f70ee5d3036f1562486cbc6065b52a8d173
+   Vita system headers, the NID database that    vita-headers,                                                 MIT (MIT-vita-headers.txt)
+   vita-elf-create reads, the SceXxx_stub.a      https://github.com/vitasdk/vita-headers
+   import libraries made from it                 commit e66ebe90b73d1fa4cce005a5b2072cec27322544
+
+   The GCC, binutils and newlib sources are unmodified except for the patches in the vitasdk/autobuilds repository at the tag
+   named above. libgcc.a and libstdc++.a are linked into the program; the GCC Runtime Library Exception lets that program be
+   distributed under other terms.
+
+2. Prebuilt parts of the application (game/link/): built by make-kit.sh from https://github.com/CBOC-Vita-Lab/infected-vita
+   (this repository; the commit is in kit.json "source") with the toolchain above.
+
+   Component                               Source (exact)                                                              Licence
+   --------------------------------------  --------------------------------------------------------------------------  ----------------------------
+   The port: vita/app, vita/platform,      https://github.com/CBOC-Vita-Lab/infected-vita                              MIT (MIT-infected-vita.txt)
+   port/host (objects in game/link/obj)
+   PortableKit runtime and the PSP         https://github.com/TeamGDB/PortableKit                                      MIT (MIT-PortableKit.txt)
+   re-implementation (libpk_runtime.a,     commit 33800c4060c53f3233e08f8ab2cc4590a0872063 plus the patches in
+   the psprecomp_core objects, headers     patches/portablekit/ of this repository, applied by
+   in game/include)                        scripts/get-portablekit.sh (result tree a9220349f40d51021d5ed7850e477e51a5171e02)
+   vitaGL (libvitaGL.a)                    https://github.com/Rinnegatamante/vitaGL                                    GPL-3.0 (GPL-3.0.txt,
+                                           commit dca4b9d143290d78ec043131a19be36c78cdc7b5 plus the five patches       LGPL-3.0-vitaGL-COPYING.LESSER.txt
+                                           vita/scripts/patches/vitagl-0001 ... 0005 of this repository                from its repository)
+                                           (applied by vita/scripts/fetch-third-party.sh)
+   vitaShaRK (libvitashark.a)              https://github.com/Rinnegatamante/vitaShaRK                                 LGPL-3.0 (LGPL-3.0-vitaShaRK.txt)
+                                           commit df24065e65098b2d1ac533760109ad4367573f28
+   SceShaccCgExt (libSceShaccCgExt.a)      https://github.com/Rinnegatamante/SceShaccCgExt                             GPL-3.0 (GPL-3.0-SceShaccCgExt.txt)
+                                           commit 102192366c25fe7b8fec073d665494b6172605c3
+   math-neon (libmathneon.a)               https://github.com/Rinnegatamante/math-neon                                 MIT (MIT-math-neon.txt)
+                                           commit 0faab814782c071ff4015527f1ca955ab1ccc470
+   taiHEN user stubs (libtaihen_stub.a)    vdpm package taihen-0.11-1-vita.pkg.tar.xz, SHA-256                         MIT (MIT-taiHEN.txt)
+                                           93d2075b6b61a164224a2aad651d3d6787f31f3a19c3e2bada7c99844f9fae90, from
+                                           https://github.com/vitasdk/vitasdk-autobuild/releases/download/packages-2026.08-snapshot-20260925.50.1/
+                                           (taiHEN source: https://github.com/yifanlu/taiHEN commit 309b3800bcb8ebbd5e4f5e5e920af3da3590b829)
+   FFmpeg 7.1.5 (libavcodec.a,             https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz                             LGPL-2.1-or-later for this
+   libavutil.a: the ATRAC3, ATRAC3plus     SHA-256 de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f    configuration (LGPL-2.1.txt,
+   and H.264 decoders only)                plus vita/scripts/patches/ffmpeg-tx-float-only.patch of this repository     FFmpeg-LICENSE.md)
+                                           (SHA-256 7be0cb378a8438dadecfbd0b1dca1e5d5a3281307be2c72068826de14db4ce4d);
+                                           configure options: vita/LOG.md of this repository
+   infected_core3.skprx (game/vpk/module)  vita/core3 of this repository                                               MIT
+
+   How to rebuild any of this from source: docs/BUILDING.md of this repository (sections 2 and 4), or builder/kit/make-kit.sh.
+   Link-time note: the application is linked statically with vitaGL (GPL-3.0), vitaShaRK (LGPL-3.0), SceShaccCgExt (GPL-3.0) and
+   FFmpeg (LGPL-2.1+). The package you build is for your own use; if you pass it on, you must pass on its source under the
+   same terms. The objects and libraries needed to relink are in game/link/ and the source is at the addresses above.
+
+3. Other artwork in game/vpk/: the LiveArea and RetroFlow pictures are drawn by vita/vita/assets/gen_bubble.py of this repository
+   (original artwork, MIT). param.sfo is made by vita-mksfoex from vita-toolchain (see kit.json "vpk").
+

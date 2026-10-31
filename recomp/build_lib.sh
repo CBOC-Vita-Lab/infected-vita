@@ -14,7 +14,10 @@
 #   LEAN_OPT     optimisation level (default -O2)
 #   LEAN_LTO=1   vita: link-time optimisation objects (GCC GIMPLE, archived with gcc-ar as liblean_vita_lto.a). The application
 #                then links with -DINFECTED_LEAN_LTO=ON, which inlines across the 73 units at link time (the generated functions
-#                are small and call across units all the time). Objects go to OUT/lto.
+#                are small and call across units all the time). Objects go to OUT/lto. Each unit gets a fixed -frandom-seed=<its name>:
+#                without it GCC seeds the LTO objects from the clock and two builds of the same sources link to slightly different code.
+#   LEAN_STAGE=DIR  the staging folder the units are compiled in (default OUT/lto/stage; its name ends up in the objects).
+#   LEAN_PRINT_FLAGS=1  print the compiler flags (one line) and stop (builder/kit/make-kit.sh records them in the builder kit).
 #
 # The flags are the contract: -ffp-contract=off (no fused multiply-add; the guest has none), -fno-math-errno, no exceptions/RTTI.
 # vita: Cortex-A9 + NEON + hard float, Thumb-2.  x86: the scalar fallback of the NEON forms (no LEAN_NEON_SHIM).
@@ -37,7 +40,10 @@ case $TARGET in
     FLAGS="$COMMON -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb"
     if [ "${LEAN_LTO:-0}" = 1 ]; then
       AR=$SDK/bin/arm-vita-eabi-gcc-ar
-      FLAGS="$FLAGS -flto"
+      # The LTO streams carry the file names of the headers, and the final link lays the code out differently for different names
+      # (a few hundred bytes of branch stubs). So the units are compiled from a small staging folder, with the same relative
+      # names on every machine: -Iinc -Igen, gen/lean_NNN.cpp (builder/kit compiles exactly like this).
+      FLAGS="${FLAGS//"-I$PK -I$HERE -I$GEN"/-Iinc -Igen} -flto"
       SUFFIX=_lto
     fi
     ;;
@@ -48,15 +54,24 @@ case $TARGET in
     ;;
   *) echo "unknown target $TARGET" >&2; exit 2 ;;
 esac
+if [ "${LEAN_PRINT_FLAGS:-0}" = 1 ]; then printf '%s\n' "$FLAGS"; exit 0; fi
 [ -n "${SUFFIX:-}" ] && OUT=$OUT/lto
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+STAGE=.
+if [ -n "${SUFFIX:-}" ]; then
+  STAGE=${LEAN_STAGE:-$OUT/stage}      # GCC also streams the absolute working directory into the LTO objects: pass a fixed LEAN_STAGE to get identical objects
+  rm -rf "$STAGE"; mkdir -p "$STAGE/inc/psprecomp"
+  cp "$HERE"/lean_*.h "$STAGE/inc/"
+  cp "$PK"/psprecomp/*.hpp "$STAGE/inc/psprecomp/"
+  ln -sfn "$GEN" "$STAGE/gen"
+fi
 for f in "$GEN"/lean_[0-9]*.cpp "$GEN"/lean_table.cpp; do
   o=$OUT/$(basename "$f" .cpp).o
   if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$HERE/lean_abi.h" -nt "$o" ] || [ "$HERE/lean_vfpu.h" -nt "$o" ] || [ "$HERE/lean_vfpu_fast.h" -nt "$o" ] || [ "$GEN/lean_decls.h" -nt "$o" ]; then
     echo "$f"
   fi
-done | nice -n 10 xargs -P "$JOBS" -I{} sh -c 'f={}; o='"$OUT"'/$(basename $f .cpp).o; s=$(date +%s); '"$CXX $FLAGS"' -c $f -o $o || exit 255; echo "$(basename $f) $(( $(date +%s) - s ))s" >> '"$OUT"'/compile_times.txt'
+done | nice -n 10 xargs -P "$JOBS" -I{} sh -c 'f={}; b=$(basename $f .cpp); o='"$OUT"'/$b.o; s=$(date +%s); seed=; src=$f; if [ "'"${SUFFIX:-}"'" = _lto ]; then seed=-frandom-seed=$b; src=gen/$b.cpp; cd '"$STAGE"'; fi; '"$CXX $FLAGS"' $seed -c $src -o $o || exit 255; echo "$(basename $f) $(( $(date +%s) - s ))s" >> '"$OUT"'/compile_times.txt'
 rm -f "$OUT/liblean_$TARGET${SUFFIX:-}.a"
 "$AR" rcs "$OUT/liblean_$TARGET${SUFFIX:-}.a" "$OUT"/lean_[0-9]*.o "$OUT"/lean_table.o
 echo "built $OUT/liblean_$TARGET${SUFFIX:-}.a"

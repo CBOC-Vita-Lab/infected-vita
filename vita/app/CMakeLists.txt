@@ -201,7 +201,9 @@ target_link_options(infected PRIVATE "LINKER:-u,g_lean_entry" "LINKER:-u,g_lean_
 # objects carry GIMPLE; the rest of the application is linked as before.
 option(INFECTED_LEAN_LTO "LEAN_LIB holds LTO objects" OFF)
 if(INFECTED_LEAN_LTO)
-  target_link_options(infected PRIVATE -flto=2 -flto-partition=balanced -O2 -fno-math-errno -ffp-contract=off
+  # -frandom-seed: without a fixed seed GCC seeds the LTO partitions from the clock/temporary names, and two links of the same
+  # objects differ in a few hundred bytes of code (builder/kit proves the kit's link is byte-identical to this one).
+  target_link_options(infected PRIVATE -flto=2 -flto-partition=balanced -frandom-seed=infected -O2 -fno-math-errno -ffp-contract=off
                       -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb)
 endif()
 # libgcc and libstdc++ decide whether the program has threads by a WEAK reference to pthread_cancel (gthr-posix.h,
