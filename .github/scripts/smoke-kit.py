@@ -34,6 +34,7 @@ def segments_sha256(path):
         t, off, va, pa, fsz, msz, fl, al = struct.unpack_from('<8I', d, phoff + i * phentsize)
         h.update(struct.pack('<8I', t, 0, va, pa, fsz, msz, fl, al))
         h.update(d[off:off + fsz])
+        log('segment %d type=%#x vaddr=%#x filesz=%d memsz=%d flags=%#x sha256=%s' % (i, t, va, fsz, msz, fl, hashlib.sha256(d[off:off + fsz]).hexdigest()[:16]))
     return h.hexdigest()
 
 def main():

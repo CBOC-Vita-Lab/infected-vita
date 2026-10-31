@@ -222,7 +222,7 @@ jobs:
             echo "kit ${{ matrix.name }}"
             echo "kit-sha256 $(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$T/out/$KIT_FILE")"
             echo "kit-bytes $(python3 -I -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$T/out/$KIT_FILE")"
-            grep -E '^(segments|eboot|vpk)-sha256 ' "$T/smoke.log"
+            grep -E '^(segment [0-9]|(segments|eboot|vpk)-sha256 )' "$T/smoke.log"
           } > "$T/result/${{ matrix.name }}.txt"
           cat "$T/result/${{ matrix.name }}.txt"
       # When the program exists and can build from already generated C++ (--gen DIR, see the report), its result must be the same
@@ -269,8 +269,10 @@ jobs:
           import glob, os, sys
           rows = {}
           for p in sorted(glob.glob('results/*/*.txt')):
-              d = dict(l.split(None, 1) for l in open(p).read().splitlines() if l.strip())
+              lines = open(p).read().splitlines()
+              d = dict(l.split(None, 1) for l in lines if l.strip() and not l.startswith('segment '))
               rows[d['kit'].strip()] = {k: v.strip() for k, v in d.items()}
+              rows[d['kit'].strip()]['segments'] = [l for l in lines if l.startswith('segment ')]
           names = ['linux', 'windows', 'mac-intel', 'mac-arm']
           missing = [n for n in names if n not in rows]
           out = ['| kit | size | segments-sha256 | eboot.bin sha256 |', '|---|---|---|---|']
@@ -283,6 +285,8 @@ jobs:
           if missing:
               sys.exit('no result from: %s' % ', '.join(missing))
           if len({rows[n]['segments-sha256'] for n in names}) != 1:
+              for n in names:
+                  print('--', n); print('\n'.join(rows[n]['segments']))
               sys.exit('FAIL: the four kits did not make the same program')
           print('OK: all four kits made the same program')
           PY
