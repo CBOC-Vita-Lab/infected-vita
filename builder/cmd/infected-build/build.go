@@ -426,14 +426,18 @@ func copyTree(src, dst string) error {
 // vars are the placeholder values every step can use.
 func (b *Builder) vars() Vars {
 	return Vars{
-		"kit":  b.kit.Dir,
-		"work": b.work,
+		"kit":  filepath.ToSlash(b.kit.Dir),
+		"work": filepath.ToSlash(b.work),
 		"jobs": strconv.Itoa(b.jobs),
 	}
 }
 
 func (b *Builder) env() []string {
-	return childEnv(b.kit, b.tmp, b.makeProg, b.progFile, os.Getenv)
+	e := childEnv(b.kit, b.tmp, b.makeProg, b.progFile, os.Getenv)
+	if d := os.Getenv("IB_DIAG_ENV"); d != "" { // TEMPORARY experiment hook
+		e = append(e, strings.Split(d, ";;")...)
+	}
+	return e
 }
 
 func (b *Builder) newRunner(ctx context.Context) *Runner {
