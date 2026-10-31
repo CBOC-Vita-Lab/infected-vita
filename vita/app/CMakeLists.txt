@@ -44,7 +44,7 @@ set(LIVEAREA_DIR "${CMAKE_BINARY_DIR}/livearea" CACHE PATH "generated LiveArea t
 set(RETROFLOW_DIR "${CMAKE_BINARY_DIR}/retroflow" CACHE PATH "RetroFlow pictures (COVERS/Homebrew/<id>.png, BACKGROUNDS/Homebrew/<id>.png); the app copies them to ux0:data/RetroFlow/ on its first start when RetroFlow is installed")
 set(NEWLIB_HEAP_MIB "176" CACHE STRING "_newlib_heap_size_user in MiB (see src/app_memory.cpp for the budget)")
 set(INFECTED_TEXT_PAD 0 CACHE STRING "bytes of padding in .text (build.sh sets it so vita-elf-create finds room after the code segment)")
-set(INFECTED_SHADER_CACHE_DIR "" CACHE PATH "a vitaGL shader cache (the shader_cache folder of a run: v2/v/XX/*.gxp, v2/f/XX/*.gxp) to ship in the VPK; it is copied to ux0:data/infected/shader_cache on the first start")
+set(INFECTED_SHADER_CACHE_DIR "" CACHE PATH "a vitaGL shader cache (the shader_cache folder of a run: v3/v/XX/*.gxp, v3/f/XX/*.gxp; a 1.0 cache with v2/ goes through vita/scripts/shader-cache-to-v3.sh first) to ship in the VPK; it is copied to ux0:data/infected/shader_cache on the first start")
 set(INFECTED_NO_GL OFF CACHE BOOL "build without the GL renderer (headless logging renderer only)")
 
 if(VITAGL_VARIANT STREQUAL "release")

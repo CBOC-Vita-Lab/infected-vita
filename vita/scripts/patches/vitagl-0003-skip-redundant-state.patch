@@ -3,9 +3,15 @@ sceGxmSetFragmentProgram, sceGxmSetFragmentTexture and sceGxmSetVertexStream cal
 such draw set; every other path that sets those (clears, blits, the scissor test, fixed function, legacy draws) and
 every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Off by default.
 
+Rebased onto upstream 9bf3e3f (30 Oct 2026). That commit makes glUseProgram(current program) return before it marks the
+custom-shader uniforms dirty. The paths this patch already lists as setting GXM state behind the custom draws' back (clear,
+framebuffer blit, scissor-test mask, fixed function, legacy draws, every scene begun or ended) also reserve the default
+uniform buffers, so vgl_gxm_state_touched() now marks dirty_shader_vert_unifs / dirty_shader_frag_unifs too: the next
+custom-shader draw uploads its uniforms again after any of them, with or without a glUseProgram in between.
+
 --- a/source/vitaGL.h
 +++ b/source/vitaGL.h
-@@ -1157,6 +1157,10 @@
+@@ -1167,6 +1167,10 @@
  // Overloads a buffer object with a pre-GPU mapped memory block with a copy-less action.
  void vglBufferData(GLenum target, const GLvoid *data);
  
@@ -18,14 +24,17 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  
 --- a/source/shared.h
 +++ b/source/shared.h
-@@ -454,6 +454,11 @@
+@@ -454,6 +454,14 @@
  	vgl_error = x; \
  	return y;
  
 +// Infected port (patch 0003): moved by every path that sets the GXM programs, fragment textures or vertex streams other
 +// than the custom-shader draws, and by every scene begun or ended, so that those draws know what they last set is stale.
++// The same paths (clear, blit, scissor-test mask, fixed function) also reserve the default uniform buffers, and since
++// upstream 9bf3e3f glUseProgram(current program) no longer marks the custom uniforms dirty, they mark them here: the next
++// custom-shader draw uploads its uniforms again, as it did when the program call did it.
 +extern uint32_t vgl_gxm_state_epoch;
-+#define vgl_gxm_state_touched() (vgl_gxm_state_epoch++)
++#define vgl_gxm_state_touched() (vgl_gxm_state_epoch++, dirty_shader_vert_unifs = GL_TRUE, dirty_shader_frag_unifs = GL_TRUE)
 +
  extern size_t max_vcache_size;
  extern size_t max_fcache_size;
@@ -120,7 +129,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #define VERTEX_LAYOUT_CACHE_ENTRIES 4
  static uint32_t vertex_program_layout_current_ver = 0;
  static vertex_layout_cache_entry vertex_layout_cache[VERTEX_LAYOUT_CACHE_ENTRIES] = {};
-@@ -839,7 +911,7 @@
+@@ -844,7 +916,7 @@
  				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
  				tex->overridden = GL_FALSE;
  			}
@@ -129,7 +138,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #ifdef HAVE_GLSL_TEXTURE_SIZE
  			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
  			if (info) {
-@@ -900,16 +972,16 @@
+@@ -905,16 +977,16 @@
  		SceGxmVertexStream *streams = layout_entry->stream;
  		vertex_layout_setup_ptrs(p, layout_entry->is_packed, lowest, highest - lowest, highest, ptrs);
  		p->vprog = layout_entry->vprog;
@@ -149,7 +158,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  					}
  				}
  			}
-@@ -1021,7 +1093,7 @@
+@@ -1026,7 +1098,7 @@
  #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
  	vertex_layout_cache_insert(p, VERTEX_LAYOUT_MULTI_DRAW, 0, is_packed, GL_FALSE, attributes, streams);
  #endif
@@ -158,7 +167,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  
  	// Uploading both fragment and vertex uniforms data
  	upload_uniforms();
-@@ -1034,14 +1106,14 @@
+@@ -1039,14 +1111,14 @@
  			if (is_active) {
  #ifdef STRICT_DRAW_COMPLIANCE
  				if (is_packed[i])
@@ -177,7 +186,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #endif
  			}
  		}
-@@ -1097,7 +1169,7 @@
+@@ -1102,7 +1174,7 @@
  				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
  				tex->overridden = GL_FALSE;
  			}
@@ -186,7 +195,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #ifdef HAVE_GLSL_TEXTURE_SIZE
  			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
  			if (info) {
-@@ -1158,17 +1230,17 @@
+@@ -1163,17 +1235,17 @@
  		void *ptrs[VERTEX_ATTRIBS_NUM];
  		vertex_layout_setup_ptrs(p, layout_entry->is_packed, first, count, count, ptrs);
  		p->vprog = layout_entry->vprog;
@@ -208,7 +217,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  			}
  		}
  #ifdef HAVE_PROFILING
-@@ -1302,7 +1374,7 @@
+@@ -1307,7 +1379,7 @@
  #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
  	vertex_layout_cache_insert(p, VERTEX_LAYOUT_ARRAYS, layout_variant, is_packed, GL_FALSE, attributes, streams);
  #endif
@@ -217,7 +226,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  
  	// Uploading both fragment and vertex uniforms data
  	upload_uniforms();
-@@ -1313,16 +1385,16 @@
+@@ -1318,16 +1390,16 @@
  		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
  		if (is_active) {
  #ifdef DRAW_SPEEDHACK
@@ -238,7 +247,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		}
  		if (!p->has_unaligned_attrs) {
  			attributes[i].regIndex = i;
-@@ -1383,7 +1455,7 @@
+@@ -1388,7 +1460,7 @@
  				vglSetTexLodBias(&tex->gxm_tex, tex->lod_bias);
  				tex->overridden = GL_FALSE;
  			}
@@ -247,7 +256,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #ifdef HAVE_GLSL_TEXTURE_SIZE
  			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
  			if (info) {
-@@ -1463,17 +1535,17 @@
+@@ -1468,17 +1540,17 @@
  			void *ptrs[VERTEX_ATTRIBS_NUM];
  			vertex_layout_setup_ptrs(p, layout_entry->is_packed, 0, top_idx, top_idx, ptrs);
  			p->vprog = layout_entry->vprog;
@@ -269,7 +278,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  				}
  			}
  #ifdef HAVE_PROFILING
-@@ -1639,7 +1711,7 @@
+@@ -1644,7 +1716,7 @@
  #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
  	vertex_layout_cache_insert(p, VERTEX_LAYOUT_ELEMENTS, (uint8_t)index_type, is_packed, is_full_vbo, attributes, streams);
  #endif
@@ -278,7 +287,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  
  	// Uploading both fragment and vertex uniforms data
  	upload_uniforms();
-@@ -1650,16 +1722,16 @@
+@@ -1655,16 +1727,16 @@
  		GLboolean is_active = (cur_vao->vertex_attrib_state & (1 << attr_idx)) ? GL_TRUE : GL_FALSE;
  		if (is_active) {
  #ifdef DRAW_SPEEDHACK
@@ -299,7 +308,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		}
  		if (!p->has_unaligned_attrs) {
  			attributes[i].regIndex = i;
-@@ -1688,7 +1760,7 @@
+@@ -1693,7 +1765,7 @@
  	setup_frag_program();
  
  	// Setting up required vertex shader
@@ -308,7 +317,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  
  	// Uploading textures on relative texture units
  	for (int i = 0; i < p->max_frag_texunit_idx; i++) {
-@@ -1699,7 +1771,7 @@
+@@ -1704,7 +1776,7 @@
  #ifndef TEXTURES_SPEEDHACK
  			tex->last_frame = vgl_framecount;
  #endif
@@ -317,7 +326,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #ifdef HAVE_GLSL_TEXTURE_SIZE
  			glsl_samplers_info *info = p->frag_texunits[i]->sampler;
  			if (info) {
-@@ -3872,7 +3944,7 @@
+@@ -3909,7 +3981,7 @@
  	}
  
  	// Setting vertex stream to passed index in sceGxm
@@ -326,7 +335,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  #endif
  }
  
-@@ -3881,7 +3953,7 @@
+@@ -3918,7 +3990,7 @@
  
  #ifdef ENABLE_LEGACY_PIPELINE
  	// Setting vertex stream to passed index in sceGxm
@@ -386,7 +395,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetFragmentProgram(gxm_context, blit_fragment_program_float_patched);
 --- a/source/draw.c
 +++ b/source/draw.c
-@@ -595,12 +595,14 @@
+@@ -598,12 +598,14 @@
  #ifndef TEXTURES_SPEEDHACK
  			texture_slots[tex_unit->tex_id[0]].last_frame = vgl_framecount;
  #endif
@@ -411,7 +420,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  	sceGxmSetVertexProgram(gxm_context, ffp_vertex_program_patched);
  	sceGxmSetFragmentProgram(gxm_context, ffp_fragment_program_patched);
  
-@@ -1355,6 +1356,7 @@
+@@ -1377,6 +1378,7 @@
  			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
  			tex->overridden = GL_FALSE;
  		}
@@ -419,7 +428,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
  	}
  	
-@@ -1455,6 +1457,7 @@
+@@ -1469,6 +1471,7 @@
  #endif
  				}
  			}
@@ -427,7 +436,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  			sceGxmSetVertexStream(gxm_context, j++, ptr);
  		}
  	}
-@@ -1494,6 +1497,7 @@
+@@ -1508,6 +1511,7 @@
  			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
  			tex->overridden = GL_FALSE;
  		}
@@ -435,7 +444,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
  	}
  	
-@@ -1611,6 +1615,7 @@
+@@ -1617,6 +1621,7 @@
  	
  	for (int i = 0; i < drawcount; i++) {
  		for (int z = 0; z < j; z++) {
@@ -443,7 +452,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  			sceGxmSetVertexStream(gxm_context, z, ptrs[z] + (first[i] - lowest) * strides[z]);
  		}
  		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, idx_ptr, count[i]);
-@@ -1708,6 +1713,7 @@
+@@ -1714,6 +1719,7 @@
  			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
  			tex->overridden = GL_FALSE;
  		}
@@ -451,7 +460,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
  	}
  
-@@ -1791,6 +1797,7 @@
+@@ -1789,6 +1795,7 @@
  #endif
  			}
  		}
@@ -459,7 +468,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetVertexStream(gxm_context, i, ptr);
  	}
  #ifdef HAVE_PROFILING
-@@ -2777,6 +2784,7 @@
+@@ -2775,6 +2782,7 @@
  				vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
  				tex->overridden = GL_FALSE;
  			}
@@ -467,7 +476,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  			sceGxmSetFragmentTexture(gxm_context, i, &tex->gxm_tex);
  		}
  	} else if (texture_units[0].state) { // Texturing usage
-@@ -2809,6 +2817,7 @@
+@@ -2807,6 +2815,7 @@
  			vglSetTexMipmapCount(&tex->gxm_tex, tex->use_mips ? tex->mip_count : 0);
  			tex->overridden = GL_FALSE;
  		}
@@ -475,7 +484,7 @@ every scene begun or ended moves vgl_gxm_state_epoch, which drops the record. Of
  		sceGxmSetFragmentTexture(gxm_context, 0, &tex->gxm_tex);
  	} else { // No texturing usage
  		ffp_vertex_attrib_state = (1 << FFP_ATTRIB_POSITION) | (1 << FFP_ATTRIB_COLOR);
-@@ -2824,6 +2833,7 @@
+@@ -2822,6 +2831,7 @@
  
  	// Uploading vertex streams and performing the draw
  	for (int i = 0; i < ffp_vertex_num_params; i++) {

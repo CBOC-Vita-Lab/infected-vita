@@ -16,7 +16,7 @@ clone_at() {   # url dir commit
   git -C "$2" checkout -q "$3"
   echo "$2 $(git -C "$2" rev-parse HEAD)"
 }
-clone_at https://github.com/Rinnegatamante/vitaGL       vitaGL        dca4b9d143290d78ec043131a19be36c78cdc7b5
+clone_at https://github.com/Rinnegatamante/vitaGL       vitaGL        9bf3e3f4e55efd1f4a191b179144f7f9a98cd925
 # Our vitaGL patches (scripts/patches/vitagl-*.patch, in order), applied once on top of that commit.
 for patch in "$here"/scripts/patches/vitagl-*.patch; do
   git -C vitaGL apply --check "$patch" 2>/dev/null && git -C vitaGL apply "$patch" && echo "vitaGL: applied $(basename "$patch")"

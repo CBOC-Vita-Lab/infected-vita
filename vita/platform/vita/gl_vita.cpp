@@ -125,7 +125,7 @@ bool gl_init(const GlParams& p) {
             dir_make(Root::Data, p.shader_cache_dir);
             size_t n = strlen(path);
             while (n && path[n - 1] == '/') path[--n] = 0;
-            vglSetShaderCachePath(path);   // vitaGL then reads/writes <path>/v2/{v,f}/<XX>/<H>.gxp, H = XXH3_64bits(raw GLSL) printed %llX (no zero padding), XX = H>>56 printed %02X
+            vglSetShaderCachePath(path);   // vitaGL then reads/writes <path>/v3/{v,f}/<XX>/<H>.gxp, H = XXH3_64bits(raw GLSL) printed %016llX (zero padded), XX = H>>56 printed %02X
             logf("GL: shader cache root %s", path);
         }
     }
@@ -203,7 +203,7 @@ void gl_swap() {
 }
 void gl_set_vsync(bool on) { vglWaitVblankStart(on ? GL_TRUE : GL_FALSE); }
 void gl_shutdown() {
-    // vitaGL (dca4b9d) has no vglEnd(); resources are reclaimed when the process exits.
+    // vitaGL (9bf3e3f) has no vglEnd(); resources are reclaimed when the process exits.
     logf("GL: shutdown requested (vitaGL cannot be torn down; freed at process exit)");
     g_gl_ready = false;
 }

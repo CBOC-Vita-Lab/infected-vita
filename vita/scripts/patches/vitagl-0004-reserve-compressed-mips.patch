@@ -7,7 +7,7 @@ hint off, or a chain larger than reserved) now waits for the transfers itself. O
 
 --- a/source/vitaGL.h
 +++ b/source/vitaGL.h
-@@ -1161,6 +1161,12 @@
+@@ -1171,6 +1171,12 @@
  // that the previous custom-shader draw already set and nothing has changed since (off by default).
  void vglSkipRedundantState(GLboolean enable);
  

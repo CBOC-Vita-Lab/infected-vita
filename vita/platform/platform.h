@@ -333,7 +333,7 @@ bool gl_init(const GlParams& p);
 bool gl_is_ready();
 void gl_swap();                                // vglSwapBuffers(GL_FALSE); returns after the frame is queued (see VITAGL_NOTES.md section 4)
 void gl_set_vsync(bool on);
-void gl_shutdown();                            // vitaGL (dca4b9d) has NO vglEnd(): this only marks GL as down; memory returns at process exit
+void gl_shutdown();                            // vitaGL (9bf3e3f) has NO vglEnd(): this only marks GL as down; memory returns at process exit
 void* gl_get_proc(const char* name);           // vglGetProcAddress; nullptr when the function is not implemented
 // Vita: true if libshacccg.suprx exists at ur0:/data/libshacccg.suprx (vitaShaRK's default, vitashark.c DEFAULT_SHACCCG_PATH)
 // or ur0:data/external/libshacccg.suprx (the path vitaGL's gxm.c passes to shark_init). File existence only.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build one vitaGL variant into $VITA_SYSROOT/lib/libvitaGL<suffix>.a
 #   usage: build-vitagl.sh release|debug|fast|store
-# Source tree: third_party/vitaGL (vitaGL at dca4b9d plus vita/scripts/patches/vitagl-*.patch; fetch-third-party.sh makes it). Each variant is built in its own copy.
+# Source tree: third_party/vitaGL (vitaGL at 9bf3e3f plus vita/scripts/patches/vitagl-*.patch; fetch-third-party.sh makes it). Each variant is built in its own copy.
 # NOTE: GCC 15 defaults to -std=gnu23; vitaGL (C) needs -std=gnu17 (e.g. K&R-style () prototypes). Passed through CC.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"

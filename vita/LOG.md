@@ -18,7 +18,7 @@ Third-party trees live in `third_party/` and build output in `build/`, `sysroot/
 
 | What | URL | Version |
 |---|---|---|
-| vitaGL | https://github.com/Rinnegatamante/vitaGL | `dca4b9d143290d78ec043131a19be36c78cdc7b5` (2026-10-07, "Fix alignment issue and add mips support to paletted textures."), unmodified |
+| vitaGL | https://github.com/Rinnegatamante/vitaGL | `9bf3e3f4e55efd1f4a191b179144f7f9a98cd925` (2026-10-30, "Avoid setting dirty flags when program doesn't change in glUseProgram.") plus `scripts/patches/vitagl-0001..0004` (was `dca4b9d143290d78ec043131a19be36c78cdc7b5`, 2026-10-07, until 30 Oct; see "30 Oct 2026" below) |
 | vitaShaRK | https://github.com/Rinnegatamante/vitaShaRK | `df24065e65098b2d1ac533760109ad4367573f28` |
 | SceShaccCgExt | https://github.com/Rinnegatamante/SceShaccCgExt | `102192366c25fe7b8fec073d665494b6172605c3` |
 | math-neon | https://github.com/Rinnegatamante/math-neon | `0faab814782c071ff4015527f1ca955ab1ccc470` |
@@ -135,6 +135,35 @@ Library sizes (sysroot): `libvitaGL.a` 6,398,508 B, `_debug` 6,831,756 B, `_fast
 * Vita3K does not honour `SCE_O_TRUNC` (project roadmap: a shorter rewrite keeps the old tail): `plat::file_open(WriteTruncate)`, the log open and
   `dir_copy_tree` now `sceIoRemove` the target first.
 * `log_sync` in `selftest.cfg` could never take effect (the config is read after platform init): `plat::log_set_sync()` added.
+
+## 30 Oct 2026 - vitaGL moved from `dca4b9d` to `9bf3e3f`
+
+* Pin in `scripts/fetch-third-party.sh`; the patches (`scripts/patches/vitagl-000{1..4}-*.patch`) applied to the new base in order.
+  0001 and 0002 unchanged, 0004 only shifted (`vitaGL.h` hunk 1161 -> 1171), **0003 changed**: `vgl_gxm_state_touched()` also marks
+  `dirty_shader_vert_unifs` / `dirty_shader_frag_unifs`, because upstream's `glUseProgram` no longer does when the program is unchanged and the
+  clear, blit, scissor-mask and fixed-function paths reserve the default uniform buffers (reasons: `VITAGL_NOTES.md` section 14).
+  **0005 dropped**: upstream `76f43e6` is the same change.
+* Libraries rebuilt with the default variants (`build-sysroot.sh`, release vitaGL + FFmpeg nopt); the app with `app/build.sh --lean-lib ...`.
+  Splashscreen: all variants still build with `NO_SPLASHSCREEN=1`, so upstream's new boot splash code is compiled out (checked in the object file).
+* The shader cache moved: vitaGL now uses `shader_cache/v3/{v,f}/XX/<16-digit hash>.gxp` (was `v2`, unpadded). `scripts/shader-cache-to-v3.sh`
+  converts the 1.0 cache (70 files, 10 of them with 15-digit names) for `build.sh --shader-cache`. The 1.0 eboot keeps using `v2`, the new one `v3`;
+  both folders may exist in `ux0:data/infected/shader_cache/`.
+* Upstream commits reviewed one by one against the port's GL calls: `VITAGL_NOTES.md` section 14. Expected gain is small and on the CPU side of the
+  GL thread (cheaper uniform uploads, `36219c3` and `6f56e3f`); nothing here was run on the console yet.
+
+**Console comparison (one session).** Everything except patch 0003 is compiled in, so the A side is the 1.0 `eboot.bin`:
+
+1. Keep `eboot_1.0.bin` (the `eboot.bin` of the 1.0 VPK) and `eboot_new.bin` (the new VPK's) side by side. Install the new VPK (VitaShell); the
+   install is the B side. To switch sides, copy the wanted file over `ux0:app/INFC00001/eboot.bin` (FTP or VitaShell) and start the game. Nothing else
+   differs between the two VPKs but the shader cache folder it ships (`v2` vs `v3`), and `ux0:data/infected` already has the `v2` one from 1.0.
+2. Same `config.txt` for every run, for example `bench=play`, `gl_timing=600` (`[gl-time]` lines: draws, uploads, swap) and no other change, so
+   `[play]` fps/low1%/`guest`/`ge` and `[gl-time]` are comparable. Run each side at least twice (the bot's game differs by about 2 fps a run).
+3. Runs, in this order, B first so a crash shows up early: B (new eboot); A (1.0 eboot); B with `gl_vgl_skip_redundant=0` (isolates patch 0003 in the
+   new library). Optional: B with `gl_scratch_buffers=0`.
+4. Before the first B run delete `ux0:data/infected/shader_cache/v3` if it exists, so the log shows the shipped files being copied
+   (`shader cache: 70 shipped file(s) copied`) and no `[gl] program ... linked` slow compiles at start.
+5. Look for: no vitaGL splash at start (first frames are the port's own), pictures equal to A in mission 1 (HUD, fades, post passes after clears),
+   `log.txt` without `vitaGL` errors, and the same `FINAL` line fields in `[play]`.
 
 ## Open (UNVERIFIED) items, each tied to a test
 

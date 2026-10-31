@@ -85,7 +85,7 @@ of the game). `SETTINGS.md` lists every option, what it costs and which ones nee
 | `texpack_2x.bin`, `texpack_4x.bin` | optional HD texture packs (yours to copy; the menu row "HD textures" turns on when one is there). `texpack_4x.bin` is the **mixed** 4x pack (about 98 MB) |
 | `log.txt` | the log of the **last** run (rewritten each start); send it with any report |
 | `ms0/PSP/SAVEDATA/ULUS10054xxxx/` | the game's save data (the PSP memory stick is emulated by the folder `ms0/`); a copy of a PSP save folder dropped in works |
-| `shader_cache/v2/{v,f}/XX/<hash>.gxp` | compiled shaders, one file per GLSL source |
+| `shader_cache/v3/{v,f}/XX/<hash>.gxp` | compiled shaders, one file per GLSL source (`v2/` is the 1.0 build's: the two sit side by side) |
 | `dumps/` | GE dumps for `bench=ge_replay` (below) |
 | `pad.script` | optional scripted input (`pad_script_file=pad.script`) for unattended runs |
 

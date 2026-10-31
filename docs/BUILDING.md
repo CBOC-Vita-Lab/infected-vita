@@ -98,7 +98,7 @@ The result is **`dist/infected.vpk`** (and `dist/infected.elf`, the unstripped p
 | Option | What it does |
 | --- | --- |
 | `--art DIR` | Use these bubble and RetroFlow pictures instead of the original artwork that `vita/vita/assets/gen_bubble.py` draws. Make `DIR` with `art_from_disc.py` or `art_from_image.py` (below). |
-| `--shader-cache DIR` | Ship precompiled shaders. Optional: without them the game compiles each shader the first time it is drawn. `DIR` is the `shader_cache` folder of an earlier run (`ux0:data/infected/shader_cache`, filled fastest with `prewarm_shaders=1`, see `vita/README-VITA.md`). |
+| `--shader-cache DIR` | Ship precompiled shaders. Optional: without them the game compiles each shader the first time it is drawn. `DIR` is the `shader_cache` folder of an earlier run (`ux0:data/infected/shader_cache`, filled fastest with `prewarm_shaders=1`, see `vita/README-VITA.md`); it has to hold `v3/` (the vitaGL this port builds with): a `v2/` cache from a 1.0 build goes through `vita/scripts/shader-cache-to-v3.sh SRC DST` first. |
 | `--heap-mib N`, `--vitagl`, `--ffmpeg`, `--attr2` | Memory split and library variants. The defaults are the ones the measurements in `docs/STATUS.md` were made with. |
 | `--clean` | Start the CMake build directory again. |
 

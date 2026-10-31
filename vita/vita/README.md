@@ -314,10 +314,11 @@ entry. So users without the compiler can run the port if the cache is shipped. P
 512-subdirectory trap and the vertex/fragment pairing hazard, in `VITAGL_NOTES.md` section 7):
 
 1. Run the port (or the T6/T8 shader set) once on a console that has `libshacccg.suprx`.
-2. FTP out `ux0:data/infected/shader_cache/v2/` (the self-test uses `ux0:data/infected/selftest_shader_cache/`).
-3. Put it in the VPK as `shader_cache/v2/{v,f}/XX/*.gxp`.
-4. On start, create **all** 256 + 256 `XX` directories, then `plat::dir_copy_tree("shader_cache", "shader_cache", false)` into the data root,
-   before `vglInit`.
+2. FTP out `ux0:data/infected/shader_cache/v3/` (the self-test uses `ux0:data/infected/selftest_shader_cache/`). A cache written by the
+   1.0 build (vitaGL `dca4b9d`) is `v2/`, and `vita/scripts/shader-cache-to-v3.sh` turns it into the `v3/` layout of vitaGL `9bf3e3f`.
+3. Put it in the VPK as `shader_cache/v3/{v,f}/XX/*.gxp`.
+4. On start, `plat::dir_copy_tree("shader_cache", "shader_cache", false)` into the data root, before `vglInit` (vitaGL makes the `XX`
+   folders of files it writes itself).
 5. Never edit the shader preamble after the warm-up run: the GLSL text is the key.
 
 ## 10. File I/O advice (what T10 is meant to confirm)
