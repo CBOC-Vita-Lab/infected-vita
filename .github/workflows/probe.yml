@@ -1,0 +1,55 @@
+name: Toolchain probe
+on:
+  push:
+    branches: [ci-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: List autobuild releases
+        run: |
+          gh release list --repo vitasdk/autobuilds --limit 40 | head -40
+          tag=$(gh release list --repo vitasdk/autobuilds --limit 1 --json tagName --jq '.[0].tagName')
+          echo "latest $tag"
+          gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[] | "\(.name) \(.size)"'
+          gh api 'repos/vitasdk/autobuilds/releases?per_page=100' --jq '.[] | "\(.tag_name) \(.published_at) \([.assets[].name] | join(","))"' | grep -i '2026-09\|2026-10' | head -40 || true
+      - name: Fetch this OS's toolchain
+        run: |
+          case "$RUNNER_OS" in
+            Linux) pat='linux' ;;
+            Windows) pat='w64|windows|mingw' ;;
+            macOS) pat='darwin|osx|macos' ;;
+          esac
+          tag=$(gh release list --repo vitasdk/autobuilds --limit 1 --json tagName --jq '.[0].tagName')
+          name=$(gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[].name' | grep -Ei "$pat" | grep -Ei "$(uname -m | sed 's/x86_64/x86_64|amd64/;s/arm64/arm64|aarch64/')" | head -1)
+          [ -n "$name" ] || name=$(gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[].name' | grep -Ei "$pat" | head -1)
+          echo "asset: $name"
+          gh release download "$tag" --repo vitasdk/autobuilds --pattern "$name" --dir dl
+          mkdir sdk && tar -xf dl/* -C sdk || (cd sdk && 7z x ../dl/* >/dev/null)
+          ls sdk; root=$(dirname $(find sdk -name 'arm-vita-eabi-gcc*' -path '*bin*' | head -1))/..
+          echo "root $root"; cat $root/version_info.txt || true
+          du -sh $root; du -sh $root/* | sort -h
+          $root/bin/arm-vita-eabi-gcc --version | head -1
+          ls $root/bin | head -80
+          ls $root/libexec/gcc/arm-vita-eabi/*/ || true
+          for f in $root/bin/arm-vita-eabi-g++* $root/bin/vita-elf-create* $root/bin/vita-make-fself* $root/libexec/gcc/arm-vita-eabi/*/cc1plus* $root/libexec/gcc/arm-vita-eabi/*/lto1* $root/libexec/gcc/arm-vita-eabi/*/liblto_plugin*; do
+            echo "== $f"; ls -la "$f"
+            case "$RUNNER_OS" in
+              Linux) file "$f"; ldd "$f" || true ;;
+              macOS) file "$f"; otool -L "$f"; otool -l "$f" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | head -8 ;;
+              Windows) objdump -p "$f" | grep -E 'DLL Name|MajorOSVersion|MajorSubsystemVersion' || true ;;
+            esac
+          done
+          ls $root/bin/*.dll 2>/dev/null || true
+          find $root -name '*.yml' -o -name 'db*.json' | head
