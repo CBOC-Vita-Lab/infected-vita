@@ -159,6 +159,7 @@ def main():
             with open(src, 'rb') as f:
                 z.writestr(zi, f.read())
     log('   %s (%d bytes)' % (vpk, os.path.getsize(vpk)))
+    shutil.copyfile(velf, os.path.join(out, 'infected.velf'))      # kept for comparing hosts; the installer never sees this file
     log('segments-sha256 %s' % segments_sha256(velf))
     log('eboot-sha256 %s' % sha256(eboot))
     log('vpk-sha256 %s' % sha256(vpk))
