@@ -44,3 +44,6 @@ func shortPath(p string) string { return p }
 
 // killChildrenWithMe is for Windows (a job object); the tools here are killed by killTree through their process group.
 func killChildrenWithMe() {}
+
+// ansiRoundTrips: only Windows has an ANSI code page.
+func ansiRoundTrips(string) bool { return true }

@@ -393,17 +393,21 @@ func TestStageGenerated(t *testing.T) {
 
 func TestPlainPath(t *testing.T) {
 	short := func(p string) string { return `C:\Users\5BA0~1\kit` }
-	if got, ok := plainPath(`C:\Users\Иван\kit`, true, short); !ok || got != `C:\Users\5BA0~1\kit` {
+	yes, no := func(string) bool { return true }, func(string) bool { return false }
+	if got, ok := plainPath(`C:\Users\Иван\kit`, true, short, yes); !ok || got != `C:\Users\5BA0~1\kit` {
 		t.Fatalf("%q %v", got, ok)
 	}
-	if got, ok := plainPath(`C:\Users\Ivan\kit`, true, short); !ok || got != `C:\Users\Ivan\kit` {
+	if got, ok := plainPath(`C:\Users\Ivan\kit`, true, short, no); !ok || got != `C:\Users\Ivan\kit` {
 		t.Fatalf("plain path changed: %q %v", got, ok)
 	}
-	if got, ok := plainPath("/home/José/kit", false, short); !ok || got != "/home/José/kit" {
+	if got, ok := plainPath("/home/José/kit", false, short, no); !ok || got != "/home/José/kit" {
 		t.Fatalf("non-Windows path changed: %q %v", got, ok)
 	}
-	if _, ok := plainPath(`C:\Users\Иван\kit`, true, func(p string) string { return p }); ok {
+	if _, ok := plainPath(`C:\Users\Иван\kit`, true, func(p string) string { return p }, yes); ok {
 		t.Fatal("a path with no short name is not plain")
+	}
+	if _, ok := plainPath(`C:\Users\Иван\kit`, true, short, no); ok {
+		t.Fatal("a letter outside the code page has no usable short name")
 	}
 	if !isASCII("abc (2) 'x'") || isASCII("José") {
 		t.Fatal("isASCII")

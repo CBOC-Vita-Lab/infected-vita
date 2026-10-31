@@ -197,13 +197,15 @@ func isASCII(s string) bool {
 
 // plainPath returns a spelling of the folder p that the kit's programs can open. On Windows they are MinGW programs: arguments, environment
 // and the makefile of the LTO link are in the ANSI code page and files are opened by ANSI names, so a folder with a letter outside plain
-// ASCII ("C:\Users\Иван\Downloads\kit") cannot be used, and its 8.3 short name ("C:\Users\5BA0~1\...") can, where the volume has short
-// names. Elsewhere, or when p is plain already, it is p itself. ok is false when there is no plain spelling.
-func plainPath(p string, windows bool, short func(string) string) (plain string, ok bool) {
+// ASCII ("C:\Users\José\kit") cannot be used as it is, and its 8.3 short name ("C:\Users\JOS~1\kit") can, where the volume has short
+// names and where every letter is in the ANSI code page (the compiler turns a short name back into the long one: a letter outside the
+// code page, like the Cyrillic of "C:\Users\Иван", is lost there). Elsewhere, or when p is plain already, it is p itself. ok is false
+// when there is no usable spelling.
+func plainPath(p string, windows bool, short func(string) string, ansi func(string) bool) (plain string, ok bool) {
 	if !windows || isASCII(p) {
 		return p, true
 	}
-	if s := short(p); isASCII(s) {
+	if s := short(p); isASCII(s) && ansi(p) {
 		return s, true
 	}
 	return p, false

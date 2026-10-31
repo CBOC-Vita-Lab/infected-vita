@@ -11,15 +11,16 @@ import (
 )
 
 var (
-	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	procGetDiskFreeSpaceEx = kernel32.NewProc("GetDiskFreeSpaceExW")
-	procGlobalMemoryStatus = kernel32.NewProc("GlobalMemoryStatusEx")
-	procSetPriorityClass   = kernel32.NewProc("SetPriorityClass")
-	procGetShortPathName   = kernel32.NewProc("GetShortPathNameW")
-	procGetCurrentProcess  = kernel32.NewProc("GetCurrentProcess")
-	procCreateJobObject    = kernel32.NewProc("CreateJobObjectW")
-	procSetInfoJobObject   = kernel32.NewProc("SetInformationJobObject")
-	procAssignProcessToJob = kernel32.NewProc("AssignProcessToJobObject")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	procGetDiskFreeSpaceEx  = kernel32.NewProc("GetDiskFreeSpaceExW")
+	procGlobalMemoryStatus  = kernel32.NewProc("GlobalMemoryStatusEx")
+	procSetPriorityClass    = kernel32.NewProc("SetPriorityClass")
+	procGetShortPathName    = kernel32.NewProc("GetShortPathNameW")
+	procGetCurrentProcess   = kernel32.NewProc("GetCurrentProcess")
+	procWideCharToMultiByte = kernel32.NewProc("WideCharToMultiByte")
+	procCreateJobObject     = kernel32.NewProc("CreateJobObjectW")
+	procSetInfoJobObject    = kernel32.NewProc("SetInformationJobObject")
+	procAssignProcessToJob  = kernel32.NewProc("AssignProcessToJobObject")
 )
 
 const (
@@ -156,4 +157,18 @@ func shortPath(p string) string {
 		return p
 	}
 	return syscall.UTF16ToString(buf[:n])
+}
+
+// ansiRoundTrips reports whether every letter of s exists in the ANSI code page (a name can be handed to a MinGW program unchanged).
+func ansiRoundTrips(s string) bool {
+	u, err := syscall.UTF16FromString(s)
+	if err != nil || len(u) < 2 {
+		return err == nil
+	}
+	const wcNoBestFitChars = 0x400
+	buf := make([]byte, len(u)*4)
+	var used int32
+	n, _, _ := procWideCharToMultiByte.Call(0, wcNoBestFitChars, uintptr(unsafe.Pointer(&u[0])), uintptr(len(u)-1),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, uintptr(unsafe.Pointer(&used)))
+	return n > 0 && used == 0
 }

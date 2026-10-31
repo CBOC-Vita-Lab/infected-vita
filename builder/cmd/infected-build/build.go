@@ -153,10 +153,10 @@ func (b *Builder) prepare() error {
 		return err
 	}
 	b.kit = kit
-	if plain, ok := plainPath(kit.Dir, runtime.GOOS == "windows", shortPath); ok {
+	if plain, ok := plainPath(kit.Dir, runtime.GOOS == "windows", shortPath, ansiRoundTrips); ok {
 		kit.Dir = plain
 	} else {
-		return userErrorf("The builder kit is in a folder whose name has letters that the compiler cannot open (%s), and Windows has no short name for it. Move the kit to a folder with a plain English name, for example C:\\InfectedBuilder, and run it from there.", kit.Dir)
+		return userErrorf("The builder kit is in a folder whose name has letters that the compiler cannot open (%s): Windows has no usable short name for it. Move the kit to a folder with a plain English name, for example C:\\InfectedBuilder, and run it from there.", kit.Dir)
 	}
 	if runtime.GOOS == "darwin" {
 		if err := checkMacOS(macOSMajor(), kit.requiredMacOS()); err != nil {
@@ -228,11 +228,11 @@ func (b *Builder) prepare() error {
 		}
 		b.work, b.ownWork = w, true
 	}
-	if plain, ok := plainPath(b.work, runtime.GOOS == "windows", shortPath); ok {
+	if plain, ok := plainPath(b.work, runtime.GOOS == "windows", shortPath, ansiRoundTrips); ok {
 		b.work = plain
 	} else {
 		b.cleanup(false)
-		return userErrorf("The work folder %s has letters that the compiler cannot open, and Windows has no short name for it. Choose another with --work, for example C:\\InfectedWork.", b.work)
+		return userErrorf("The work folder %s has letters that the compiler cannot open: Windows has no usable short name for it. Choose another with --work, for example C:\\InfectedWork.", b.work)
 	}
 	if free, err := freeDiskBytes(b.work); err == nil && kit.MinDiskBytes > 0 && free < kit.MinDiskBytes {
 		b.cleanup(false)
