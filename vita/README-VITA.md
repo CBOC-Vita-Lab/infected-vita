@@ -70,10 +70,18 @@ The Vita's buttons are the PSP's. The game's own menus work as on the PSP (CROSS
 ## The settings menu
 
 Hold **SELECT + START** for half a second (or tap the **top-right corner of the touch screen**) while playing. The game pauses, a menu with
-two pages (Graphics, Performance) opens; UP/DOWN choose a row, LEFT/RIGHT change it, L/R switch page, CIRCLE or START close it.
+three pages (Graphics, Performance, Controls) opens; UP/DOWN choose a row, LEFT/RIGHT change it, L/R switch page, CIRCLE or START close it.
 Enemy density and view distance are on the Performance page: view distance changes at once, enemy density at the next mission.
 The choices are saved in `ux0:data/infected/settings.txt`. SELECT + START together with L or R is not the menu (that is the way out
 of the game). `SETTINGS.md` lists every option, what it costs and which ones need a restart.
+
+### Settings from version 1.0
+
+The menu of 1.0 wrote **every** row to `settings.txt`, so a player who only opened the menu has `gfx.antialiasing=off` in the file, the same as one who chose it.
+Version 1.1 has anti-aliasing **Auto** as its default. At the first start of 1.1 (`aa_auto.done` records that it ran), a `settings.txt` in which *every other
+row is at its default* has no choice in it, and its Off becomes Auto (`log.txt`: `settings: gfx.antialiasing off in settings.txt was the old default; it is now Auto`).
+A file in which anything else was changed keeps its Off, and so does a real FXAA or MSAA choice: the Off may have been chosen. (`gfx.antialiasing=off` in
+`config.txt` still decides for the run.)
 
 ## Where things are (`ux0:data/infected/`)
 
@@ -81,7 +89,8 @@ of the game). `SETTINGS.md` lists every option, what it costs and which ones nee
 | --- | --- |
 | `Infected.iso` | the game disc (yours) |
 | `config.txt` | optional settings of this port (below); read once at start |
-| `settings.txt` | the port's user settings (`key=value`), written by the in-game settings menu (every option of `SETTINGS.md`); delete it for the defaults |
+| `settings.txt` | the port's user settings (`key=value`), written by the in-game settings menu (every option of `SETTINGS.md`; it writes every row, chosen or not); delete it for the defaults |
+| `cpu_clock_500.done`, `aa_auto.done` | markers: the start that moved an old 1.0 `perf.cpu_clock=444` to 500 MHz, and an untouched 1.0 `gfx.antialiasing=off` to Auto (see "Settings from version 1.0" below). Delete one to run its check again |
 | `texpack_2x.bin`, `texpack_4x.bin` | optional HD texture packs (yours to copy; the menu row "HD textures" turns on when one is there). `texpack_4x.bin` is the **mixed** 4x pack (about 98 MB) |
 | `log.txt` | the log of the **last** run (rewritten each start); send it with any report |
 | `ms0/PSP/SAVEDATA/ULUS10054xxxx/` | the game's save data (the PSP memory stick is emulated by the folder `ms0/`); a copy of a PSP save folder dropped in works |
@@ -122,6 +131,13 @@ Everything has a default; the file is only needed to change something.
 | `ge_split_slots`, `ge_split_presents_ahead` | `1024`, `1` | the split's draw ring and how many presents the walker may be ahead of the GL thread (more of either measured no faster) |
 | `ge_split_early_sync` | `0` | `1`: a GE job counts as done once the walker is through it, not once it is drawn, so the game's `sceGeDrawSync` waits less. Measured slower (27 against 30 fps: the GL thread, already the busiest, then runs at 100 %) and a texture the game rewrites right after the sync may show its new contents a frame early |
 | `atrac_ahead` | `1` | the game's ATRAC3plus music and voice: the frame after the one the game just took is decoded on the helper core (core 3 when the system lets the game use it, else core 2) while the game runs on, so the next request only copies samples (about 3 ms a frame was spent decoding on the game's core in mission 1). Same samples as decoding in place (83,709 requests compared on the PC); unmeasured on the console. `0` decodes on the game's core as before |
+| `gl_alpha_elide` | `1` | the alpha test of a draw whose fragments cannot fail it (every alpha 255: opaque vertices or material, an opaque texture) is dropped, so its program has no `discard`; same pictures (PC replay); `0` keeps every test. Unmeasured on the console |
+| `gl_alpha_elide_range` | `1` | with `gl_alpha_elide`: the wider rule, alpha bounded as an interval (a constant fade of an opaque texture passes "greater than 0" too); `0` goes back to "every fragment at alpha 255" only |
+| `gl_fxaa_quality` | `fast` | the FXAA pass (Anti-aliasing FXAA, and Auto when it is on): `fast` is 5 texture reads for a flat pixel and 7 for an edge pixel, `high` the first version (9 for every pixel, 4 of them dependent). The fast one is not yet measured on the console |
+| `gl_aa_auto` | `1` | what the menu's Anti-aliasing **Auto** does: `1` FXAA while the renderer has room for it and off while it does not (below), `0` Auto means Off (the behaviour before Auto existed), `2` Auto means FXAA always (to compare). `gfx.antialiasing=off` (or `fxaa`) fixes the menu row itself |
+| `gl_aa_auto_retry_s`, `gl_aa_auto_need_idle_us` | `10`, `3000` | Auto's quiet time before FXAA is tried again after going off (seconds), and how long the GL thread must sleep per frame for want of work (microseconds) for FXAA to be tried. A try that fails within 6 s doubles the first (up to 80 s) and raises the second (up to 9000) |
+| `gl_ui_upscale` | `1` | small HUD textures that look like pixel art are enlarged by MMPX once, so the HUD is not blurred at 960x544; `0` leaves them alone |
+| `gl_prewarm` | `1` | the shader programs earlier runs used (and the FXAA program, when FXAA or Auto may use it) are linked while the renderer has nothing to draw (the logos); `0` links every program at its first draw |
 | `gl_skip_invisible` | `1` | draws whose every fragment has alpha 0 and that then change nothing (a sprite or effect faded out) are not sent to vitaGL. About 2 draws a frame in the mission-1 replay, pictures identical; `0` draws them |
 | `hd_async` | `1` | HD replacement textures are read from the memory card by a thread of their own; the original is drawn until the replacement arrives (a frame or two). `0` reads them on the GL thread as before: every HD texture from its first frame, and a 5-60 ms hitch each time a new one appears |
 | `cost_probe` | `1` | the start-up `costs:` line (what a clock read, an event signal, a mutex and `thread_local` cost on this console; a few ms) |
@@ -142,6 +158,8 @@ Everything has a default; the file is only needed to change something.
 * Start of the file: build date, config actually used, the settings list (the HD row can read `greyed: No texture pack installed.` there even when a pack is in place: it is printed before the renderer looks for the packs; the `[hdtex] mode ... pack of N textures` line and the menu are right), memory line (`mem user_free=... heap=.../...`), `shader cache: N shipped file(s) copied`,
   the ISO check, `threaded renderer: guest executor on core 0, GE thread on core 1` (or `off`), and `[gl] program ... linked`
   lines (one per shader variant as the game first uses it, with the number of variants so far).
+* Near the start, `[gl] speed features: specialize=1 alpha_elide=1/1 skip_invisible=1 compact_vertices=1 vgl_skip_redundant=1 scratch_buffers=1 merge=1 ui_upscale=1 prewarm=1 fxaa_quality=fast aa_auto=1`: the drawing speed-ups as this run has them (the player build has all of them on; a `0` means a `config.txt` line turned it off). `[gl] warm-up: the FXAA program is ready, N ms` says the Auto/FXAA shader was made during the logos.
+* `[aa] auto: fxaa off (gpu late: frame 52.1 ms, present 9.3 ms, gl lag 15.2 ms, skipped 0; next try in 10 s, room needed 3.0 ms) [change 1]` and `[aa] auto: fxaa on (quiet and the gl thread has room, last frame 33.4 ms) [change 2]`: Auto's decisions (anti-aliasing Auto only). A few lines at the start of a mission are normal; a stream of them (more than a few a minute) is a scene the GPU cannot afford with FXAA, and a sign to look at `[stat]`'s `aa=` figures.
 * Once a second: `[stat] ... t=61s flips=3571(+30) presented=30 frame=33.6ms ge=split:walk 73% gl 89% | ms/frame guest=22.4 hle=off gewalk=24.7 (vertex=N.N) glsubmit=0.0 present=1.7 decode=3.2 audio=0.5 io=0.0 idle=7.5 (gesync=8.4 flipwait=0.0) | splitwait=0.0 walkidle=9.2 glidle=3.7 | draws/f=719 gl_draws/f=383 | switches/s=... | audio q=... underruns=0(+0)`.
   `flips(+N)` is the game's frames in the last second. `ge=split:walk 73% gl 89%` is how busy the two renderer threads were
   (a thread is busy whenever it is not asleep: `walkidle`/`glidle` are their sleeps, `splitwait` the walker waiting for the GL
@@ -149,6 +167,7 @@ Everything has a default; the file is only needed to change something.
   then part of the frame). `guest` is the game's own busy time: the frame less what it slept (`idle`), of which `gesync` waited in
   `sceGeDrawSync`/`sceGeListSync` for the renderer and `flipwait` at a flip for a renderer frames behind. The thread nearest 100 %
   is the bottleneck. `(vertex=N)` is the part of `gewalk` spent decoding (and skinning) the draws' vertices; it is already inside `gewalk`, not beside it.
+  With anti-aliasing Auto the line ends with `| aa=auto:on(off 1, on 1)`: FXAA on or off now, and how many times Auto has switched it off and back on since the start.
   `[split] walker on core 2, GL on core 1; 1024 draw slots, ...` once at start says the split is running, and
   `[split] thread_local storage is shared between threads` would mean a build whose C++ runtime is single-threaded (VITAGL_NOTES.md section 4).
   `[gl-time] slow texture upload 11.2 ms: 0x... 256x128 format 5 ... | HD replacement ... | pack read 0.0 ms, GPU waits 0.0 ms`: an upload that

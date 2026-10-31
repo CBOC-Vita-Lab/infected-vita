@@ -1,0 +1,445 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:57:27 -0400
+Subject: [PATCH 73/73] tests, ge_replay: a settings smoke test and a script that
+ walks the picture rows through the replayer
+
+portablekit_settings_smoke_tests walks every row and every value of the settings menu with no GL and no game: the typed accessor
+for each value, the restart rule, save to settings.txt and reload, LEFT/RIGHT wrapping around the list, a developer override (the
+row greys and keeps the override's value), the "not available" and "needs a restart" reasons, the real Menu button navigation across
+the pages and rows with CIRCLE saving, and the menu drawn on a software canvas at two sizes with every value and every help line
+(18 rows, 46 values).
+
+tools/ge_replay/settings_matrix.sh replays the same GE dumps once per value of a picture row (texture filter, mipmaps, anti-aliasing
+including Auto and gl_aa_auto=0, pixel lighting, effects resolution, FPS counter, resolution, frame limit, frame skip, HD textures,
+movie filter, and two switches made while the replay runs) and checks each against the default picture by checksum: "differ" where
+the menu promises a different picture, "same" where the row changes nothing in a replay. It needs a GE dump folder; dumps and the
+pictures made from them are game data and stay out of git.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                     |  14 ++
+ tests/settings_smoke_tests.cpp     | 308 +++++++++++++++++++++++++++++
+ tools/ge_replay/settings_matrix.sh |  70 +++++++
+ 3 files changed, 392 insertions(+)
+ create mode 100644 tests/settings_smoke_tests.cpp
+ create mode 100755 tools/ge_replay/settings_matrix.sh
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4f036d9..5a3233c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -412,6 +412,20 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_alpha_test_tests COMMAND portablekit_alpha_test_tests)
+ endif()
+ 
++# Every row and every value of the settings menu: model, save and reload, the menu's buttons, drawing. No GL, no game.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_settings_smoke_tests
++        "${PORTABLEKIT_ROOT}/tests/settings_smoke_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/settings/port_settings.cpp"
++        "${PORTABLEKIT_ROOT}/host/overlay/bitmap_font.cpp"
++        "${PORTABLEKIT_ROOT}/host/overlay/canvas.cpp"
++        "${PORTABLEKIT_ROOT}/host/overlay/overlay_menu.cpp")
++    target_compile_features(portablekit_settings_smoke_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_settings_smoke_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_settings_smoke_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_settings_smoke_tests COMMAND portablekit_settings_smoke_tests)
++endif()
++
+ # gfx.antialiasing=auto (host/gpu/auto_aa.hpp): the state machine driven with made-up frame timings. Header only, no GL.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_auto_aa_tests "${PORTABLEKIT_ROOT}/tests/auto_aa_tests.cpp")
+diff --git a/tests/settings_smoke_tests.cpp b/tests/settings_smoke_tests.cpp
+new file mode 100644
+index 0000000..d3fa028
+--- /dev/null
++++ b/tests/settings_smoke_tests.cpp
+@@ -0,0 +1,308 @@
++// A smoke test of the whole settings menu: every row, every value. For each one it checks what the settings model promises (the value is stored,
++// read back by its typed accessor, written to settings.txt and read again, reached by LEFT and RIGHT with a wrap at both ends, "restart needed"
++// exactly when the row says so), then walks the real menu (overlay::Menu) through every page and row with button presses, closes it (which saves)
++// and loads the file into a new instance, and draws every page with every value on a software canvas to see that nothing is cut off.
++// No renderer, no game: what each value does to the picture is checked with ge_replay (docs/GRAPHICS_OPTIONS.md).
++
++#include "overlay/bitmap_font.hpp"
++#include "overlay/overlay_menu.hpp"
++#include "settings/port_settings.hpp"
++
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <string>
++
++namespace {
++
++using namespace portablekit;
++using namespace portablekit::port;
++namespace btn = portablekit::overlay::button;
++
++int g_failures = 0;
++void check(bool condition, const std::string &what) {
++    if (!condition) {
++        std::printf("FAIL %s\n", what.c_str());
++        ++g_failures;
++    }
++}
++
++std::map<std::string, std::string> g_files;
++bool fake_read(const char *path, std::string &out) {
++    const auto found = g_files.find(path);
++    if (found == g_files.end()) return false;
++    out = found->second;
++    return true;
++}
++bool fake_write(const char *path, const std::string &data) {
++    g_files[path] = data;
++    return true;
++}
++
++// A Settings the way the Vita app has it: the platform defaults, every row usable (the app and the game enable them).
++void make_vita(Settings &s) {
++    s.set_file_ops({&fake_read, &fake_write});
++    s.set_path("smoke/settings.txt");
++    apply_vita_defaults(s);
++    for (Key key : {Key::GfxHdTextures, Key::GfxHdMovies, Key::PerfThreadedRenderer, Key::PerfCpuClock, Key::PerfEnemyDensity, Key::PerfViewDistance})
++        s.set_unavailable(key, nullptr);
++    s.mark_started();
++}
++
++// The typed accessor each row feeds, as text, for the global instance. "" for a row nothing reads through an accessor here.
++std::string accessor(Key key) {
++    switch (key) {
++    case Key::GfxHdTextures: return std::to_string(static_cast<int>(hd_textures()));
++    case Key::GfxTextureFilter: return texture_filter_smooth() ? "smooth" : "original";
++    case Key::GfxMipmaps: return mipmaps() ? "on" : "off";
++    case Key::GfxAntialiasing: return antialiasing_auto() ? "auto" : fxaa() ? "fxaa" : msaa_samples() == 0u ? "off" : "msaa";
++    case Key::GfxPixelLighting: return pixel_lighting() ? "on" : "off";
++    case Key::GfxEffectsScale: return std::to_string(effects_scale());
++    case Key::GfxMovieFilter: return movie_filter() == MovieFilter::Sharp ? "sharp" : "bilinear";
++    case Key::GfxHdMovies: return hd_movies() ? "on" : "off";
++    case Key::PerfFrameCap: return std::to_string(frame_cap_period_us());
++    case Key::PerfFrameSkip: return frame_skip() ? "auto" : "off";
++    case Key::PerfShowFps: return show_fps() ? "on" : "off";
++    case Key::PerfResolution: return reduced_resolution() ? "720x408" : "960x544";
++    case Key::PerfThreadedRenderer: return split_renderer() ? "split" : threaded_renderer() ? "on" : "off";
++    case Key::PerfCpuClock: return std::to_string(cpu_clock_mhz());
++    case Key::PerfEnemyDensity: return std::to_string(enemy_density_percent());
++    case Key::PerfViewDistance: return std::to_string(view_distance_percent());
++    case Key::ControlsLayout: return control_layout() == ControlLayout::Modern ? "modern" : "classic";
++    case Key::ControlsAutoFire: return auto_fire() ? "on" : "off";
++    case Key::Count: break;
++    }
++    return "";
++}
++
++// What the accessor must say for a value of the row.
++std::string expected(Key key, const std::string &value) {
++    switch (key) {
++    case Key::GfxHdTextures: return std::to_string(value == "auto" ? 0 : value == "off" ? 1 : value == "2x" ? 2 : 3);
++    case Key::GfxAntialiasing: return value == "msaa2" || value == "msaa4" ? "off" : value;   // MSAA is the value the run started with: see below
++    case Key::GfxEffectsScale: return value;
++    case Key::PerfFrameCap: return value == "60" ? "16683" : value == "30" ? "33366" : "0";
++    case Key::PerfResolution: return "960x544";   // read from the value the run started with (restart needed)
++    case Key::PerfThreadedRenderer: return value;
++    case Key::PerfCpuClock: return value;
++    case Key::PerfEnemyDensity: return value;
++    case Key::PerfViewDistance: return value;
++    default: return value;
++    }
++}
++
++} // namespace
++
++int main() {
++    int rows = 0, values = 0;
++
++    // ---- the model: every row, every value ----------------------------------------------------------------------------------
++    for (std::size_t k = 0; k < kKeyCount; ++k) {
++        const Key key = static_cast<Key>(k);
++        const KeyInfo &entry = info(key);
++        ++rows;
++        for (std::uint8_t v = 0; v < entry.value_count; ++v) {
++            ++values;
++            const std::string name = std::string(entry.name) + "=" + entry.values[v];
++            // The program starts with the platform defaults; the player picks the value; the typed accessor says what the program would do.
++            Settings& g = settings();
++            g.set_file_ops({&fake_read, &fake_write});
++            g.set_path("smoke/g.txt");
++            g.reset_to_defaults();
++            for (Key u : {Key::GfxHdTextures, Key::GfxHdMovies, Key::PerfThreadedRenderer, Key::PerfCpuClock, Key::PerfEnemyDensity, Key::PerfViewDistance})
++                g.set_unavailable(u, nullptr);
++            g.mark_started();
++            check(g.set(key, v) && g.index(key) == v, name + ": stored and effective");
++            check(std::strcmp(g.value(key), entry.values[v]) == 0 && g.label(key) != nullptr && std::strlen(g.label(key)) > 0u, name + ": value and label");
++            const bool restart_row = entry.restart_always || ((entry.restart_values >> v) & 1u) != 0u;
++            const bool pending = g.restart_pending(key);
++            // "restart needed" must be right both ways: a change to a restart row/value shows it, any other does not.
++            check(pending == restart_for_change(key, g.started_index(key), v), name + ": restart_pending follows restart_for_change");
++            if (v == g.started_index(key)) check(!pending, name + ": the value the run started with is never pending");
++            else if (entry.restart_always) check(pending, name + ": a restart_always row is pending after a change");
++            else check(pending == (restart_row || ((entry.restart_values >> g.started_index(key)) & 1u) != 0u), name + ": pending iff either value needs a restart");
++            const std::string got = accessor(key);
++            std::string want = expected(key, entry.values[v]);
++            if (key == Key::GfxAntialiasing && std::strncmp(entry.values[v], "msaa", 4) == 0) want = "off";   // started without MSAA: the accessor says 0 samples
++            if (key == Key::GfxHdTextures) want = std::to_string(static_cast<int>(v));
++            check(got == want, name + ": the accessor reads " + want + ", got " + got);
++            // Live rows are read from the effective value at once; restart rows from the value at start (resolution, MSAA).
++            if (key == Key::PerfResolution) check(!reduced_resolution(), name + ": resolution is read from the started value");
++            if (key == Key::GfxAntialiasing) check(msaa_samples() == 0u, name + ": MSAA samples are the started value (0)");
++            if (key == Key::PerfEnemyDensity || key == Key::PerfViewDistance) check(entry.next_mission == (key == Key::PerfEnemyDensity), name + ": next_mission tag");
++            // settings.txt: saved, and a new instance reads the same value.
++            check(g.save(), name + ": saves");
++            const std::string file = g_files["smoke/g.txt"];
++            check(file.find(std::string(entry.name) + "=" + entry.values[v] + "\n") != std::string::npos, name + ": the file names the value");
++            Settings reloaded;
++            reloaded.set_file_ops({&fake_read, &fake_write});
++            reloaded.set_path("smoke/g.txt");
++            apply_vita_defaults(reloaded);
++            check(reloaded.load() && reloaded.stored_index(key) == v, name + ": reloaded");
++            // LEFT and RIGHT from this value: one step either way, and a wrap at the ends.
++            Settings s;
++            make_vita(s);
++            s.set(key, v);
++            const std::uint8_t n = entry.value_count;
++            check(s.step(key, +1) == static_cast<std::uint8_t>((v + 1) % n), name + ": RIGHT");
++            s.set(key, v);
++            check(s.step(key, -1) == static_cast<std::uint8_t>((v + n - 1) % n), name + ": LEFT");
++            // Costs and labels fit the column.
++            check(overlay::text_width(entry.labels[v], 3) + 36 <= 290, name + ": the label and its arrows fit the value column");
++        }
++        // A full lap of RIGHT is back where it started; the defaults are values of the row.
++        Settings s;
++        make_vita(s);
++        const std::uint8_t start = s.index(key);
++        for (std::uint8_t i = 0; i < entry.value_count; ++i) s.step(key, +1);
++        check(s.index(key) == start, std::string(entry.name) + ": a lap of RIGHT returns to the start");
++        check(s.default_index(key) < entry.value_count, std::string(entry.name) + ": default is a value");
++        check(std::strlen(entry.description) > 0u && std::strlen(entry.description) <= 46u, std::string(entry.name) + ": help text fits one line");
++    }
++    check(rows == static_cast<int>(kKeyCount), "every row walked");
++
++    // ---- greyed rows, developer overrides --------------------------------------------------------------------------------------
++    {
++        Settings s;
++        s.set_file_ops({&fake_read, &fake_write});
++        s.set_path("smoke/grey.txt");
++        apply_vita_defaults(s);
++        s.mark_started();
++        // No pack, no movies: greyed, running at their defaults whatever is stored, with a reason of at most 31 characters.
++        check(!s.available(Key::GfxHdTextures) && s.unavailable_reason(Key::GfxHdTextures) != nullptr, "HD textures is grey without a pack");
++        check(!s.available(Key::GfxHdMovies), "HD movies is grey without movies");
++        s.set(Key::GfxHdTextures, "4x");
++        check(s.index(Key::GfxHdTextures) == 0u, "a grey row runs at its default");
++        overlay::Menu menu(s);
++        menu.open(0u);
++        menu.update(0u);
++        for (std::size_t i = 0; i < kKeyCount; ++i) {
++            const Key key = static_cast<Key>(i);
++            if (s.available(key)) continue;
++            check(std::strlen(s.unavailable_reason(key)) <= 31u, std::string(info(key).name) + ": the reason fits");
++        }
++        // The menu does not change a grey row.
++        s.set(Key::GfxHdTextures, std::uint8_t(0));
++        menu.update(btn::kDown);   // (graphics page, row 1 now) ...
++        menu.update(btn::kUp);
++        menu.update(0u);
++        menu.update(btn::kRight);   // row 0 is HD textures
++        menu.update(0u);
++        check(s.index(Key::GfxHdTextures) == 0u && s.stored_index(Key::GfxHdTextures) == 0u, "RIGHT on a grey row changes nothing");
++        menu.close(0u);
++        // A developer override (config.txt gfx.mipmaps=off): the row shows it, the menu cannot change it, it is not saved.
++        Settings o;
++        make_vita(o);
++        o.override_value(Key::GfxMipmaps, "off");
++        check(o.index(Key::GfxMipmaps) == 1u && o.overridden(Key::GfxMipmaps), "an override decides the value");
++        overlay::Menu om(o);
++        om.open(0u);
++        om.update(0u);
++        om.update(btn::kDown);   // the page opens on row 0; mipmaps is row 2
++        om.update(0u);
++        om.update(btn::kDown);
++        om.update(0u);
++        om.update(btn::kRight);
++        om.update(0u);
++        check(o.index(Key::GfxMipmaps) == 1u && o.stored_index(Key::GfxMipmaps) == 0u, "the menu cannot change an overridden row");
++        om.close(0u);
++    }
++
++    // ---- the real menu: buttons through every page and row, then close (which saves), then load ----------------------------------------
++    {
++        g_files.clear();
++        Settings s;
++        make_vita(s);
++        overlay::Menu menu(s);
++        menu.open(0u);
++        const auto press = [&](std::uint32_t b) {
++            menu.update(b);
++            menu.update(0u);
++        };
++        int pages_seen = 0;
++        for (std::size_t page = 0; page < kPageCount; ++page) {
++            check(static_cast<std::size_t>(menu.page()) == page, std::string("page ") + page_name(static_cast<Page>(page)) + " is shown");
++            ++pages_seen;
++            const std::vector<Key> keys = keys_on(static_cast<Page>(page));
++            for (std::size_t row = 0; row < keys.size(); ++row) {
++                check(menu.row() == row, "the selection is on the row");
++                const Key key = keys[row];
++                const std::uint8_t start = s.index(key);
++                const std::uint8_t n = info(key).value_count;
++                // RIGHT through all the values and back to the start; each press moves to the next value.
++                for (std::uint8_t i = 1; i <= n; ++i) {
++                    press(btn::kRight);
++                    check(s.index(key) == static_cast<std::uint8_t>((start + i) % n), std::string(info(key).name) + ": menu RIGHT " + std::to_string(i));
++                }
++                press(btn::kLeft);
++                check(s.index(key) == static_cast<std::uint8_t>((start + n - 1) % n), std::string(info(key).name) + ": menu LEFT wraps");
++                press(btn::kRight);
++                // Leave every row one step on from where it started, so the file has a choice in every row.
++                press(btn::kRight);
++                if (row + 1 < keys.size()) press(btn::kDown);
++            }
++            // DOWN from the last row wraps to the first; UP from the first goes to the last.
++            press(btn::kDown);
++            check(menu.row() == 0u, "DOWN from the last row wraps");
++            press(btn::kUp);
++            check(menu.row() == keys.size() - 1u, "UP from the first row wraps");
++            press(btn::kDown);
++            press(btn::kR);   // the next page; the last page wraps to the first
++        }
++        check(pages_seen == static_cast<int>(kPageCount) && menu.page() == Page::Graphics, "R over the last page wraps to the first");
++        press(btn::kL);
++        check(menu.page() == Page::Controls, "L on the first page goes to the last");
++        press(btn::kR);
++        std::map<std::string, int> chosen;
++        for (std::size_t i = 0; i < kKeyCount; ++i) chosen[info(static_cast<Key>(i)).name] = s.index(static_cast<Key>(i));
++        menu.update(btn::kCircle);   // closes and saves
++        check(!menu.is_open() && g_files.count("smoke/settings.txt") == 1u, "CIRCLE closes the menu and saves settings.txt");
++        Settings back;
++        back.set_file_ops({&fake_read, &fake_write});
++        back.set_path("smoke/settings.txt");
++        apply_vita_defaults(back);
++        check(back.load(), "settings.txt loads");
++        for (std::size_t i = 0; i < kKeyCount; ++i) {
++            const Key key = static_cast<Key>(i);
++            check(back.stored_index(key) == chosen[info(key).name], std::string(info(key).name) + ": the choice survived save and load");
++        }
++        // Deleting the file goes back to the defaults.
++        g_files.clear();
++        Settings fresh;
++        fresh.set_file_ops({&fake_read, &fake_write});
++        fresh.set_path("smoke/settings.txt");
++        apply_vita_defaults(fresh);
++        check(!fresh.load(), "no file");
++        for (std::size_t i = 0; i < kKeyCount; ++i) check(fresh.is_default(static_cast<Key>(i)), std::string(info(static_cast<Key>(i)).name) + ": default without a file");
++    }
++
++    // ---- drawing: every page with every row at each of its values ---------------------------------------------------------------------
++    {
++        int drawn = 0;
++        for (int size : {1, 2}) {
++            Settings s;
++            make_vita(s);
++            overlay::Menu menu(s);
++            menu.open(0u);
++            overlay::SoftCanvas canvas(480 * size, 272 * size);
++            for (std::size_t page = 0; page < kPageCount; ++page) {
++                for (std::size_t i = 0; i < kKeyCount; ++i) {
++                    const Key key = static_cast<Key>(i);
++                    if (info(key).page != static_cast<Page>(page)) continue;
++                    for (std::uint8_t v = 0; v < info(key).value_count; ++v) {
++                        s.set(key, v);
++                        menu.draw(canvas);
++                        ++drawn;
++                    }
++                    s.set(key, s.default_index(key));
++                }
++                menu.update(btn::kR);
++                menu.update(0u);
++            }
++        }
++        check(drawn > 60, "every value of every row was drawn");
++    }
++
++    std::printf("%d rows, %d values walked; %s\n", rows, values, g_failures == 0 ? "all passed" : "FAILURES");
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tools/ge_replay/settings_matrix.sh b/tools/ge_replay/settings_matrix.sh
+new file mode 100755
+index 0000000..6f93280
+--- /dev/null
++++ b/tools/ge_replay/settings_matrix.sh
+@@ -0,0 +1,70 @@
++#!/bin/bash
++# Walks the picture rows of the settings menu through ge_replay and checks what each value does to the replayed pictures.
++#
++#   usage: settings_matrix.sh GE_REPLAY SCENE_DUMPS "FLIPS" [MOVIE_DUMPS "FLIPS" [PACK_DIR]]
++#
++# SCENE_DUMPS: a GE dump folder of a 3D scene (a mission); FLIPS like 5804-5806. MOVIE_DUMPS: a dump with a movie playing (for the movie
++# filter). PACK_DIR: the folder with texpack_2x.bin / texpack_4x.bin (for the HD rows). Dumps and pictures are made from the game: keep them
++# out of git. Every run is a fresh ge_replay process of the same flips; a row's value is compared with the picture of the last flip at the
++# defaults by checksum. Exit status 1 when a value does what the menu does not promise.
++set -u
++replay=$1; scene=$2; flips=$3; movie=${4:-}; movie_flips=${5:-}; packs=${6:-}
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++fail=0
++last=${flips##*-}
++
++pic() {  # pic NAME DUMPS FLIPS LAST ARGS...  -> checksum of the last picture
++    local name=$1 dumps=$2 fl=$3 lastflip=$4; shift 4
++    INFECTED_DATA_DIR="$work/data" nice -n 10 "$replay" "$dumps" --flips "$fl" --png "$work/${name}_{flip}.png" --set ui_upscale_budget_us=0 --set ui_upscale_max_us=0 "$@" >"$work/$name.log" 2>&1
++    md5sum "$work/${name}_$(printf %06d "$lastflip").png" 2>/dev/null | cut -c1-16
++}
++expect() {  # expect LABEL SUM_A SUM_B same|differ
++    local ok=0
++    if [ "$4" = same ]; then [ "$2" = "$3" ] && [ -n "$2" ] && ok=1; else [ "$2" != "$3" ] && [ -n "$2" ] && [ -n "$3" ] && ok=1; fi
++    if [ $ok = 1 ]; then echo "ok    $1 ($4)"; else echo "FAIL  $1: expected $4 ($2 / $3)"; fail=1; fi
++}
++
++mkdir -p "$work/data"
++base=$(pic base "$scene" "$flips" "$last")
++echo "scene $flips: defaults $base"
++# Every value of a picture row, against the defaults (Smooth, Mipmaps On, Off, Pixel lighting Off, Effects Normal).
++expect "gfx.texture_filter=original"   "$base" "$(pic tf "$scene" "$flips" "$last" --port gfx.texture_filter=original)" differ
++expect "gfx.texture_filter=smooth"     "$base" "$(pic tfs "$scene" "$flips" "$last" --port gfx.texture_filter=smooth)" same
++expect "gfx.mipmaps=off"               "$base" "$(pic mip "$scene" "$flips" "$last" --port gfx.mipmaps=off)" differ
++expect "gfx.antialiasing=off"          "$base" "$(pic aaoff "$scene" "$flips" "$last" --port gfx.antialiasing=off)" same
++fx=$(pic fxaa "$scene" "$flips" "$last" --port gfx.antialiasing=fxaa)
++expect "gfx.antialiasing=fxaa"         "$base" "$fx" differ
++expect "gfx.antialiasing=auto (FXAA while there is room)" "$fx" "$(pic aaauto "$scene" "$flips" "$last" --port gfx.antialiasing=auto)" same
++expect "gfx.antialiasing=auto, gl_aa_auto=0 (the old behaviour)" "$base" "$(pic aaauto0 "$scene" "$flips" "$last" --port gfx.antialiasing=auto --set aa_auto=0)" same
++expect "gfx.antialiasing=msaa2 (desktop preview)" "$base" "$(pic ms2 "$scene" "$flips" "$last" --port gfx.antialiasing=msaa2)" differ
++expect "gfx.antialiasing=msaa4 (desktop preview)" "$base" "$(pic ms4 "$scene" "$flips" "$last" --port gfx.antialiasing=msaa4)" differ
++expect "gfx.pixel_lighting=on"         "$base" "$(pic pl "$scene" "$flips" "$last" --port gfx.pixel_lighting=on)" differ
++expect "gfx.effects_scale=2"           "$base" "$(pic es "$scene" "$flips" "$last" --port gfx.effects_scale=2)" differ
++expect "perf.show_fps=on (the counter)" "$base" "$(pic fps "$scene" "$flips" "$last" --port perf.show_fps=on)" differ
++# The Resolution row is read when the renderer is made (hle_media.cpp turns it into display_scale_percent=150): the replayer makes its own
++# renderer, so the setting it stands for is given directly. A smoke test checks the row's accessor.
++expect "perf.resolution=720x408 (display_scale_percent=150)" "$base" "$(pic res "$scene" "$flips" "$last" --set display_scale_percent=150)" differ
++for v in 60 30 off; do expect "perf.frame_cap=$v (no change to a replayed picture)" "$base" "$(pic cap$v "$scene" "$flips" "$last" --port perf.frame_cap=$v)" same; done
++for v in auto off; do expect "perf.frame_skip=$v (the split renderer's: no change to a replay)" "$base" "$(pic skip$v "$scene" "$flips" "$last" --port perf.frame_skip=$v)" same; done
++# A change while the replay runs, as the menu makes it: the picture follows from the next frame.
++mid=$(( ${flips%-*} + 1 ))
++expect "live switch: filter original from flip $mid is the same picture as original from the start" "$(pic tf2 "$scene" "$flips" "$last" --port gfx.texture_filter=original)" "$(pic live "$scene" "$flips" "$last" --port-switch "$mid:gfx.texture_filter=original")" same
++expect "live switch: FXAA from flip $mid is the same picture as FXAA from the start" "$fx" "$(pic livefx "$scene" "$flips" "$last" --port-switch "$mid:gfx.antialiasing=fxaa")" same
++if [ -n "$packs" ]; then
++    off=$(pic hdoff "$scene" "$flips" "$last" --hd follow --pack-dir "$packs" --port gfx.hd_textures=off)
++    x2=$(pic hd2 "$scene" "$flips" "$last" --hd follow --pack-dir "$packs" --port gfx.hd_textures=2x)
++    x4=$(pic hd4 "$scene" "$flips" "$last" --hd follow --pack-dir "$packs" --port gfx.hd_textures=4x)
++    au=$(pic hdauto "$scene" "$flips" "$last" --hd follow --pack-dir "$packs" --port gfx.hd_textures=auto)
++    expect "gfx.hd_textures=2x vs off"  "$off" "$x2" differ
++    expect "gfx.hd_textures=4x vs 2x"   "$x2" "$x4" differ
++    expect "gfx.hd_textures=auto is the 2x pack when it is there" "$x2" "$au" same
++fi
++if [ -n "$movie" ]; then
++    mlast=${movie_flips##*-}
++    mbase=$(pic mbase "$movie" "$movie_flips" "$mlast")
++    expect "gfx.movie_filter=bilinear (a movie picture)" "$mbase" "$(pic mbil "$movie" "$movie_flips" "$mlast" --port gfx.movie_filter=bilinear)" differ
++    expect "gfx.movie_filter=sharp is the default"       "$mbase" "$(pic msh "$movie" "$movie_flips" "$mlast" --port gfx.movie_filter=sharp)" same
++fi
++[ $fail = 0 ] && echo "all rows did what the menu says" || echo "SOME ROWS DID NOT"
++exit $fail
+-- 
+2.43.0
+

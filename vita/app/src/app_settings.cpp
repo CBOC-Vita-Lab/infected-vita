@@ -67,17 +67,12 @@ void apply() {
 }  // namespace
 
 void init() {
-    // The Vita's own default: the renderer thread split in two (display lists and vertex decoding on core 2, the GL calls
-    // on core 1). Measured in mission 1 with the bot: 29-31 fps against 25 with one renderer thread (README-VITA.md).
-    // A settings.txt that names another value keeps it.
-    port::settings().set_platform_default(port::Key::PerfThreadedRenderer, "split");
-    // And 30 frames a second: the game's own rate on a PSP, and what the console holds in a mission (it averages 30-32
-    // uncapped, unevenly); a steady 30 looks smoother than 27-34 and leaves the cores time to spare.
-    port::settings().set_platform_default(port::Key::PerfFrameCap, "30");
-    // And the CPU at 500 MHz (the retail maximum is 444): 12 % more cycles for all three threads at once, which is the cheapest
-    // frame time there is. It needs a plugin that lifts the limit (the clock setter's answer is logged: when the system refuses,
-    // apply() keeps 444); the menu's "CPU clock" row goes back to 444 for a cooler console. A settings.txt that names a value keeps it.
-    port::settings().set_platform_default(port::Key::PerfCpuClock, "500");
+    // The Vita's own defaults (one list for the app and the replayer, PortableKit's apply_vita_defaults): the renderer thread split in
+    // two (mission 1: 29-31 fps against 25 with one renderer thread), 30 frames a second (the game's own rate; a steady 30 looks smoother
+    // than 27-34), the CPU at 500 MHz (12 % more cycles for all three threads; the app keeps 444 when the system refuses, and the menu's
+    // "CPU clock" row goes back to 444 for a cooler console) and anti-aliasing Auto (FXAA while the renderer has room for it).
+    // A settings.txt that names a value keeps it.
+    port::apply_vita_defaults(port::settings());
     portablekit::overlay_host::init_settings();   // the data root comes from INFECTED_DATA_DIR (ux0:data/infected/)
     // The menu writes every row to settings.txt, so a console that has used the menu holds perf.cpu_clock=444, the old default,
     // and 444 would win over the new default for good. Once (the marker file records it), that 444 becomes 500; a 444 chosen
@@ -91,6 +86,18 @@ void init() {
                        saved ? "saved" : "NOT saved");
         }
         plat::file_write_all(plat::Root::Data, "cpu_clock_500.done", "1\n", 2);
+    }
+    // Anti-aliasing Auto is new in 1.1. The menu of 1.0 wrote every row to settings.txt, so a console that has used the menu holds
+    // gfx.antialiasing=off, the old default, and Off would win over Auto for good. Once (the marker file records it): a settings.txt
+    // in which every other row is at its default has no choice in it, and its Off becomes Auto; a file in which the player changed
+    // anything else keeps its Off (it may be a choice), and so does a real FXAA or MSAA choice. A config.txt override is left alone.
+    if (!plat::file_exists(plat::Root::Data, "aa_auto.done")) {
+        port::Settings& s = port::settings();
+        if (s.adopt_auto_antialiasing()) {
+            const bool saved = s.save();
+            plat::logf("settings: gfx.antialiasing off in settings.txt was the old default; it is now Auto (%s)", saved ? "saved" : "NOT saved");
+        }
+        plat::file_write_all(plat::Root::Data, "aa_auto.done", "1\n", 2);
     }
     log_non_default();
 }

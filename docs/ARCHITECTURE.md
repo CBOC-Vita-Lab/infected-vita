@@ -168,7 +168,7 @@ All enhancements are user-switchable from an in-game overlay menu, grouped as Gr
 | Graphics | `gfx.hd_textures` | `auto`, `off`, `2x`, `4x` (`auto` = the 2x pack if installed, else the 4x pack) | texture pack, section below |
 | Graphics | `gfx.texture_filter` | `smooth`, `original` | 3D draws only; HUD/2D keeps the game's own filter |
 | Graphics | `gfx.mipmaps` | `on`, `off` | generated at upload or taken from the pack |
-| Graphics | `gfx.antialiasing` | `off`, `fxaa`, `msaa2`, `msaa4` | MSAA = restart needed |
+| Graphics | `gfx.antialiasing` | `auto`, `off`, `fxaa`, `msaa2`, `msaa4` | MSAA = restart needed (Auto: the Vita's default; the framework's is `off`) |
 | Graphics | `gfx.pixel_lighting` | `off`, `on` | per-fragment lighting |
 | Graphics | `gfx.effects_scale` | `1`, `2` | off-screen glow/blur targets |
 | Graphics | `gfx.movie_filter` | `sharp`, `bilinear` | scaling of 480x272 movies |

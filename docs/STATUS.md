@@ -22,7 +22,7 @@ movies have not.
 | 4x pack + FXAA + pixel lighting + double-resolution effects | 10 to 14 fps: the GPU cannot keep up |
 | 500 MHz | Needs a PSVshellPlus profile (`vita/psvshell`). With it the CPU measures about 494-497 MHz. |
 | Ceiling | With no draw calls at all (`gl_null_draw=1`) the game and the display-list walk alone reach 36 fps, so 60 fps is out of reach; the game itself runs at 30. |
-| Not measured yet | the worst frames (1 % lows), the gain of each speed feature on its own, 500 MHz over a whole mission |
+| Not measured yet | the worst frames (1 % lows), the gain of each speed feature on its own, 500 MHz over a whole mission, the cheaper FXAA pass (`gl_fxaa_quality=fast`), anti-aliasing Auto (version 1.1: how often it has FXAA on in a mission, whether its thresholds are right), the other settings rows on the console except the ones above |
 
 `docs/history/` has the working logs behind these numbers, including what was tried and dropped.
 

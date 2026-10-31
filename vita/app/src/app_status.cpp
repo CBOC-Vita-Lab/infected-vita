@@ -321,7 +321,7 @@ void report(const char* why) {
     const auto snd = portablekit::audio::AudioSink::instance().telemetry();
     // Frame skipping: frames left undrawn so far, how far behind the walker the GL thread runs, and whether the guest runs ahead of it.
     const portablekit::gpu::FrameSkipStats fs = split_on ? split->frame_skip_stats() : portablekit::gpu::FrameSkipStats{};
-    char line[960];
+    char line[1100];
     snprintf(line, sizeof(line),
              "[stat] %s t=%.0fs flips=%llu(+%llu) presented=%llu(+%llu) frame=%.1fms ge=%s%.0f%% | ms/frame guest=%.1f hle=%s gewalk=%.1f (vertex=%.1f) glsubmit=%.1f present=%.1f "
              "decode=%.1f audio=%.1f io=%.1f idle=%.1f (gesync=%.1f flipwait=%.1f) | splitwait=%.1f walkidle=%.1f glidle=%.1f | draws/f=%u gl_draws/f=%u | switches/s=%.0f calls/f lean=%.0f interp=%.0f hle=%.0f | audio q=%u underruns=%llu(+%llu) snd fill=%llu silent=%llu lost=%llu rst=%llu over=%llu lead=%lld ppm=%d | skip=%llu catchup=%d lag=%.1fms",
@@ -336,6 +336,14 @@ void report(const char* why) {
              (unsigned long long)snd.fill, (unsigned long long)snd.silent, (unsigned long long)snd.dropped, (unsigned long long)snd.restarts,
              (unsigned long long)plat::audio_stats().overruns, (long long)snd.lead, (int)plat::audio_stats().rate_ppm,
              (unsigned long long)fs.skipped_frames, fs.catchup ? 1 : 0, fs.lag_us / 1000.0);
+#if !defined(INFECTED_NO_GL)
+    // Anti-aliasing Auto: whether FXAA is on now, and how often it has gone off and come back since the start (log lines: "[aa] auto: ...").
+    if (gpu::Renderer* r = media_renderer()) {
+        const portablekit::gpu::GlRenderer::AutoAaInfo aa = static_cast<portablekit::gpu::GlRenderer*>(portablekit::gpu::innermost(r))->auto_aa_info();
+        const size_t used = strlen(line);
+        if (aa.state >= 0) snprintf(line + used, sizeof(line) - used, " | aa=auto:%s(off %u, on %u)", aa.state ? "on" : "off", aa.offs, aa.ons);
+    }
+#endif
     // with the HLE timer on, replace the on/off marker by the number
     if (cfg_bool("stats_hle", false)) {
         char* p = strstr(line, "hle=on");

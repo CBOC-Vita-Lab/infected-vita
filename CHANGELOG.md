@@ -1,5 +1,12 @@
 # What's New
 
+## Version 1.1 — (unreleased)
+
+**Smoother and smoother-looking, with nothing to set**
+- New anti-aliasing choice, **Auto**, now the default: the game turns on FXAA (a cheaper version than before) when the Vita's graphics chip has room and switches it off again the moment a scene needs the time, so edges are smoother without losing frames. The menu shows **Auto (on)** or **Auto (off)**.
+- Players coming from 1.0 who never changed a setting move to Auto by themselves; anyone who changed settings keeps their anti-aliasing as it was.
+- The log lists every speed feature the run has on (`[gl] speed features: ...`), and the settings menu was checked row by row, value by value (new automatic test).
+
 ## Version 1.0 — October 23, 2026
 
 **The first public version.** The whole game runs natively on the Vita, at a steady 30 fps.
