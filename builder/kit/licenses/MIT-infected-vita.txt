@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2026 Vita Port Lab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Exceptions, each under its own licence (see CREDITS.md):
+
+* vita/scripts/patches/vitagl-*.patch change vitaGL, which is GPL-3.0; the patches are GPL-3.0 too.
+* vita/scripts/patches/ffmpeg-tx-float-only.patch changes FFmpeg (LGPL-2.1-or-later); the patch follows it.
+* patches/portablekit/ change PortableKit (MIT); the patches are MIT.
+* A package built from this repository links vitaGL statically (GPL-3.0) and FFmpeg's libavcodec and libavutil (LGPL-2.1-or-later).
+  Whoever passes such a package on has to meet those licences. It also contains code translated from the game, which is not
+  anyone's to pass on: build your own, from your own disc, and keep it.
