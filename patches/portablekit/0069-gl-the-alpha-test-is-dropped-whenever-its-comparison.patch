@@ -1,0 +1,670 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:07:38 -0400
+Subject: [PATCH 69/70] gl: the alpha test is dropped whenever its comparison
+ passes for every alpha the draw's fragments can have
+
+The first rule dropped the test (and so the shader's `discard`, which on a tile-based GPU keeps the hardware
+from settling visibility before shading) only when every fragment had alpha 255. The decision is now an interval
+rule in host/gpu/gl/gl_alpha_test.hpp: the 8-bit alpha range of the draw's fragments from the vertex colours or
+material (min and max over the vertices), the lighting's ambient alpha, and the texture function (modulate, blend, add
+multiply the texel's alpha, replace takes it, decal and a texture whose alpha is unused leave the colour's) with what is
+known of the texture (every texel opaque), against the comparison and reference. A guard of two units is applied
+wherever a bound is not exactly 0 or 255. A constant fade of an opaque texture, a lit draw at a constant ambient
+alpha and "replace" with an opaque texture now lose the test; a texture with any alpha below 255 keeps it.
+
+The texture scan that says a texture is opaque used to happen only with gfx.texture_filter or gfx.mipmaps on, so with
+both off almost no draw lost its test (1 a frame instead of 409): it is made when a 3D draw first needs it.
+
+gl_alpha_elide_range=0 returns to the first rule, gl_alpha_elide=0 keeps every test. GlStats::alpha_tested/alpha_elided
+and the [perf] line ("alpha-test draws N, without discard M") count draws. portablekit_alpha_test_tests checks the
+decision table against a brute-force evaluation of every alpha.
+
+Mission-1 dumps (100 flips, software GL, ui upscale budget off so the replay is deterministic): 100/100 pictures
+byte-identical with the test kept and dropped, in four configurations (defaults, all options off, FXAA on, first rule).
+Draws that lose the test: 350 -> 410 of 640 alpha-tested draws a frame; their covered area 46 % -> 71 %.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                |   9 +++
+ docs/GL_RENDERER.md           |  19 +++--
+ host/gpu/gl/gl_alpha_test.hpp | 130 ++++++++++++++++++++++++++++++++
+ host/gpu/gl/gl_renderer.cpp   | 107 ++++++++++++++++----------
+ host/gpu/gl/gl_renderer.hpp   |   7 +-
+ host/perf/frame_stats.cpp     |  14 ++++
+ host/perf/frame_stats.hpp     |   6 ++
+ tests/alpha_test_tests.cpp    | 137 ++++++++++++++++++++++++++++++++++
+ tools/ge_replay/ge_replay.cpp |   3 +-
+ 9 files changed, 387 insertions(+), 45 deletions(-)
+ create mode 100644 host/gpu/gl/gl_alpha_test.hpp
+ create mode 100644 tests/alpha_test_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e706f85..e5fb854 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -403,6 +403,15 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_mip_chain_tests COMMAND portablekit_mip_chain_tests)
+ endif()
+ 
++# When the GE's alpha test cannot fail (host/gpu/gl/gl_alpha_test.hpp): the decision table. Header only, no GL.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_alpha_test_tests "${PORTABLEKIT_ROOT}/tests/alpha_test_tests.cpp")
++    target_compile_features(portablekit_alpha_test_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_alpha_test_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_alpha_test_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_alpha_test_tests COMMAND portablekit_alpha_test_tests)
++endif()
++
+ # The settings overlay (host/overlay): chord, navigation, saving, script and drawing on a software canvas.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_overlay_tests
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index fa4074b..b3f0446 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -55,11 +55,20 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   program from about 600 instructions to 96–182. `GL_SPECIALIZE=0` (`--set specialize=0`) goes back to the
+   uniform-driven programs; both give the same pictures.
+ * **Alpha tests that decide nothing are dropped** (`GL_ALPHA_ELIDE`, on). Infected keeps the GE's alpha test on
+-  ("greater than 0") for nearly everything. When every fragment of a draw has alpha 255 (opaque vertices or material,
+-  and a texture whose texels are all opaque, or a DXT1 HD replacement), the comparison has one answer, so the draw
+-  gets a program without the test and without `discard`, which on a tile-based GPU holds up the depth test of what
+-  lies behind. About 400 of a mission frame's 640 draws qualify; the pictures are identical (replays with and without
+-  the HD pack, and a live mission).
++  ("greater than 0") for nearly everything, and on a tile-based GPU a `discard` holds up the depth test of what lies behind.
++  The decision is an interval rule ([`gl_alpha_test.hpp`](../host/gpu/gl/gl_alpha_test.hpp), tested without GL by
++  `portablekit_alpha_test_tests`): the 8-bit alpha a draw's fragments can have is bounded from the vertex colours (or the
++  material), the lighting's ambient alpha, and the texture function with what is known of the texture (every texel opaque:
++  an opaque format, a palette without alpha, a scanned texture, a DXT1 HD replacement), and the test is dropped when its
++  comparison passes for the whole range. Opaque vertices and an opaque texture were the first rule; the range also takes a
++  constant fade of an opaque texture (alpha 128 passes "greater than 0") and a lit draw at a constant ambient alpha, with a
++  guard of two units wherever a bound is not exactly 0 or 255 (the varying's precision, the product of two alphas). `replace`
++  with an opaque texture ignores the vertices. A texture that is not opaque keeps its test: a bound from a texture's smallest
++  alpha would have to hold through mip levels and filtering. The scan of a 3D draw's texture happens when a draw first needs
++  it, so the gfx options that used to trigger it (filter, mipmaps) can be off. `GL_ALPHA_ELIDE=0` keeps every test;
++  `GL_ALPHA_ELIDE_RANGE=0` goes back to the first rule (every fragment at alpha 255). Replays of 100 mission-1 frames are
++  pixel-identical with the switches on and off (default options, all options off, FXAA on). `ge_replay --stats` and the
++  perf line (`alpha-test draws N, without discard M`) count the draws that had a test that could reject, and those that lost it.
+ * **Pixel-art upscaling for the HUD** (`GL_UI_UPSCALE`, on). A small texture that only 2D draws sample (through mode:
+   a button glyph, a HUD icon) and that looks like pixel art (a palette texture, or at most 256 colours) is uploaded at
+   twice its size, made by MMPX ([`host/gpu/mmpx.hpp`](../host/gpu/mmpx.hpp); credit in
+diff --git a/host/gpu/gl/gl_alpha_test.hpp b/host/gpu/gl/gl_alpha_test.hpp
+new file mode 100644
+index 0000000..0d40e0f
+--- /dev/null
++++ b/host/gpu/gl/gl_alpha_test.hpp
+@@ -0,0 +1,130 @@
++#pragma once
++
++// When the GE's alpha test cannot fail for any fragment of a draw, the draw does not need it: its program has no `discard`.
++// On a tile-based GPU (the Vita's PowerVR) a `discard` in a shader means the hardware cannot settle which fragment of a pixel is
++// visible before shading, so a draw that has one pays for all its overdraw. This header is the decision, with no GL and no
++// state in it so that a test can drive every row of the table; gl_renderer.cpp feeds it what it knows about a draw.
++//
++// The rule is one of intervals. Whatever reaches the test is an 8-bit alpha (the shader rounds: floor(alpha * 255 + 0.5)). From
++// the draw's colour source, the lighting and the texture function a range [low, high] that holds every such alpha is worked
++// out; the test is dropped when its comparison against the reference gives "pass" for every value of that range. Anything the
++// renderer cannot bound is the whole range 0..255, which only the comparison "always" passes. The range is widened by a guard
++// (kGuard) where the shader's interpolation and its half-precision arithmetic could move a value by a unit or two, so that a
++// bound that merely touches the reference does not drop the test.
++#include <cstdint>
++
++namespace portablekit::gpu::alpha_test {
++
++// AlphaTestState::function.
++enum Function : std::uint32_t {
++    kNever = 0u,
++    kAlways = 1u,
++    kEqual = 2u,
++    kNotEqual = 3u,
++    kLess = 4u,
++    kLessEqual = 5u,
++    kGreater = 6u,
++    kGreaterEqual = 7u,
++};
++
++// An inclusive range of 8-bit alpha values.
++struct Range {
++    std::uint32_t low{0u};
++    std::uint32_t high{255u};
++};
++
++// The comparison against `reference` (the shader's: the rounded 8-bit alpha on the left) for the single value `alpha`.
++[[nodiscard]] constexpr bool passes(std::uint32_t function, std::uint32_t reference, std::uint32_t alpha) noexcept {
++    switch (function) {
++    case kNever: return false;
++    case kAlways: return true;
++    case kEqual: return alpha == reference;
++    case kNotEqual: return alpha != reference;
++    case kLess: return alpha < reference;
++    case kLessEqual: return alpha <= reference;
++    case kGreater: return alpha > reference;
++    default: return alpha >= reference;   // 7, and the (unused) codes above it: the shader treats them as "greater or equal"
++    }
++}
++
++// True when the comparison passes for every alpha in the range, as an interval test (no loop).
++[[nodiscard]] constexpr bool passes_for_all(std::uint32_t function, std::uint32_t reference, Range range) noexcept {
++    switch (function) {
++    case kNever: return false;
++    case kAlways: return true;
++    case kEqual: return range.low == range.high && range.low == reference;
++    case kNotEqual: return reference < range.low || reference > range.high;
++    case kLess: return range.high < reference;
++    case kLessEqual: return range.high <= reference;
++    case kGreater: return range.low > reference;
++    default: return range.low >= reference;
++    }
++}
++
++// The units the bounds are widened by wherever they are not 255 (for low) or 0 (for high): at those two ends nothing can
++// move the value (a constant 1.0 and 0.0 interpolate to themselves), elsewhere the varying's precision and the product of two
++// alphas can be a unit off, and the rounding another half.
++constexpr std::uint32_t kGuard = 2u;
++
++[[nodiscard]] constexpr Range guarded(Range range) noexcept {
++    Range out;
++    out.low = range.low >= 255u ? 255u : (range.low > kGuard ? range.low - kGuard : 0u);
++    out.high = range.high == 0u ? 0u : (range.high + kGuard < 255u ? range.high + kGuard : 255u);
++    return out;
++}
++
++// How the draw's texture contributes to the fragment's alpha.
++enum class TexelAlpha : std::uint8_t {
++    Unused,    // no texture, a texture function that keeps the colour's alpha (decal), or a texture whose alpha is not used
++    Multiply,  // the colour's alpha times the texel's (modulate, blend, add)
++    Replace,   // the texel's alpha alone
++};
++
++// The GE texture functions: 0 modulate, 1 decal, 2 blend, 3 replace, 4 add (the shader treats 5..7 as add).
++[[nodiscard]] constexpr TexelAlpha texel_alpha_use(bool textured, bool alpha_from_texture, std::uint32_t texture_function) noexcept {
++    if (!textured || !alpha_from_texture || texture_function == 1u) return TexelAlpha::Unused;
++    return texture_function == 3u ? TexelAlpha::Replace : TexelAlpha::Multiply;
++}
++
++// The alpha of a lit draw's colour: the ambient alpha times the material's (or the vertex's) ambient alpha. A range for the
++// product of the ambient alpha and a colour alpha in [low, high], rounded outwards.
++[[nodiscard]] constexpr Range lit_alpha(std::uint32_t ambient_alpha, Range colour) noexcept {
++    Range out;
++    out.low = ambient_alpha * colour.low / 255u;
++    out.high = (ambient_alpha * colour.high + 254u) / 255u;
++    return out;
++}
++
++// What is known about the draw's alpha before the texture.
++struct Facts {
++    Range colour{};              // the alpha of the vertex colour / material / lit colour, 0..255 (the whole range when unknown)
++    TexelAlpha texel{TexelAlpha::Unused};
++    bool texel_opaque{};         // every texel the draw can read has alpha 255 (otherwise the texel's alpha is 0..255)
++};
++
++// The range of 8-bit alphas the fragments of a draw can have at the alpha test.
++[[nodiscard]] constexpr Range fragment_range(const Facts &facts) noexcept {
++    switch (facts.texel) {
++    case TexelAlpha::Unused: return facts.colour;
++    case TexelAlpha::Replace: return Range{facts.texel_opaque ? 255u : 0u, 255u};
++    default: break;
++    }
++    // colour * texel: the texel's alpha is 255 or anywhere in 0..255, so the product is the colour's alpha or runs from 0 to it.
++    return Range{facts.texel_opaque ? facts.colour.low : 0u, facts.colour.high};
++}
++
++// True when the alpha test of a draw with these facts passes for every fragment (the comparison "always" included, and the
++// rounding guard applied): the draw can be made with a program that has no alpha test.
++[[nodiscard]] constexpr bool cannot_fail(std::uint32_t function, std::uint32_t reference, const Facts &facts) noexcept {
++    if (function == kAlways) return true;
++    if (function == kNever) return false;
++    return passes_for_all(function, reference, guarded(fragment_range(facts)));
++}
++
++// The exact case the first version of the elision knew: every fragment has alpha 255. No guard (255 is a bound nothing
++// can exceed or fall below by more than the rounding), so this is the rule the renderer keeps behind `alpha_elide_range=0`.
++[[nodiscard]] constexpr bool cannot_fail_at_255(std::uint32_t function, std::uint32_t reference) noexcept {
++    return passes_for_all(function, reference, Range{255u, 255u});
++}
++
++} // namespace portablekit::gpu::alpha_test
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 45a98dd..e5813a3 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -14,10 +14,12 @@
+ 
+ #include "../../overlay/overlay_menu.hpp"
+ #include "../../settings/port_settings.hpp"
++#include "../../perf/frame_stats.hpp"
+ #include "../mip_chain.hpp"
+ #include "../mmpx.hpp"
+ #include "../texture_decode.hpp"
+ #include "../triangle_indices.hpp"
++#include "gl_alpha_test.hpp"
+ #include "gl_overlay.hpp"
+ #include "gl_hd_movie.hpp"
+ #include "gl_hd_textures.hpp"
+@@ -2291,40 +2293,73 @@ struct GlRenderer::Impl {
+     }
+ 
+     // ---- alpha tests that decide nothing (settings.alpha_elide) ---------------------------------------------------
++    // The decision itself is gl_alpha_test.hpp (an interval rule, tested on its own); this gathers what it needs.
+ 
+-    // The GE's comparison (the shader's: the 8-bit alpha against the reference) for an alpha of 255.
+-    static bool alpha_test_passes_at_255(std::uint32_t function, std::uint32_t reference) {
+-        switch (function) {
+-        case 1u: return true;                   // always
+-        case 2u: return reference == 255u;      // equal
+-        case 3u: return reference != 255u;      // not equal
+-        case 5u: return reference >= 255u;      // less or equal
+-        case 6u: return reference < 255u;       // greater
+-        case 7u: return true;                   // greater or equal
+-        default: return false;                  // never, less
++    // The lowest and highest alpha of the vertex colours (0..255). prepare_draw() has classified all-opaque and all-zero draws.
++    static alpha_test::Range vertex_alpha_range(const DrawCall &call) {
++        if (call.prepared_vertex_alpha == 1u) return {255u, 255u};
++        if (call.prepared_vertex_alpha == 3u) return {0u, 0u};
++        std::uint32_t low = 255u, high = 0u;
++        for (const Vertex &vertex : call.vertices) {
++            const std::uint32_t alpha = vertex.color >> 24u;
++            low = std::min(low, alpha);
++            high = std::max(high, alpha);
+         }
++        if (call.vertices.empty()) return {0u, 255u};
++        return {low, high};
+     }
+ 
+-    static bool vertices_opaque(const DrawCall &call) {
+-        if (call.prepared_vertex_alpha != 0u) return call.prepared_vertex_alpha == 1u;  // prepare_draw() looked already
+-        std::uint32_t all = 0xFFFFFFFFu;  // every colour ANDed: no early exit, two instructions a vertex
+-        for (const Vertex &vertex : call.vertices) all &= vertex.color;
+-        return (all >> 24u) == 0xFFu;
++    // Whether every texel the draw can read has alpha 255. Conservative: anything not known to be opaque is not. `memory`
++    // lets a 3D draw's texture be scanned when nothing has looked at it yet (the scan normally comes with the filter options,
++    // which may be off).
++    bool texel_alpha_is_255(const DrawCall &call, const TextureBinding &binding, const GuestMemory &memory) {
++        if (binding.opaque) return true;   // the shader sets the texel's alpha to 1
++        if (binding.from_target || binding.hd_movie || binding.entry == nullptr) return false;
++        TextureEntry &entry = *binding.entry;
++        if (entry.hd.replaced) return entry.hd.opaque;
++        if (!entry.traits_known && !call.through) ensure_traits(entry, memory);   // the 2D draws keep to what is known
++        return entry.traits_known && entry.traits.transparent == 0u && entry.traits.translucent == 0u;
+     }
+ 
+-    // Every fragment of the draw has alpha 1.0 when it reaches the alpha test: the shader's alpha is the vertex colour's
+-    // (the material's without vertex colours; with lighting, the ambient alpha times the vertex's or the material's), times
+-    // the texel's when the texture function uses it. Conservative: anything not known to be opaque is not.
+-    bool fragment_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured, bool lit) const {
+-        // The texel's part first: it decides most draws without a look at the vertices.
+-        if (!texel_alpha_is_255(call, binding, textured)) return false;
++    // Every fragment of the draw passes its alpha test (so the program can leave it out). The shader's alpha is the vertex
++    // colour's (the material's without vertex colours; with lighting, the ambient alpha times the vertex's or the material's),
++    // times the texel's when the texture function uses it.
++    bool alpha_test_cannot_fail(const DrawCall &call, const TextureBinding &binding, bool textured, bool lit,
++                                const GuestMemory &memory) {
++        const std::uint32_t function = call.alpha_test.function, reference = call.alpha_test.reference;
++        if (!settings.alpha_elide_range) {
++            // The first version's rule: every fragment has alpha 255.
++            if (!alpha_test::cannot_fail_at_255(function, reference)) return false;
++            alpha_test::Facts facts;
++            if (!colour_alpha_range(call, lit, facts.colour) || facts.colour.low != 255u) return false;
++            facts.texel = alpha_test::texel_alpha_use(textured, call.texture.alpha_from_texture, call.texture.function);
++            return facts.texel == alpha_test::TexelAlpha::Unused || texel_alpha_is_255(call, binding, memory);
++        }
++        alpha_test::Facts facts;
++        facts.texel = alpha_test::texel_alpha_use(textured, call.texture.alpha_from_texture, call.texture.function);
++        if (facts.texel != alpha_test::TexelAlpha::Replace) {
++            if (!colour_alpha_range(call, lit, facts.colour)) return false;
++        }
++        if (facts.texel != alpha_test::TexelAlpha::Unused) facts.texel_opaque = texel_alpha_is_255(call, binding, memory);
++        return alpha_test::cannot_fail(function, reference, facts);
++    }
++
++    // The alpha range of the colour the texture function starts from. False when it cannot be known.
++    static bool colour_alpha_range(const DrawCall &call, bool lit, alpha_test::Range &out) {
+         if (lit) {
+-            if (call.lighting.ambient_alpha != 0xFFu) return false;
+             const bool from_vertex = call.has_vertex_color && (call.lighting.material_update & 1u) != 0u;
+-            return from_vertex ? vertices_opaque(call) : (call.material_color >> 24u) == 0xFFu;
++            const std::uint32_t material = call.material_color >> 24u;
++            out = alpha_test::lit_alpha(call.lighting.ambient_alpha & 0xFFu, from_vertex ? vertex_alpha_range(call) : alpha_test::Range{material, material});
++            return true;
+         }
+         const bool use_material = !call.has_vertex_color && !call.lighting_enabled;
+-        return use_material ? (call.material_color >> 24u) == 0xFFu : vertices_opaque(call);
++        if (use_material) {
++            const std::uint32_t material = call.material_color >> 24u;
++            out = {material, material};
++        } else {
++            out = vertex_alpha_range(call);
++        }
++        return true;
+     }
+ 
+     // ---- draws that change nothing (settings.skip_invisible) -------------------------------------------------------
+@@ -2369,15 +2404,6 @@ struct GlRenderer::Impl {
+         return alpha_kept;
+     }
+ 
+-    static bool texel_alpha_is_255(const DrawCall &call, const TextureBinding &binding, bool textured) {
+-        if (!textured || !call.texture.alpha_from_texture || call.texture.function == 1u) return true;  // decal keeps the colour's
+-        if (binding.opaque) return true;   // the shader sets the texel's alpha to 1
+-        if (binding.from_target || binding.hd_movie || binding.entry == nullptr) return false;
+-        const TextureEntry &entry = *binding.entry;
+-        if (entry.hd.replaced) return entry.hd.opaque;
+-        return entry.traits_known && entry.traits.transparent == 0u && entry.traits.translucent == 0u;
+-    }
+-
+     void refresh_environment(const DrawCall &call) {
+         const LightingState &state = call.lighting;
+         const auto ambient = unpack_color(state.ambient_color, static_cast<float>(state.ambient_alpha) / 255.0f);
+@@ -2741,10 +2767,14 @@ struct GlRenderer::Impl {
+                 return;
+             }
+         }
+-        if (alpha_test && settings.alpha_elide && alpha_test_passes_at_255(call.alpha_test.function, call.alpha_test.reference) &&
+-            fragment_alpha_is_255(call, binding, textured, lit)) {
+-            alpha_test = false;
+-            ++st().alpha_elided;
++        if (alpha_test) {
++            ++st().alpha_tested;
++            perf::count_alpha_test_draw();
++            if (settings.alpha_elide && alpha_test_cannot_fail(call, binding, textured, lit, memory)) {
++                alpha_test = false;
++                ++st().alpha_elided;
++                perf::count_alpha_test_dropped();
++            }
+         }
+         const bool rect_clamp = through && textured && settings.rect_clamp;
+         float picture_rect[4] = {};
+@@ -3193,6 +3223,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "fill_test") settings.fill_test = flag;
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
++    else if (name == "alpha_elide_range") settings.alpha_elide_range = flag;
+     else if (name == "skip_invisible") settings.skip_invisible = flag;
+     else if (name == "ui_upscale") settings.ui_upscale = flag;
+     else if (name == "prewarm") settings.prewarm = flag;
+@@ -3224,7 +3255,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index fb24020..8313e00 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -73,6 +73,10 @@ struct GlSettings {
+     // An alpha test that a draw's fragments cannot fail (every alpha is 255: opaque vertices or material, an opaque
+     // texture) is dropped, so the program has no discard. The picture is the same.
+     bool alpha_elide{true};
++    // With alpha_elide: the wider rule. The alpha of a draw's fragments is bounded as an interval (vertex or material alpha,
++    // the lighting's ambient alpha, an opaque texture), not only "all 255": a fade of an opaque texture at a constant alpha
++    // passes "greater than 0" too. Off (gl_alpha_elide_range=0), only draws whose every fragment has alpha 255 lose the test.
++    bool alpha_elide_range{true};
+     // A draw whose every fragment has alpha 0 and that then changes nothing (the alpha test rejects alpha 0, or it blends
+     // as source alpha / one minus source alpha onto a target whose alpha is not written or not kept) is not drawn.
+     // Games fade sprites and effects out by their alpha and keep sending them; the picture is the same.
+@@ -203,7 +207,8 @@ struct GlStats {
+     std::uint64_t mip_draws{};          // 3D draws sampled with mips
+     std::uint64_t pixel_lit_draws{};    // draws lit per fragment
+     std::uint64_t invisible_skipped{};  // draws with every fragment at alpha 0 that changed nothing: not drawn
+-    std::uint64_t alpha_elided{};       // alpha-tested draws whose every fragment has alpha 255: drawn without the test
++    std::uint64_t alpha_tested{};       // draws that reached the renderer with an alpha test that could reject (not "always"/"never")
++    std::uint64_t alpha_elided{};       // ... of which drawn without the test (and without `discard`): no fragment can fail it
+     std::uint64_t ui2x_textures{};      // textures uploaded at twice their size (settings.ui_upscale)
+     std::uint64_t ui2x_us{};            // ... and the microseconds the MMPX passes took
+     std::uint64_t ui2x_deferred{};      // passes put off to a later frame by ui_upscale_budget_us
+diff --git a/host/perf/frame_stats.cpp b/host/perf/frame_stats.cpp
+index 83c44cd..7805d23 100644
+--- a/host/perf/frame_stats.cpp
++++ b/host/perf/frame_stats.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -119,6 +120,8 @@ struct State {
+     std::uint64_t pass_sum{};
+     std::uint64_t cleared_pass_sum{};
+     std::uint64_t copy_sum{};
++    std::atomic<std::uint64_t> alpha_test_sum{};   // the GL thread counts, the reporting thread reads
++    std::atomic<std::uint64_t> alpha_dropped_sum{};
+     std::uint64_t vertex_peak{};
+     std::uint64_t index_peak{};
+     StallTallies stall_sum{};
+@@ -172,6 +175,9 @@ void print(const Summary &s) {
+     if (s.passes > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+         length += std::snprintf(line + length, sizeof(line) - length, " | passes %.1f (%.1f cleared) copies %.1f",
+                                 s.passes, s.cleared_passes, s.copies);
++    if (s.alpha_tested > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
++        length += std::snprintf(line + length, sizeof(line) - length, " | alpha-test draws %.0f, without discard %.0f",
++                                s.alpha_tested, s.alpha_dropped);
+     if (s.overlay_ms > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+         length += std::snprintf(line + length, sizeof(line) - length, " | overlay %.2f ms", s.overlay_ms);
+     if (alternate().paths != 0u && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+@@ -261,6 +267,8 @@ void restart_measurement() {
+     s.list_sum = 0u;
+     s.draw_sum = s.recorded_draw_sum = 0u;
+     s.pass_sum = s.copy_sum = s.cleared_pass_sum = 0u;
++    s.alpha_test_sum.store(0u, std::memory_order_relaxed);
++    s.alpha_dropped_sum.store(0u, std::memory_order_relaxed);
+     s.stall_sum = StallTallies{};
+     s.gpu_sum_ms = s.gpu_max_ms = 0.0;
+     s.vertex_peak = s.index_peak = 0u;
+@@ -365,6 +373,8 @@ void count_recorded_draws(std::uint32_t count) { state().recorded_draws += count
+ void count_render_pass() { ++state().pass_sum; }
+ void count_target_copy() { ++state().copy_sum; }
+ void count_cleared_pass() { ++state().cleared_pass_sum; }
++void count_alpha_test_draw() { state().alpha_test_sum.fetch_add(1u, std::memory_order_relaxed); }
++void count_alpha_test_dropped() { state().alpha_dropped_sum.fetch_add(1u, std::memory_order_relaxed); }
+ 
+ void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes) {
+     State &s = state();
+@@ -478,6 +488,8 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
+     out.passes = static_cast<double>(s.pass_sum) / frames;
+     out.cleared_passes = static_cast<double>(s.cleared_pass_sum) / frames;
+     out.copies = static_cast<double>(s.copy_sum) / frames;
++    out.alpha_tested = static_cast<double>(s.alpha_test_sum.load(std::memory_order_relaxed)) / frames;
++    out.alpha_dropped = static_cast<double>(s.alpha_dropped_sum.load(std::memory_order_relaxed)) / frames;
+     out.frame_avg_ms = s.presents != 0u ? s.present_sum_ms / presents : 0.0;
+     out.frame_max_ms = s.present_max_ms;
+     const double gpu_wait_ms = to_ms(s.wait_sum) / frames;
+@@ -526,6 +538,8 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
+     s.list_sum = 0u;
+     s.draw_sum = s.recorded_draw_sum = 0u;
+     s.pass_sum = s.copy_sum = s.cleared_pass_sum = 0u;
++    s.alpha_test_sum.store(0u, std::memory_order_relaxed);
++    s.alpha_dropped_sum.store(0u, std::memory_order_relaxed);
+     s.stall_sum = StallTallies{};
+     s.gpu_sum_ms = s.gpu_max_ms = 0.0;
+     s.vertex_peak = s.index_peak = 0u;
+diff --git a/host/perf/frame_stats.hpp b/host/perf/frame_stats.hpp
+index c7ffdb8..c301e61 100644
+--- a/host/perf/frame_stats.hpp
++++ b/host/perf/frame_stats.hpp
+@@ -81,6 +81,10 @@ void count_render_pass();
+ void count_target_copy();
+ // A render pass begun without loading what its first draw, a clear, writes.
+ void count_cleared_pass();
++// A draw with an alpha test that could reject fragments, and one of those the renderer drew without the test (and so without
++// `discard`, which on a tile-based GPU keeps the hardware from hiding what is behind); shown per frame on the perf line.
++void count_alpha_test_draw();
++void count_alpha_test_dropped();
+ // Bytes of the vertex and index buffers one frame's draws took; the perf line
+ // shows the most a frame took in the second, against the room each frame has.
+ void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes);
+@@ -118,6 +122,8 @@ struct Summary {
+     double passes{};          // render passes per frame, presents between flips included
+     double cleared_passes{};  // of those, begun without loading what a clear overwrites
+     double copies{};          // full-size render target copies and blits per frame
++    double alpha_tested{};    // draws with an alpha test that could reject, per frame
++    double alpha_dropped{};   // ... of which drawn without it
+     double frame_avg_ms{};
+     double frame_max_ms{};
+     double guest_ms{};
+diff --git a/tests/alpha_test_tests.cpp b/tests/alpha_test_tests.cpp
+new file mode 100644
+index 0000000..a55d5bb
+--- /dev/null
++++ b/tests/alpha_test_tests.cpp
+@@ -0,0 +1,137 @@
++// When the GE's alpha test cannot fail (host/gpu/gl/gl_alpha_test.hpp): the decision table, checked against a brute-force
++// evaluation of every alpha, plus the rows Infected relies on. No GL, no game.
++
++#include "gpu/gl/gl_alpha_test.hpp"
++
++#include <cstdio>
++
++namespace {
++
++using namespace portablekit::gpu::alpha_test;
++
++int g_failures = 0;
++
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++// Every alpha of the range passes, found by trying them all.
++bool brute_force(std::uint32_t function, std::uint32_t reference, Range range) {
++    for (std::uint32_t alpha = range.low; alpha <= range.high; ++alpha)
++        if (!passes(function, reference, alpha)) return false;
++    return true;
++}
++
++Facts unlit(std::uint32_t low, std::uint32_t high) {
++    Facts facts;
++    facts.colour = {low, high};
++    return facts;
++}
++
++Facts textured(std::uint32_t low, std::uint32_t high, TexelAlpha use, bool opaque) {
++    Facts facts = unlit(low, high);
++    facts.texel = use;
++    facts.texel_opaque = opaque;
++    return facts;
++}
++
++} // namespace
++
++int main() {
++    // 1. The interval rule equals trying every alpha, for every function, a grid of references and ranges (the ranges include
++    //    the empty-looking single values and the whole 0..255).
++    {
++        bool same = true;
++        std::uint32_t rows = 0;
++        for (std::uint32_t function = 0; function < 8u; ++function)
++            for (std::uint32_t reference = 0; reference < 256u; reference += (reference < 4u || reference > 250u) ? 1u : 17u)
++                for (std::uint32_t low = 0; low < 256u; low += (low < 3u || low > 252u) ? 1u : 23u)
++                    for (std::uint32_t high = low; high < 256u; high += (high < 3u || high > 252u) ? 1u : 29u) {
++                        ++rows;
++                        if (passes_for_all(function, reference, {low, high}) != brute_force(function, reference, {low, high})) {
++                            same = false;
++                            std::printf("     differs: function %u reference %u range %u..%u\n", function, reference, low, high);
++                        }
++                    }
++        check(same, "passes_for_all equals trying every alpha of the range");
++        std::printf("     (%u rows)\n", rows);
++    }
++
++    // 2. The first version's rule: every fragment at 255.
++    check(cannot_fail_at_255(kGreater, 0u) && cannot_fail_at_255(kGreater, 254u) && !cannot_fail_at_255(kGreater, 255u),
++          "alpha 255 passes greater than every reference below 255");
++    check(cannot_fail_at_255(kGreaterEqual, 255u) && cannot_fail_at_255(kAlways, 0u), "alpha 255 passes greater-or-equal 255 and always");
++    check(cannot_fail_at_255(kEqual, 255u) && !cannot_fail_at_255(kEqual, 254u), "alpha 255 passes equal only to 255");
++    check(cannot_fail_at_255(kNotEqual, 0u) && !cannot_fail_at_255(kNotEqual, 255u), "alpha 255 passes not-equal to anything but 255");
++    check(cannot_fail_at_255(kLessEqual, 255u) && !cannot_fail_at_255(kLessEqual, 254u), "alpha 255 passes less-or-equal 255 only");
++    check(!cannot_fail_at_255(kLess, 255u) && !cannot_fail_at_255(kNever, 0u), "alpha 255 never passes less, never fails never");
++
++    // 3. The draws Infected makes: GREATER 0 (the game keeps the test on nearly everywhere).
++    check(cannot_fail(kGreater, 0u, unlit(255u, 255u)), "opaque vertices, no texture: greater than 0 cannot fail");
++    check(cannot_fail(kGreater, 0u, textured(255u, 255u, TexelAlpha::Multiply, true)), "opaque vertices, opaque texture: cannot fail");
++    check(!cannot_fail(kGreater, 0u, textured(255u, 255u, TexelAlpha::Multiply, false)), "opaque vertices, texture with holes: the test stays");
++    check(!cannot_fail(kGreater, 0u, textured(255u, 255u, TexelAlpha::Replace, false)), "replace with a texture with holes: the test stays");
++    check(cannot_fail(kGreater, 0u, textured(0u, 0u, TexelAlpha::Replace, true)), "replace with an opaque texture: the vertices' alpha does not matter");
++    check(cannot_fail(kGreater, 0u, textured(0u, 255u, TexelAlpha::Replace, true)), "replace with an opaque texture and unknown vertex alpha: cannot fail");
++    check(cannot_fail(kGreater, 0u, textured(255u, 255u, TexelAlpha::Unused, false)), "decal / no texture alpha: the texture's holes do not count");
++    check(!cannot_fail(kGreater, 0u, unlit(0u, 255u)), "unknown vertex alpha: the test stays");
++    check(!cannot_fail(kGreater, 0u, unlit(0u, 0u)), "vertices at alpha 0: the test stays (every fragment fails)");
++    check(!cannot_fail(kGreater, 0u, textured(128u, 128u, TexelAlpha::Multiply, false)), "a fade of a texture with holes: the test stays");
++
++    // 4. A constant fade of an opaque texture: alpha 16..254 is above 0 with room to spare.
++    check(cannot_fail(kGreater, 0u, textured(128u, 128u, TexelAlpha::Multiply, true)), "opaque texture at constant alpha 128: greater than 0 cannot fail");
++    check(cannot_fail(kGreater, 0u, textured(3u, 3u, TexelAlpha::Multiply, true)), "alpha 3 clears the guard of 2");
++    check(!cannot_fail(kGreater, 0u, textured(2u, 2u, TexelAlpha::Multiply, true)), "alpha 2 is inside the guard: the test stays");
++    check(!cannot_fail(kGreater, 0u, textured(1u, 1u, TexelAlpha::Multiply, true)), "alpha 1 is inside the guard: the test stays");
++    check(!cannot_fail(kGreater, 0u, textured(0u, 128u, TexelAlpha::Multiply, true)), "a fade that reaches 0 at a vertex: the test stays");
++    check(cannot_fail(kGreaterEqual, 1u, textured(128u, 128u, TexelAlpha::Multiply, true)), "greater-or-equal 1 likewise");
++    check(!cannot_fail(kGreater, 126u, textured(128u, 128u, TexelAlpha::Multiply, true)), "alpha 128 against reference 126: inside the guard");
++    check(cannot_fail(kGreater, 125u, textured(128u, 128u, TexelAlpha::Multiply, true)), "alpha 128 against reference 125: outside the guard");
++    check(cannot_fail(kLess, 200u, unlit(10u, 100u)) && !cannot_fail(kLess, 102u, unlit(10u, 100u)), "less than: the high end plus the guard decides");
++    check(cannot_fail(kNotEqual, 0u, textured(128u, 128u, TexelAlpha::Multiply, true)), "not equal to 0 at alpha 128");
++    check(!cannot_fail(kEqual, 128u, unlit(128u, 128u)), "equal is only decided for 255 (anything else is within the guard)");
++    check(cannot_fail(kEqual, 255u, unlit(255u, 255u)), "equal 255 at alpha 255");
++
++    // 5. The comparisons that need no look.
++    check(cannot_fail(kAlways, 0u, unlit(0u, 255u)), "always cannot fail");
++    check(!cannot_fail(kNever, 0u, unlit(255u, 255u)), "never always fails");
++
++    // 6. The texture function: which of them put the texel's alpha into the fragment.
++    check(texel_alpha_use(false, true, 0u) == TexelAlpha::Unused, "no texture: unused");
++    check(texel_alpha_use(true, false, 0u) == TexelAlpha::Unused, "a texture whose alpha is not used: unused");
++    check(texel_alpha_use(true, true, 1u) == TexelAlpha::Unused, "decal keeps the colour's alpha");
++    check(texel_alpha_use(true, true, 0u) == TexelAlpha::Multiply && texel_alpha_use(true, true, 2u) == TexelAlpha::Multiply &&
++              texel_alpha_use(true, true, 4u) == TexelAlpha::Multiply && texel_alpha_use(true, true, 7u) == TexelAlpha::Multiply,
++          "modulate, blend, add (and the codes above) multiply");
++    check(texel_alpha_use(true, true, 3u) == TexelAlpha::Replace, "replace takes the texel's alpha");
++
++    // 7. Lighting: the ambient alpha times the colour's.
++    {
++        const Range full = lit_alpha(255u, {255u, 255u});
++        check(full.low == 255u && full.high == 255u, "ambient 255 over alpha 255 is 255");
++        const Range half = lit_alpha(128u, {255u, 255u});
++        check(half.low == 128u && half.high == 128u, "ambient 128 over alpha 255 is 128");
++        const Range mixed = lit_alpha(100u, {50u, 200u});
++        check(mixed.low == 19u && mixed.high == 79u, "the product of ranges is rounded outwards (19..79)");
++        check(cannot_fail(kGreater, 0u, textured(half.low, half.high, TexelAlpha::Multiply, true)), "a lit draw at ambient alpha 128 with an opaque texture");
++        check(!cannot_fail(kGreater, 0u, textured(half.low, half.high, TexelAlpha::Multiply, false)), "... and with a texture with holes");
++        const Range off = lit_alpha(0u, {255u, 255u});
++        check(!cannot_fail(kGreater, 0u, unlit(off.low, off.high)), "ambient alpha 0: every fragment fails, the test stays");
++    }
++
++    // 8. The guard never makes a bound better than it was: the guarded range holds the original range.
++    {
++        bool holds = true;
++        for (std::uint32_t low = 0; low < 256u; ++low)
++            for (std::uint32_t high = low; high < 256u; high += 5u) {
++                const Range wide = guarded({low, high});
++                if (wide.low > low || wide.high < high) holds = false;
++            }
++        check(holds, "guarded() only widens");
++        check(guarded({255u, 255u}).low == 255u && guarded({0u, 0u}).high == 0u, "the ends 255 (low) and 0 (high) are exact");
++    }
++
++    std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILURES");
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 003dc24..e91f5af 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1064,7 +1064,8 @@ int main(int argc, char **argv) {
+         line("textures evicted", t.texture_evicted);
+         line("approximated blends", t.unsupported_blend);
+         line("3D draws made smooth", t.smooth_draws);
+-        line("alpha tests dropped (alpha 255)", t.alpha_elided);
++        line("alpha-tested draws (could reject)", t.alpha_tested);
++        line("... drawn without the test/discard", t.alpha_elided);
+         line("invisible draws skipped (alpha 0)", t.invisible_skipped);
+         line("textures uploaded at 2x (MMPX)", t.ui2x_textures);
+         line("... microseconds spent on them", t.ui2x_us);
+-- 
+2.43.0
+

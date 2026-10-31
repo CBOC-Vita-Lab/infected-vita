@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:08:42 -0400
+Subject: [PATCH 70/70] gl: a cheaper FXAA pass (5 taps for a flat pixel, 7 for
+ an edge pixel, against 9 for every pixel)
+
+gl_fxaa_quality=fast (the default for gfx.antialiasing=fxaa) replaces the nine-tap pass; =high is the first version, kept
+for A/B. The decision is the same (luma of the pixel and its four diagonal neighbours, the same edge test); what changed
+is how it is read:
+
+* a vertex stage of its own gives the five tap coordinates as varyings, so none of the five is a dependent read;
+* the edge test is made right after them, and a pixel off an edge (about 80 % of a mission frame's pixels) is written back
+  unchanged, exactly as before;
+* an edge pixel takes two blur taps along the edge (at 0.33 of the direction, the width that matched the old four-tap
+  average best on mission-1 frames) instead of four, kept inside the per-channel range of the five taps instead of
+  choosing between two blur widths by a third luma test;
+* the colour arithmetic is mediump; coordinates stay at full precision.
+
+If the cheaper program does not build the first is used. ge_replay --shader-lint covers both (the new pass has three
+varying slots).
+
+Mission-1 dumps, 50 frames, software GL: the new pass differs from the old FXAA by 0.115 of 255 on average (PSNR 47.8 dB,
+worst frame 45.6), 8.5 % of pixels differ and 0.3 % by more than 8 levels; the old pass differs from no FXAA by 0.42
+(10 % of pixels). Looked at crops of edges beside each other. Not measured on a Vita: no Vita shader compiler or device was
+used, so the tap and operation counts are from the source.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/GL_RENDERER.md           |  7 ++++
+ host/gpu/gl/gl_post.inc       | 32 ++++++++++----
+ host/gpu/gl/gl_renderer.cpp   |  5 ++-
+ host/gpu/gl/gl_renderer.hpp   |  4 ++
+ host/gpu/gl/gl_shaders.cpp    | 78 +++++++++++++++++++++++++++++++++++
+ host/gpu/gl/gl_shaders.hpp    |  4 ++
+ tools/ge_replay/ge_replay.cpp |  3 +-
+ 7 files changed, 123 insertions(+), 10 deletions(-)
+
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index b3f0446..fbda3d2 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -69,6 +69,13 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   `GL_ALPHA_ELIDE_RANGE=0` goes back to the first rule (every fragment at alpha 255). Replays of 100 mission-1 frames are
+   pixel-identical with the switches on and off (default options, all options off, FXAA on). `ge_replay --stats` and the
+   perf line (`alpha-test draws N, without discard M`) count the draws that had a test that could reject, and those that lost it.
++* **FXAA** (`gfx.antialiasing=fxaa`). `GL_FXAA_QUALITY=fast` (default) is a cheaper pass than the first version
++  (`high`): its vertex stage supplies the five tap coordinates (no dependent reads), the edge test is made after those five
++  reads and a pixel off an edge is written back unchanged, an edge pixel takes two blur taps along the edge (not four) kept
++  inside the colours around it, and the colour arithmetic is medium precision. 5 fetches for a flat pixel and 7 for an edge
++  pixel, against 9 (four of them dependent) for every pixel. About a fifth of a mission frame's pixels are edge pixels by that
++  test. The picture is within 0.1 of 255 on average of the first version's. If the cheaper program does not build, the first
++  is used.
+ * **Pixel-art upscaling for the HUD** (`GL_UI_UPSCALE`, on). A small texture that only 2D draws sample (through mode:
+   a button glyph, a HUD icon) and that looks like pixel art (a palette texture, or at most 256 colours) is uploaded at
+   twice its size, made by MMPX ([`host/gpu/mmpx.hpp`](../host/gpu/mmpx.hpp); credit in
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index e3b820a..ad176c7 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -56,15 +56,16 @@
+     }
+ 
+     // ---- post programs and full-screen passes ----------------------------------------------------------------------
+-    Program fxaa_program, bicubic_program, resolve_program;
+-    bool fxaa_failed{}, bicubic_failed{}, resolve_failed{};
++    Program fxaa_program, fxaa_fast_program, bicubic_program, resolve_program;
++    bool fxaa_failed{}, fxaa_fast_failed{}, bicubic_failed{}, resolve_failed{};
+ 
+     // `fragment` is a callable returning the program's fragment source; it runs only when the program is built.
+-    template <typename Source>
+-    bool ensure_post_program(Program &program, bool &failed, Source fragment, const char *label) {
++    // `vertex`: a callable returning the vertex source, for a pass that has its own (the blit's otherwise).
++    template <typename Source, typename Vertex>
++    bool ensure_post_program(Program &program, bool &failed, Source fragment, const char *label, Vertex vertex) {
+         if (program.id != 0u) return true;
+         if (failed) return false;
+-        failed = !link(program, glsl::blit_vertex_source(), fragment(), label, true);
++        failed = !link(program, vertex(), fragment(), label, true);
+         variant_names.push_back(std::string("post:") + label + (failed ? " (failed)" : ""));
+         if (failed) return false;
+         ++aux_programs;
+@@ -73,6 +74,22 @@
+         return true;
+     }
+ 
++    template <typename Source>
++    bool ensure_post_program(Program &program, bool &failed, Source fragment, const char *label) {
++        return ensure_post_program(program, failed, fragment, label, [] { return glsl::blit_vertex_source(); });
++    }
++
++    // The program the FXAA pass runs: the cheaper one (settings.fxaa_quality 0), or the first version when asked for or when
++    // the cheaper one does not build. Null when neither builds.
++    Program *fxaa_program_for_pass() {
++        if (settings.fxaa_quality == 0u &&
++            ensure_post_program(fxaa_fast_program, fxaa_fast_failed, [] { return glsl::fxaa_fast_fragment_source(); }, "fxaa-fast",
++                                [] { return glsl::fxaa_fast_vertex_source(); }))
++            return &fxaa_fast_program;
++        if (ensure_post_program(fxaa_program, fxaa_failed, [] { return glsl::fxaa_fragment_source(); }, "fxaa")) return &fxaa_program;
++        return nullptr;
++    }
++
+     // Draws `source` over the whole of the bound framebuffer, `width` x `height` pixels, through `program`. No depth,
+     // no blend, no scissor; the caller binds the destination. `inv_size`: one over the source size and the size.
+     void fullscreen_pass(Program &program, GLuint source, GLenum filter, std::int32_t width, std::int32_t height,
+@@ -143,7 +160,8 @@
+     // attachment, so nothing is copied; the old texture is the scratch one of the next pass.
+     void run_fxaa(Target &target) {
+         fxaa_done = true;
+-        if (!ensure_post_program(fxaa_program, fxaa_failed, [] { return glsl::fxaa_fragment_source(); }, "fxaa")) return;
++        Program *program = fxaa_program_for_pass();
++        if (program == nullptr) return;
+         flush();
+         if (target.post == 0u) {
+             glGenTextures(1, &target.post);
+@@ -157,7 +175,7 @@
+         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.post, 0);
+         const float inv[4] = {1.0f / static_cast<float>(target.width), 1.0f / static_cast<float>(target.height),
+                               static_cast<float>(target.width), static_cast<float>(target.height)};
+-        fullscreen_pass(fxaa_program, target.color, GL_LINEAR, static_cast<std::int32_t>(target.width),
++        fullscreen_pass(*program, target.color, GL_LINEAR, static_cast<std::int32_t>(target.width),
+                         static_cast<std::int32_t>(target.height), inv, false);
+         std::swap(target.color, target.post);
+         ++target.draw_serial;   // the picture changed under whoever copied it
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index e5813a3..6b3927f 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -3224,6 +3224,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
+     else if (name == "alpha_elide_range") settings.alpha_elide_range = flag;
++    else if (name == "fxaa_quality") settings.fxaa_quality = (value == "high" || value == "1" || value == "full") ? 1u : 0u;
+     else if (name == "skip_invisible") settings.skip_invisible = flag;
+     else if (name == "ui_upscale") settings.ui_upscale = flag;
+     else if (name == "prewarm") settings.prewarm = flag;
+@@ -3255,7 +3256,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+@@ -3459,7 +3460,7 @@ std::size_t GlRenderer::prewarm_shaders() {
+         }
+     }
+     // The post passes: FXAA and the bicubic enlargement (the multisample resolve is a desktop preview and is not built here).
+-    if (impl.ensure_post_program(impl.fxaa_program, impl.fxaa_failed, [] { return glsl::fxaa_fragment_source(); }, "fxaa")) ++built;
++    if (impl.fxaa_program_for_pass() != nullptr) ++built;
+     else ++failed;
+     if (impl.ensure_post_program(impl.bicubic_program, impl.bicubic_failed, [] { return glsl::bicubic_fragment_source(); }, "bicubic")) ++built;
+     else ++failed;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 8313e00..0ae13fb 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -77,6 +77,10 @@ struct GlSettings {
+     // the lighting's ambient alpha, an opaque texture), not only "all 255": a fade of an opaque texture at a constant alpha
+     // passes "greater than 0" too. Off (gl_alpha_elide_range=0), only draws whose every fragment has alpha 255 lose the test.
+     bool alpha_elide_range{true};
++    // gfx.antialiasing=fxaa: 0 the cheaper pass (default: the edge test first, two blur taps for an edge pixel, vertex-stage tap
++    // coordinates, medium-precision colour), 1 the first version (nine taps for every pixel, four of them dependent reads).
++    // gl_fxaa_quality=fast|high. The cheaper pass falls back to the first if its program does not build.
++    std::uint32_t fxaa_quality{0u};
+     // A draw whose every fragment has alpha 0 and that then changes nothing (the alpha test rejects alpha 0, or it blends
+     // as source alpha / one minus source alpha onto a target whose alpha is not written or not kept) is not drawn.
+     // Games fade sprites and effects out by their alpha and keep sending them; the picture is the same.
+diff --git a/host/gpu/gl/gl_shaders.cpp b/host/gpu/gl/gl_shaders.cpp
+index 6e0f91f..83abf43 100644
+--- a/host/gpu/gl/gl_shaders.cpp
++++ b/host/gpu/gl/gl_shaders.cpp
+@@ -724,6 +724,71 @@ void main() {
+ }
+ )GLSL";
+ 
++// The "fast" FXAA (gfx.antialiasing=fxaa, gl_fxaa_quality=fast, the default). Same decision as the one above, written for a
++// tile-based GPU's texture units:
++//  * the five taps that find the edge take their coordinates straight from the vertex stage (the centre and the four diagonal
++//    neighbours as varyings), so none of them is a dependent read;
++//  * the edge test is made before anything else is fetched, and a pixel that is not on an edge (nearly all of them) is done after
++//    those five reads and writes them back unchanged, exactly as the full version does;
++//  * an edge pixel takes two more taps along the edge, not four, then keeps the result inside the colours around it (a
++//    per-channel clamp to the five taps) instead of choosing between two blur widths by a third luma test;
++//  * the colour arithmetic is medium precision (the coordinates stay full precision).
++// 5 fetches for a flat pixel, 7 for an edge pixel (the full version always makes 9, four of them dependent).
++const char *const kFxaaFastVertex = R"GLSL(
++precision highp float;
++attribute vec2 a_position;
++attribute vec2 a_texcoord;
++uniform vec4 u_inv_size;
++varying vec2 v_texcoord;
++varying vec4 v_north;
++varying vec4 v_south;
++void main() {
++    v_texcoord = a_texcoord;
++    v_north = a_texcoord.xyxy + vec4(-1.0, -1.0, 1.0, -1.0) * u_inv_size.xyxy;
++    v_south = a_texcoord.xyxy + vec4(-1.0, 1.0, 1.0, 1.0) * u_inv_size.xyxy;
++    gl_Position = vec4(a_position, 0.0, 1.0);
++}
++)GLSL";
++
++const char *const kFxaaFastBody = R"GLSL(
++varying vec2 v_texcoord;
++varying vec4 v_north;
++varying vec4 v_south;
++uniform sampler2D u_texture;
++
++mediump float luma_of(mediump vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
++
++void main() {
++    mediump vec4 centre = texture2D(u_texture, v_texcoord);
++    mediump vec3 rgb_nw = texture2D(u_texture, v_north.xy).rgb;
++    mediump vec3 rgb_ne = texture2D(u_texture, v_north.zw).rgb;
++    mediump vec3 rgb_sw = texture2D(u_texture, v_south.xy).rgb;
++    mediump vec3 rgb_se = texture2D(u_texture, v_south.zw).rgb;
++    mediump float l_m = luma_of(centre.rgb);
++    mediump float l_nw = luma_of(rgb_nw);
++    mediump float l_ne = luma_of(rgb_ne);
++    mediump float l_sw = luma_of(rgb_sw);
++    mediump float l_se = luma_of(rgb_se);
++    mediump float l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
++    mediump float l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
++    if ((l_max - l_min) < max(FXAA_EDGE_MIN, l_max * FXAA_EDGE_SHARE)) {
++        gl_FragColor = centre;
++    } else {
++        // One texel in uv units, from the neighbours' own coordinates.
++        vec2 px = vec2(v_north.z - v_north.x, v_south.y - v_north.y) * 0.5;
++        mediump vec2 direction = vec2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
++        mediump float dir_reduce = max((l_nw + l_ne + l_sw + l_se) * (0.25 * FXAA_REDUCE_MUL), FXAA_REDUCE_MIN);
++        mediump float scale = 1.0 / (min(abs(direction.x), abs(direction.y)) + dir_reduce);
++        vec2 step_uv = clamp(direction * scale, vec2(-FXAA_SPAN_MAX), vec2(FXAA_SPAN_MAX)) * px * FXAA_TAP;
++        mediump vec3 blurred = 0.5 * (texture2D(u_texture, v_texcoord + step_uv).rgb +
++                                      texture2D(u_texture, v_texcoord - step_uv).rgb);
++        mediump vec3 lowest = min(centre.rgb, min(min(rgb_nw, rgb_ne), min(rgb_sw, rgb_se)));
++        mediump vec3 highest = max(centre.rgb, max(max(rgb_nw, rgb_ne), max(rgb_sw, rgb_se)));
++        gl_FragColor = vec4(clamp(blurred, lowest, highest), centre.a);
++    }
++}
++)GLSL";
++
+ // A bicubic (Catmull-Rom) enlargement for low-resolution pictures, 9 bilinear taps, followed by an anti-ringing clamp
+ // to the range of the four texels around the sample. The result is sharper than bilinear without the halos a plain
+ // bicubic or Lanczos tail leaves beside a hard edge. The source must be sampled with linear filtering and clamp to
+@@ -770,6 +835,19 @@ void main() { gl_FragColor = v_color * texture2D(u_texture, v_texcoord); }
+ 
+ } // namespace
+ 
++std::string fxaa_fast_vertex_source() { return std::string("#version 100\n") + kFxaaFastVertex; }
++
++std::string fxaa_fast_fragment_source() {
++    return std::string("#version 100\n"
++                       "#define FXAA_SPAN_MAX 8.0\n"
++                       "#define FXAA_REDUCE_MIN (1.0 / 128.0)\n"
++                       "#define FXAA_REDUCE_MUL (1.0 / 8.0)\n"
++                       "#define FXAA_EDGE_MIN 0.0625\n"
++                       "#define FXAA_EDGE_SHARE 0.125\n"
++                       "#define FXAA_TAP 0.33\n") +
++           kPostPrecision + kFxaaFastBody;
++}
++
+ std::string fxaa_fragment_source() {
+     return std::string("#version 100\n"
+                        "#define FXAA_SPAN_MAX 8.0\n"
+diff --git a/host/gpu/gl/gl_shaders.hpp b/host/gpu/gl/gl_shaders.hpp
+index 1a7dfd2..3d91ddf 100644
+--- a/host/gpu/gl/gl_shaders.hpp
++++ b/host/gpu/gl/gl_shaders.hpp
+@@ -95,6 +95,10 @@ enum Uniform : std::uint32_t {
+ // FXAA over the finished 3D picture (gfx.antialiasing=fxaa); a bicubic enlargement with an anti-ringing clamp for
+ // low-resolution pictures (gfx.movie_filter=sharp); the overlay's textured, coloured quads.
+ [[nodiscard]] std::string fxaa_fragment_source();
++// The cheaper FXAA (gl_fxaa_quality=fast, the default): its own vertex stage (the neighbours' coordinates as varyings, so the
++// five taps that find the edge are not dependent reads), an early exit for pixels off an edge, two blur taps for the rest.
++[[nodiscard]] std::string fxaa_fast_vertex_source();
++[[nodiscard]] std::string fxaa_fast_fragment_source();
+ [[nodiscard]] std::string bicubic_fragment_source();
+ // The desktop's preview of multisampling (the Vita does the real thing in hardware): the picture is drawn at a larger
+ // scale and this pass averages it down to the display's size, each output pixel taking the exact area it covers
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index e91f5af..0db28ad 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -421,7 +421,8 @@ int run_shader_lint(const Options &options) {
+         variants.push_back({glsl::describe(flags), glsl::vertex_source(flags), glsl::fragment_source(flags)});
+     const std::size_t world = variants.size();
+     variants.push_back({"post:blit", glsl::blit_vertex_source(), glsl::blit_fragment_source()});
+-    variants.push_back({"post:fxaa", glsl::blit_vertex_source(), glsl::fxaa_fragment_source()});
++    variants.push_back({"post:fxaa (gl_fxaa_quality=high)", glsl::blit_vertex_source(), glsl::fxaa_fragment_source()});
++    variants.push_back({"post:fxaa-fast", glsl::fxaa_fast_vertex_source(), glsl::fxaa_fast_fragment_source()});
+     variants.push_back({"post:bicubic", glsl::blit_vertex_source(), glsl::bicubic_fragment_source()});
+     variants.push_back({"post:resolve (desktop preview only)", glsl::blit_vertex_source(), glsl::resolve_fragment_source(2.0f)});
+     variants.push_back({"overlay:ui", glsl::ui_vertex_source(), glsl::ui_fragment_source()});
+-- 
+2.43.0
+
