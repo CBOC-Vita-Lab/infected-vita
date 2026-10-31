@@ -133,6 +133,7 @@ def main():
     # ---- link
     elf = os.path.join(work, 'infected.elf')
     link_args = [l for l in open(os.path.join(kit, 'game', 'link', 'link.args')).read().split('\n') if l != '']
+    link_args += r['link'].get('extraArgs', [])      # the prefix maps and -g0, after link.args, as the builder does
     def link(label, pad_obj=None):
         a = []
         for l in link_args:
