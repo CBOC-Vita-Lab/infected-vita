@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:08:19 -0400
+Subject: [PATCH 71/73] ge_replay: --menu N shows any page of the settings menu;
+ --menu-as-vita draws it with the Vita app's defaults and rows
+
+For pictures of the menu: page 3 (Controls) is reachable, and the rows the replayer greys (renderer
+thread, CPU clock, the gameplay rows, HD textures) are drawn as the Vita app shows them, with its
+defaults (Split, 30 fps, 500 MHz).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/ge_replay/ge_replay.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 0a9546f..003dc24 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -123,7 +123,8 @@ struct Options {
+     std::vector<std::pair<std::string, std::string>> port;   // --port KEY=VALUE
+     bool port_baseline{};
+     bool shader_lint{};
+-    int menu_page{};   // --menu: 0 none, 1 or 2
++    bool menu_as_vita{};   // --menu-as-vita: the menu as the Vita app shows it (its defaults, every row usable but HD movies)
++    int menu_page{};   // --menu: 0 none, else the page shown (1 Graphics, 2 Performance, 3 Controls)
+     // --clip-texture ADDRESS:ROWS: draws that sample the texture at ADDRESS see only its first ROWS rows. A test aid for a
+     // recorded picture whose 512-row texture runs past the end of VRAM (the picture itself is 272 rows).
+     std::uint32_t clip_address{};
+@@ -563,6 +564,7 @@ int main(int argc, char **argv) {
+                 options.port.emplace_back(pair.substr(0, eq), pair.substr(eq + 1));
+             }
+         } else if (arg == "--menu") options.menu_page = std::atoi(value().c_str());
++        else if (arg == "--menu-as-vita") options.menu_as_vita = true;
+         else if (arg == "--clip-texture") {
+             const std::string pair = value();
+             const std::size_t colon = pair.find(':');
+@@ -726,8 +728,17 @@ int main(int argc, char **argv) {
+     // --menu: the overlay over every picture, as the live app draws it while the menu is open.
+     overlay::Menu menu(port::settings());
+     if (gl != nullptr && options.menu_page != 0) {
++        if (options.menu_as_vita) {   // for pictures of the menu: the Vita's own defaults, and the rows the Vita app makes usable
++            port::Settings &s = port::settings();
++            s.set_platform_default(port::Key::PerfThreadedRenderer, "split");
++            s.set_platform_default(port::Key::PerfFrameCap, "30");
++            s.set_platform_default(port::Key::PerfCpuClock, "500");
++            for (port::Key key : {port::Key::GfxHdTextures, port::Key::PerfThreadedRenderer, port::Key::PerfCpuClock,
++                                  port::Key::PerfEnemyDensity, port::Key::PerfViewDistance})
++                s.set_unavailable(key, nullptr);
++        }
+         menu.open(0u);
+-        if (options.menu_page == 2) {   // R switches the page
++        for (int page = 1; page < options.menu_page; ++page) {   // R switches the page
+             menu.update(overlay::button::kR);
+             menu.update(0u);
+         }
+-- 
+2.43.0
+

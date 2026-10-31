@@ -1,0 +1,1144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:53:11 -0400
+Subject: [PATCH 72/73] gl: gfx.antialiasing=auto, the default for new players: FXAA
+ while the GPU has room, off while it has not
+
+Antialiasing gets a fifth value, Auto, first in the list and the default of the Vita app. The pass is the cheaper FXAA
+(gl_fxaa_quality=fast); Auto turns it off when the renderer falls behind and back on when it has room again, so a casual player
+gets the smoother edges where they fit and a steady frame rate where they do not. Off, FXAA, MSAA 2x and MSAA 4x are what they were.
+
+host/gpu/auto_aa.hpp is a plain state machine, one sample per presented frame, no GL and no clock of its own:
+* late frame: the interval since the last present is over 125 % of the 30 Hz budget (41.7 ms) and the renderer side is to blame
+  (the present waited 6 ms or more for the GPU, the split GL thread was 12 ms or more behind the walker, or a frame was skipped);
+  a frame that was late because the game's own code was slow is not FXAA's doing;
+* off after 2 late 3D frames in a row, at once on a skipped frame; menus, movies and loads change nothing, and an interval over
+  200 ms is a pause, not a frame time;
+* back on after 10 s with no late frame, at least 150 3D frames and a GL thread that slept 3 ms or more per frame on average;
+* a try that fails within 6 s doubles the wait (up to 80 s) and asks for 1.5 times the room (up to 9 ms); a try that holds for a
+  minute is forgiven; the first 2 frames after it comes on are not counted.
+The renderer reads the GL thread's lag, its idle time (the GlIdle phase timer) and the skipped-frame count through a new
+Renderer::set_load_probe that the split renderer fills in.
+
+The log has "[aa] auto: fxaa off/on (...) [change N]" for every change and "[gl] speed features: ..." once at start. Options:
+gl_aa_auto=0 is the old behaviour (Auto behaves as Off), =2 forces FXAA on; gl_aa_auto_retry_s, gl_aa_auto_need_idle_us,
+gl_aa_auto_budget_ms and gl_aa_auto_min_frames set the thresholds; gl_test_slow_* makes a frame slow on purpose for a test.
+Auto never adds FXAA to a run that started with MSAA (MSAA needs a restart and is only ever chosen by the player). The menu row
+reads "Auto (on)" or "Auto (off)" once something is known.
+
+Settings saved by 1.0 wrote every key, so a choice cannot be told from a default: Settings::adopt_auto_antialiasing() moves a file
+to Auto only when its anti-aliasing is Off and every other row is at its default (a player who changed nothing else); a file with
+other changes keeps its Off. port::apply_vita_defaults() is the Vita app's platform defaults in one place; ge_replay --menu-as-vita
+uses it. The FXAA pass is pre-linked at start-up when Auto may use it.
+
+tests/auto_aa_tests.cpp drives the state machine with synthetic frame timings (steady 30 fps stays on; two late frames switch
+off; a skipped frame at once; a slow game thread is not blamed; menus and pauses are ignored; the retry waits, back-off and
+forgiveness; change counts). tests/port_settings_tests.cpp covers the new value, its labels and the migration cases.
+
+Checked with software GL on mission-1 replays: Auto at full speed is the same picture as FXAA frame for frame, gl_aa_auto=0 the same
+as Off, and with a slow frame injected the pass goes off and comes back after the quiet time. Not measured on a Vita: the
+thresholds are a first estimate and have not been tuned on a console.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   9 ++
+ docs/GL_RENDERER.md             |  17 +++
+ host/gpu/auto_aa.hpp            | 186 +++++++++++++++++++++++++++
+ host/gpu/gl/gl_post.inc         |  98 ++++++++++++++-
+ host/gpu/gl/gl_renderer.cpp     |  61 ++++++++-
+ host/gpu/gl/gl_renderer.hpp     |  24 ++++
+ host/gpu/renderer.hpp           |  12 ++
+ host/gpu/split_renderer.cpp     |   9 ++
+ host/settings/port_settings.cpp |  41 +++++-
+ host/settings/port_settings.hpp |  20 ++-
+ tests/auto_aa_tests.cpp         | 217 ++++++++++++++++++++++++++++++++
+ tests/port_settings_tests.cpp   |  90 ++++++++++++-
+ tools/ge_replay/ge_replay.cpp   |   4 +-
+ 13 files changed, 768 insertions(+), 20 deletions(-)
+ create mode 100644 host/gpu/auto_aa.hpp
+ create mode 100644 tests/auto_aa_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e5fb854..4f036d9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -412,6 +412,15 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_alpha_test_tests COMMAND portablekit_alpha_test_tests)
+ endif()
+ 
++# gfx.antialiasing=auto (host/gpu/auto_aa.hpp): the state machine driven with made-up frame timings. Header only, no GL.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_auto_aa_tests "${PORTABLEKIT_ROOT}/tests/auto_aa_tests.cpp")
++    target_compile_features(portablekit_auto_aa_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_auto_aa_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_auto_aa_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_auto_aa_tests COMMAND portablekit_auto_aa_tests)
++endif()
++
+ # The settings overlay (host/overlay): chord, navigation, saving, script and drawing on a software canvas.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_overlay_tests
+diff --git a/docs/GL_RENDERER.md b/docs/GL_RENDERER.md
+index fbda3d2..b884096 100644
+--- a/docs/GL_RENDERER.md
++++ b/docs/GL_RENDERER.md
+@@ -76,6 +76,23 @@ setting (the names are `gl_setting_names()` in `gl_renderer.hpp`), and `<PREFIX>
+   pixel, against 9 (four of them dependent) for every pixel. About a fifth of a mission frame's pixels are edge pixels by that
+   test. The picture is within 0.1 of 255 on average of the first version's. If the cheaper program does not build, the first
+   is used.
++* **Anti-aliasing Auto** (`gfx.antialiasing=auto`, [`host/gpu/auto_aa.hpp`](../host/gpu/auto_aa.hpp)). FXAA while the renderer has room
++  for it, off while it does not, so that the smooth edges never cost the game its frame rate. The renderer measures one sample per
++  presented frame on the GL thread (the interval since the last present, the time the present took, how far the GL thread runs
++  behind the walker, how long it slept for want of work, frames the frame skip left out, and whether the frame had a 3D scene) and
++  a state machine decides, with hysteresis: FXAA goes off after two late 3D frames in a row (an interval over 125 % of the game's
++  33.3 ms, with the renderer to blame: the GL thread over 12 ms behind, a present of 6 ms or more, or a skipped frame, which turns it
++  off at once) and comes back after 10 s without a late frame, with at least 150 3D frames in that time and the GL thread sleeping at
++  least 3 ms a frame. A try that fails within 6 s doubles the wait (up to 80 s) and asks for more sleep (up to 9 ms), so a scene the
++  GPU cannot afford is tried a few times a minute at most; a try that holds for a minute is forgiven. Menus, movies and loads
++  (frames without a 3D scene, intervals over 200 ms) change nothing. Log lines: `[aa] auto: fxaa off (gpu late: ...)`,
++  `[aa] auto: fxaa on (...)`; the counts are `GlRenderer::auto_aa_info()` and in the Vita app's per-second line (`aa=auto:on(off 1, on 1)`).
++  The menu row reads `Auto (on)` or `Auto (off)` (`port::set_auto_antialiasing_state`). `GL_AA_AUTO=0` makes Auto mean Off (the
++  behaviour before Auto existed), `GL_AA_AUTO=2` makes it FXAA always (to compare); `GL_AA_AUTO_RETRY_S`, `GL_AA_AUTO_NEED_IDLE_US`
++  change the two waits. It never chooses MSAA. `GL_AA_AUTO_BUDGET_MS`, `GL_AA_AUTO_MIN_FRAMES` and `GL_TEST_SLOW_MS` / `_FROM` / `_FRAMES`
++  (a present that sleeps, as a frame the GPU could not finish would) exist for the replayer: with them `ge_replay` shows Auto turning FXAA
++  off and on, and the pictures match the fixed FXAA and Off pictures frame for frame. `tests/auto_aa_tests.cpp` drives the state machine
++  with made-up timings. The thresholds are a first estimate from the mission-1 measurements; they have not been tuned on a console.
+ * **Pixel-art upscaling for the HUD** (`GL_UI_UPSCALE`, on). A small texture that only 2D draws sample (through mode:
+   a button glyph, a HUD icon) and that looks like pixel art (a palette texture, or at most 256 colours) is uploaded at
+   twice its size, made by MMPX ([`host/gpu/mmpx.hpp`](../host/gpu/mmpx.hpp); credit in
+diff --git a/host/gpu/auto_aa.hpp b/host/gpu/auto_aa.hpp
+new file mode 100644
+index 0000000..054efca
+--- /dev/null
++++ b/host/gpu/auto_aa.hpp
+@@ -0,0 +1,186 @@
++#pragma once
++
++// gfx.antialiasing=auto: FXAA while the renderer has room for it, off while it does not.
++//
++// The controller is a plain state machine fed one sample per presented frame (no GL, no clock of its own, no threads), so a
++// test can drive it with made-up timings. The renderer (gl_renderer.cpp, present()) measures the samples on the GL thread and
++// applies the answer to the next frame.
++//
++//   * Late: a presented 3D frame whose interval since the previous present is over `late_factor` times the 30 Hz budget
++//     (33.3 ms * 1.25 = 41.7 ms), and that the renderer side is to blame for: the walker was kept waiting by the GL thread
++//     (a lag over `lag_blame_us`), the present itself waited for the GPU (`swap_blame_us`) or a frame was skipped. A frame that
++//     was late because the game's own code was slow, with the GL thread asleep for work, is not FXAA's doing.
++//   * FXAA goes off after `late_frames_off` late 3D frames in a row (2). Menus, movies and loading screens (frames without a 3D
++//     scene) change nothing, and an interval over `pause_us` (a pause, a load) is not a frame time at all.
++//   * FXAA comes back after `retry_us` (10 s) in which no frame was late or skipped, at least `min_scene_frames` of them were 3D
++//     frames, and the GL thread slept on average at least `need_idle_us` per frame (room for the pass; unknown idle time skips
++//     this test). A try that fails within `trial_us` (6 s) doubles the wait (up to `max_retry_us`) and raises the room asked for,
++//     so a scene the GPU cannot afford is tried a few times a minute at most; a try that lasts `settle_us` (60 s) forgives it.
++//   * The first `grace_frames` 3D frames after FXAA comes on are not counted: the pass makes its target the first time.
++//
++// All times are microseconds. Values: docs/GRAPHICS_OPTIONS.md, README-VITA.md (gl_aa_auto*).
++#include <algorithm>
++#include <cstdint>
++
++namespace portablekit::gpu {
++
++struct AutoAaConfig {
++    std::uint32_t budget_us{33'333};        // the game's frame time (30 Hz)
++    std::uint32_t late_percent{125};        // late = interval over budget * this / 100
++    std::uint32_t pause_us{200'000};        // an interval over this is a pause or a load: ignored, and it restarts the wait
++    std::uint32_t late_frames_off{2};
++    std::int32_t lag_blame_us{12'000};      // the GL thread this far behind the walker: the renderer is the slow side
++    std::uint32_t swap_blame_us{6'000};     // the present took this long: it waited for the GPU
++    std::uint64_t retry_us{10'000'000};     // quiet time before FXAA is tried again
++    std::uint64_t max_retry_us{80'000'000};
++    std::uint64_t trial_us{6'000'000};      // an off within this long of coming on is a failed try
++    std::uint64_t settle_us{60'000'000};    // on for this long: the earlier failures are forgotten
++    std::uint32_t grace_frames{2};
++    std::uint32_t min_scene_frames{150};    // 3D frames in the quiet time (5 s of play): a menu does not count as room
++    std::uint32_t need_idle_us{3'000};      // GL-thread sleep per frame that FXAA's pass is assumed to need
++    std::uint32_t max_need_idle_us{9'000};
++};
++
++struct AutoAaFrame {
++    std::uint64_t now_us{};          // the frame's present, on a monotonic clock
++    std::uint32_t interval_us{};     // since the previous present (0: unknown, first frame)
++    std::uint32_t swap_us{};         // the time the present itself took
++    std::int32_t lag_us{-1};         // how far behind the walker the GL thread was (smoothed); -1 unknown (no split renderer)
++    std::int32_t idle_us{-1};        // the GL thread's sleep since the previous present; -1 unknown
++    std::uint32_t skipped{};         // frames the frame-skip left out since the previous present
++    bool scene{};                    // a 3D frame (FXAA has something to work on)
++};
++
++class AutoAa {
++public:
++    enum class Event : std::uint8_t { None, TurnedOff, TurnedOn };
++
++    explicit AutoAa(const AutoAaConfig &config = {}) : config_(config) { reset(0u); }
++
++    [[nodiscard]] bool on() const noexcept { return on_; }
++    [[nodiscard]] const AutoAaConfig &config() const noexcept { return config_; }
++    [[nodiscard]] std::uint32_t changes() const noexcept { return offs_ + ons_; }
++    [[nodiscard]] std::uint32_t offs() const noexcept { return offs_; }
++    [[nodiscard]] std::uint32_t ons() const noexcept { return ons_; }
++    [[nodiscard]] std::uint64_t retry_us() const noexcept { return retry_us_; }
++    [[nodiscard]] std::uint32_t need_idle_us() const noexcept { return need_idle_us_; }
++
++    // Starts over with FXAA on (the player chose Auto, or the game began).
++    void reset(std::uint64_t now_us) noexcept {
++        on_ = true;
++        late_run_ = 0u;
++        grace_ = config_.grace_frames;
++        retry_us_ = config_.retry_us;
++        need_idle_us_ = config_.need_idle_us;
++        since_change_us_ = now_us;
++        trial_ = false;
++        restart_quiet(now_us);
++    }
++
++    // True for a frame the renderer side is to blame for being late.
++    [[nodiscard]] bool renderer_to_blame(const AutoAaFrame &f) const noexcept {
++        if (f.skipped != 0u) return true;
++        if (f.swap_us >= config_.swap_blame_us) return true;
++        if (f.lag_us >= config_.lag_blame_us) return true;
++        // No measure of the GL thread's queue (one renderer thread, or none): a late frame is the renderer's.
++        return f.lag_us < 0 && f.idle_us < 0;
++    }
++
++    [[nodiscard]] bool late(const AutoAaFrame &f) const noexcept {
++        return f.interval_us != 0u &&
++               static_cast<std::uint64_t>(f.interval_us) * 100u > static_cast<std::uint64_t>(config_.budget_us) * config_.late_percent;
++    }
++
++    Event update(const AutoAaFrame &f) noexcept {
++        if (f.interval_us > config_.pause_us) {   // a pause, a load, the settings menu: no information, and the quiet time starts again
++            late_run_ = 0u;
++            restart_quiet(f.now_us);
++            return Event::None;
++        }
++        const bool blame = (late(f) || f.skipped != 0u) && renderer_to_blame(f);
++        if (on_) return update_on(f, blame);
++        return update_off(f, blame);
++    }
++
++private:
++    Event update_on(const AutoAaFrame &f, bool blame) noexcept {
++        if (trial_ && f.now_us - since_change_us_ >= config_.settle_us) {   // it held: the earlier failures are forgotten
++            trial_ = false;
++            retry_us_ = config_.retry_us;
++            need_idle_us_ = config_.need_idle_us;
++        }
++        if (!f.scene) return Event::None;
++        if (grace_ != 0u) {
++            --grace_;
++            return Event::None;
++        }
++        if (!blame) {
++            late_run_ = 0u;
++            return Event::None;
++        }
++        // A skipped frame is as bad as two late ones: the renderer already fell a whole frame behind.
++        if (++late_run_ < config_.late_frames_off && f.skipped == 0u) return Event::None;
++        on_ = false;
++        ++offs_;
++        late_run_ = 0u;
++        const std::uint64_t on_for = f.now_us - since_change_us_;
++        if (trial_ && on_for < config_.trial_us) {   // a failed try: wait longer next time, and ask for more room
++            retry_us_ = std::min(retry_us_ * 2u, config_.max_retry_us);
++            need_idle_us_ = std::min(need_idle_us_ + need_idle_us_ / 2u, config_.max_need_idle_us);
++        }
++        since_change_us_ = f.now_us;
++        restart_quiet(f.now_us);
++        trial_ = false;
++        return Event::TurnedOff;
++    }
++
++    Event update_off(const AutoAaFrame &f, bool blame) noexcept {
++        if (blame) {   // not FXAA's doing now, but the renderer has no room: the quiet time starts again
++            restart_quiet(f.now_us);
++            return Event::None;
++        }
++        if (f.scene) {
++            ++scene_frames_;
++            if (f.idle_us >= 0) {
++                idle_sum_ += static_cast<std::uint64_t>(f.idle_us);
++                ++idle_frames_;
++            }
++        }
++        if (f.now_us - quiet_since_us_ < retry_us_ || scene_frames_ < config_.min_scene_frames) return Event::None;
++        if (idle_frames_ != 0u && idle_sum_ / idle_frames_ < need_idle_us_) {
++            restart_quiet(f.now_us);   // measured the quiet time and found no room: look again from here
++            return Event::None;
++        }
++        on_ = true;
++        ++ons_;
++        late_run_ = 0u;
++        grace_ = config_.grace_frames;
++        since_change_us_ = f.now_us;
++        trial_ = true;
++        return Event::TurnedOn;
++    }
++
++    void restart_quiet(std::uint64_t now_us) noexcept {
++        quiet_since_us_ = now_us;
++        scene_frames_ = 0u;
++        idle_sum_ = 0u;
++        idle_frames_ = 0u;
++    }
++
++    AutoAaConfig config_;
++    bool on_{true};
++    bool trial_{false};   // FXAA is on again after an off (a try), not from the start
++    std::uint32_t late_run_{0};
++    std::uint32_t grace_{0};
++    std::uint32_t offs_{0};
++    std::uint32_t ons_{0};
++    std::uint64_t retry_us_{0};
++    std::uint32_t need_idle_us_{0};
++    std::uint64_t since_change_us_{0};
++    std::uint64_t quiet_since_us_{0};
++    std::uint32_t scene_frames_{0};
++    std::uint64_t idle_sum_{0};
++    std::uint32_t idle_frames_{0};
++};
++
++} // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index ad176c7..9bd82e0 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -14,7 +14,8 @@
+     struct Options {
+         bool smooth{};
+         bool mips{};
+-        bool fxaa{};
++        bool fxaa{};          // FXAA is applied to the next frame (chosen, or Auto and the room is there)
++        bool aa_auto{};       // gfx.antialiasing=auto with the adaptive controller (gl_aa_auto=1)
+         bool pixel_light{};
+         bool movie_sharp{};
+         bool show_fps{};
+@@ -46,7 +47,14 @@
+         Options next;
+         next.smooth = port::texture_filter_smooth();
+         next.mips = port::mipmaps();
+-        next.fxaa = port::fxaa();
++        // Auto never adds FXAA to a run that started with MSAA (the player chose it at the last start, and the menu has it pending away).
++        const bool automatic = port::antialiasing_auto();
++        const bool auto_may_fxaa = automatic && port::msaa_samples() == 0u;
++        next.aa_auto = auto_may_fxaa && settings.aa_auto == 1u;
++        if (next.aa_auto && !opt.aa_auto) auto_aa_start();   // Auto was just chosen (or the first frame): FXAA on, the room is unknown yet
++        next.fxaa = port::fxaa() || (auto_may_fxaa && (settings.aa_auto == 2u || (next.aa_auto && auto_aa.on())));
++        // The menu's value: "Auto (on)" / "Auto (off)" once something is known; plain "Auto" otherwise.
++        port::set_auto_antialiasing_state(!automatic ? -1 : (next.fxaa ? 1 : ((settings.aa_auto == 0u || !auto_may_fxaa || aa_state_known) ? 0 : -1)));
+         next.pixel_light = port::pixel_lighting();
+         next.movie_sharp = port::movie_filter() == port::MovieFilter::Sharp;
+         next.show_fps = port::show_fps();
+@@ -55,6 +63,86 @@
+         offscreen_scale = std::max(settings.offscreen_scale, port::effects_scale());
+     }
+ 
++    // ---- gfx.antialiasing=auto ------------------------------------------------------------------------------------
++    // One sample per presented frame goes to the controller (gpu/auto_aa.hpp); its answer is applied to the next frame. Everything here runs on
++    // the GL thread; the counters are atomics because the status line reads them from another.
++    AutoAa auto_aa;
++    Renderer::LoadProbe load_probe;
++    Renderer::LoadReading aa_last_load{};
++    Clock::time_point aa_last_present{};
++    bool aa_have_last{};
++    bool aa_state_known{};
++    bool aa_load_primed{};   // aa_last_load holds a reading (the probe is installed after the renderer is made)
++    bool fxaa_warm_done{};
++    std::atomic<std::uint32_t> aa_offs{0u}, aa_ons{0u};
++    std::atomic<int> aa_on_now{-1};   // -1 Auto is not adaptive now, 0 off, 1 on
++
++    [[nodiscard]] static std::uint64_t clock_us(Clock::time_point t) {
++        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count());
++    }
++
++    void auto_aa_start() {
++        AutoAaConfig config;
++        if (settings.aa_auto_retry_s != 0u) config.retry_us = static_cast<std::uint64_t>(settings.aa_auto_retry_s) * 1'000'000u;
++        if (settings.aa_auto_need_idle_us != 0u) config.need_idle_us = settings.aa_auto_need_idle_us;
++        if (settings.aa_auto_budget_ms != 0u) {
++            config.budget_us = settings.aa_auto_budget_ms * 1000u;
++            config.pause_us = std::max(config.pause_us, config.budget_us * 6u);
++        }
++        if (settings.aa_auto_min_frames != 0u) config.min_scene_frames = settings.aa_auto_min_frames;
++        auto_aa = AutoAa(config);
++        auto_aa.reset(clock_us(Clock::now()));
++        aa_have_last = false;
++        aa_state_known = false;
++        aa_load_primed = false;
++    }
++
++    // Called at the end of present(), before the options are refreshed. `scene`: this frame had a 3D picture for FXAA to work on.
++    void note_auto_aa(Clock::time_point present_start, Clock::time_point after_show, bool scene) {
++        if (!opt.aa_auto) {
++            aa_on_now.store(-1, std::memory_order_relaxed);
++            return;
++        }
++        AutoAaFrame sample;
++        sample.now_us = clock_us(after_show);
++        sample.swap_us = static_cast<std::uint32_t>(std::min<std::uint64_t>(clock_us(after_show) - clock_us(present_start), 0xFFFFFFFFu));
++        if (aa_have_last)
++            sample.interval_us = static_cast<std::uint32_t>(std::min<std::uint64_t>(clock_us(present_start) - clock_us(aa_last_present), 0xFFFFFFFFu));
++        aa_last_present = present_start;
++        aa_have_last = true;
++        sample.scene = scene;
++        if (load_probe) {
++            const Renderer::LoadReading now = load_probe();
++            if (!aa_load_primed) {
++                aa_last_load = now;
++                aa_load_primed = true;
++            }
++            sample.lag_us = now.lag_us;
++            if (now.idle_us >= 0 && aa_last_load.idle_us >= 0)
++                sample.idle_us = static_cast<std::int32_t>(std::min<std::uint32_t>(static_cast<std::uint32_t>(now.idle_us - aa_last_load.idle_us), 0x7FFFFFFFu));
++            sample.skipped = static_cast<std::uint32_t>(now.skipped - aa_last_load.skipped);
++            aa_last_load = now;
++        }
++        aa_state_known = true;
++        const AutoAa::Event event = auto_aa.update(sample);
++        opt.fxaa = auto_aa.on();
++        aa_on_now.store(auto_aa.on() ? 1 : 0, std::memory_order_relaxed);
++        port::set_auto_antialiasing_state(auto_aa.on() ? 1 : 0);
++        if (event == AutoAa::Event::None) return;
++        (event == AutoAa::Event::TurnedOff ? aa_offs : aa_ons).fetch_add(1u, std::memory_order_relaxed);
++        char line[256];
++        if (event == AutoAa::Event::TurnedOff) {
++            std::snprintf(line, sizeof line,
++                          "[aa] auto: fxaa off (gpu late: frame %.1f ms, present %.1f ms, gl lag %.1f ms, skipped %u; next try in %llu s, room needed %.1f ms) [change %u]",
++                          sample.interval_us / 1000.0, sample.swap_us / 1000.0, sample.lag_us / 1000.0, sample.skipped,
++                          static_cast<unsigned long long>(auto_aa.retry_us() / 1'000'000u), auto_aa.need_idle_us() / 1000.0, auto_aa.changes());
++        } else {
++            std::snprintf(line, sizeof line, "[aa] auto: fxaa on (quiet and %s, last frame %.1f ms) [change %u]",
++                          sample.idle_us >= 0 ? "the gl thread has room" : "no late frame", sample.interval_us / 1000.0, auto_aa.changes());
++        }
++        std::cout << line << std::endl;
++    }
++
+     // ---- post programs and full-screen passes ----------------------------------------------------------------------
+     Program fxaa_program, fxaa_fast_program, bicubic_program, resolve_program;
+     bool fxaa_failed{}, fxaa_fast_failed{}, bicubic_failed{}, resolve_failed{};
+@@ -153,7 +241,11 @@
+         } else {
+             ++scene_draws;
+         }
+-        if (trigger) run_fxaa(target);
++        // Auto counts the 3D draws of a frame whether FXAA is on or not: it needs to know a 3D frame when it has FXAA off.
++        if (trigger) {
++            if (opt.fxaa) run_fxaa(target);
++            else fxaa_done = true;
++        }
+     }
+ 
+     // FXAA over the target's picture. The result is drawn into a second texture which then becomes the target's colour
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index 6b3927f..f6283f6 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -19,6 +19,7 @@
+ #include "../mmpx.hpp"
+ #include "../texture_decode.hpp"
+ #include "../triangle_indices.hpp"
++#include "../auto_aa.hpp"
+ #include "gl_alpha_test.hpp"
+ #include "gl_overlay.hpp"
+ #include "gl_hd_movie.hpp"
+@@ -31,6 +32,7 @@
+ #include "xxhash/xxhash.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdlib>
+ #include <chrono>
+ #include <cmath>
+@@ -2781,7 +2783,7 @@ struct GlRenderer::Impl {
+         const bool sharpen = opt.movie_sharp && rect_clamp && !binding.from_target && !binding.hd_movie && picture_draw(call, target, picture_rect);
+         if (sharpen) ++st().sharp_draws;
+         // gfx.antialiasing=fxaa: the 3D picture of the display ends where the HUD begins.
+-        if (opt.fxaa && !fxaa_done && target.stride >= 512u) fxaa_scene_step(target, through, textured && binding.from_target);
++        if ((opt.fxaa || opt.aa_auto) && !fxaa_done && target.stride >= 512u) fxaa_scene_step(target, through, textured && binding.from_target);
+         const bool pixel_lit = lit && opt.pixel_light;
+         if (pixel_lit) ++st().pixel_lit_draws;
+ 
+@@ -3133,7 +3135,11 @@ struct GlRenderer::Impl {
+             glFinish();
+             gt.finish_us += micros_since(start);
+         }
++        const bool scene_frame = scene_draws >= kFxaaMinDraws && target->stride >= 512u;
+         show(*target);
++        if (settings.test_slow_ms != 0u && frames >= settings.test_slow_from && frames < static_cast<std::uint64_t>(settings.test_slow_from) + settings.test_slow_frames)
++            std::this_thread::sleep_for(std::chrono::milliseconds(settings.test_slow_ms));
++        if (settings.use_port_options) note_auto_aa(present_start, Clock::now(), scene_frame);
+         if (settings.timing != 0u) gt.present_us += micros_since(present_start);
+         report_times();
+         ++frames;
+@@ -3225,6 +3231,14 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
+     else if (name == "alpha_elide_range") settings.alpha_elide_range = flag;
+     else if (name == "fxaa_quality") settings.fxaa_quality = (value == "high" || value == "1" || value == "full") ? 1u : 0u;
++    else if (name == "aa_auto") settings.aa_auto = std::min(u32, 2u);
++    else if (name == "aa_auto_retry_s") settings.aa_auto_retry_s = u32;
++    else if (name == "aa_auto_budget_ms") settings.aa_auto_budget_ms = u32;
++    else if (name == "aa_auto_min_frames") settings.aa_auto_min_frames = u32;
++    else if (name == "test_slow_ms") settings.test_slow_ms = u32;
++    else if (name == "test_slow_from") settings.test_slow_from = u32;
++    else if (name == "test_slow_frames") settings.test_slow_frames = u32;
++    else if (name == "aa_auto_need_idle_us") settings.aa_auto_need_idle_us = u32;
+     else if (name == "skip_invisible") settings.skip_invisible = flag;
+     else if (name == "ui_upscale") settings.ui_upscale = flag;
+     else if (name == "prewarm") settings.prewarm = flag;
+@@ -3256,7 +3270,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "aa_auto", "aa_auto_retry_s", "aa_auto_need_idle_us", "aa_auto_budget_ms", "aa_auto_min_frames", "test_slow_ms", "test_slow_from", "test_slow_frames", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+@@ -3289,6 +3303,15 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     impl.blit_texture = glGetUniformLocation(impl.blit_program.id, "u_texture");
+     impl.variant_names.push_back("post:blit");
+     impl.refresh_options(true);
++    // One line with every drawing speed-up as this run has it (a console log shows at a glance that the player build runs with all of them).
++    {
++        const GlSettings &g = impl.settings;
++        std::cout << "[gl] speed features: specialize=" << g.specialize << " alpha_elide=" << g.alpha_elide << "/" << g.alpha_elide_range
++                  << " skip_invisible=" << g.skip_invisible << " compact_vertices=" << g.compact_vertices
++                  << " vgl_skip_redundant=" << g.vgl_skip_redundant << " scratch_buffers=" << g.scratch_buffers
++                  << " merge=" << g.merge_draws << " ui_upscale=" << g.ui_upscale << " prewarm=" << g.prewarm
++                  << " fxaa_quality=" << (g.fxaa_quality == 0u ? "fast" : "high") << " aa_auto=" << g.aa_auto << "\n";
++    }
+     // MSAA is the Vita's: vitaGL is started with it (port::msaa_samples(), read when the context is made). The desktop has
+     // no such mode on its offscreen targets, so it shows a supersampled preview: the display is drawn at 1.5 times (msaa2) or
+     // twice (msaa4) the Vita's size in each direction and averaged down. The labels are in docs/GRAPHICS_OPTIONS.md.
+@@ -3405,7 +3428,20 @@ void GlRenderer::set_overlay(OverlayActive active, OverlayPaint paint) {
+ 
+ bool GlRenderer::present_overlay() { return impl_->present_overlay(); }
+ 
+-void GlRenderer::pause_interpolation() { impl_->forget_timing(); }
++void GlRenderer::pause_interpolation() {
++    impl_->forget_timing();
++    impl_->aa_have_last = false;   // the pause is not a frame time
++}
++
++void GlRenderer::set_load_probe(LoadProbe probe) { impl_->load_probe = std::move(probe); }
++
++GlRenderer::AutoAaInfo GlRenderer::auto_aa_info() const noexcept {
++    AutoAaInfo info;
++    info.state = impl_->aa_on_now.load(std::memory_order_relaxed);
++    info.offs = impl_->aa_offs.load(std::memory_order_relaxed);
++    info.ons = impl_->aa_ons.load(std::memory_order_relaxed);
++    return info;
++}
+ 
+ bool GlRenderer::capture_frame(const std::string &path) {
+     std::vector<std::uint8_t> rgba;
+@@ -3419,7 +3455,24 @@ std::uint64_t GlRenderer::draws_submitted() const noexcept { return impl_->draws
+ 
+ bool GlRenderer::warm_up_step(std::uint64_t quiet_us) {
+     Impl &impl = *impl_;
+-    if (!impl.ready || impl.warm_done) return false;
++    if (!impl.ready) return false;
++    // FXAA, when it is chosen or Auto may use it: its program is made now (the logos, a lull) and not at the first frame that wants it.
++    if (!impl.fxaa_warm_done && impl.settings.use_port_options) {
++        const bool wanted = port::fxaa() || (port::antialiasing_auto() && port::msaa_samples() == 0u && impl.settings.aa_auto != 0u);
++        if (!wanted) {
++            impl.fxaa_warm_done = true;
++        } else if (impl.frames == 0u || quiet_us >= 20000u) {
++            impl.fxaa_warm_done = true;
++            const auto start = std::chrono::steady_clock::now();
++            const bool ok = impl.fxaa_program_for_pass() != nullptr;
++            std::cerr << "[gl] warm-up: the FXAA program " << (ok ? "is ready" : "FAILED") << ", "
++                      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() << " ms\n";
++            return true;
++        } else {
++            return false;
++        }
++    }
++    if (impl.warm_done) return false;
+     if (!impl.warm_started) {
+         impl.warm_started = true;
+         impl.warm_flags = impl.prepare_variants();
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 0ae13fb..66f67d1 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -81,6 +81,21 @@ struct GlSettings {
+     // coordinates, medium-precision colour), 1 the first version (nine taps for every pixel, four of them dependent reads).
+     // gl_fxaa_quality=fast|high. The cheaper pass falls back to the first if its program does not build.
+     std::uint32_t fxaa_quality{0u};
++    // gfx.antialiasing=auto (gpu/auto_aa.hpp): 1 FXAA comes and goes with the room the renderer has (the default); 0 Auto means Off, as
++    // before it existed; 2 Auto means FXAA always (for pictures and for comparing). gl_aa_auto=0|1|2.
++    std::uint32_t aa_auto{1u};
++    // Auto's tuning, for measuring: the quiet time before FXAA is tried again (seconds), and the GL thread's sleep per frame (microseconds)
++    // FXAA is assumed to need. 0: the built-in 10 s and 3000 us.
++    std::uint32_t aa_auto_retry_s{0u};
++    std::uint32_t aa_auto_need_idle_us{0u};
++    // For the replayer, whose frames are not 33 ms: Auto's frame budget in milliseconds (0: 33.3), and the 3D frames of quiet it wants before it
++    // tries FXAA again (0: 150). And a test aid: the present of `test_slow_frames` frames from presented frame `test_slow_from` sleeps
++    // `test_slow_ms` milliseconds, as a frame the GPU could not finish would, to see Auto turn FXAA off.
++    std::uint32_t aa_auto_budget_ms{0u};
++    std::uint32_t aa_auto_min_frames{0u};
++    std::uint32_t test_slow_ms{0u};
++    std::uint32_t test_slow_from{0u};
++    std::uint32_t test_slow_frames{0u};
+     // A draw whose every fragment has alpha 0 and that then changes nothing (the alpha test rejects alpha 0, or it blends
+     // as source alpha / one minus source alpha onto a target whose alpha is not written or not kept) is not drawn.
+     // Games fade sprites and effects out by their alpha and keep sending them; the picture is the same.
+@@ -265,6 +280,15 @@ public:
+     bool capture_frame(const std::string &path) override;
+     [[nodiscard]] std::uint64_t frames_presented() const noexcept override;
+     [[nodiscard]] std::uint64_t draws_submitted() const noexcept override;
++    void set_load_probe(LoadProbe probe) override;
++    // gfx.antialiasing=auto: `state` -1 when Auto is not adaptive now (another choice, or gl_aa_auto=0/2), 0 FXAA off, 1 on;
++    // the number of times it went off and came back since the start. Readable from any thread.
++    struct AutoAaInfo {
++        int state{-1};
++        std::uint32_t offs{};
++        std::uint32_t ons{};
++    };
++    [[nodiscard]] AutoAaInfo auto_aa_info() const noexcept;
+ 
+     // ---- for tools ---------------------------------------------------------
+ 
+diff --git a/host/gpu/renderer.hpp b/host/gpu/renderer.hpp
+index f83a84d..b55d648 100644
+--- a/host/gpu/renderer.hpp
++++ b/host/gpu/renderer.hpp
+@@ -61,6 +61,18 @@ class Renderer {
+ public:
+     Renderer() = default;
+     virtual ~Renderer() = default;
++
++    // How loaded the thread that draws is, for a renderer that adapts to it (gfx.antialiasing=auto). The values are running totals
++    // that wrap, read on the drawing thread at each present: `lag_us` is how far the drawing thread runs behind the thread that feeds it
++    // (smoothed, -1 when there is no such measure), `idle_us` the time it has slept for want of work (-1 unknown), `skipped` the frames the
++    // frame skip has left out. A renderer in front of another (the split renderer) installs it on the one that draws.
++    struct LoadReading {
++        std::int32_t lag_us{-1};
++        std::int64_t idle_us{-1};
++        std::uint64_t skipped{};
++    };
++    using LoadProbe = std::function<LoadReading()>;
++    virtual void set_load_probe(LoadProbe) {}
+     Renderer(const Renderer &) = delete;
+     Renderer &operator=(const Renderer &) = delete;
+ 
+diff --git a/host/gpu/split_renderer.cpp b/host/gpu/split_renderer.cpp
+index 5cb71d0..99acfe0 100644
+--- a/host/gpu/split_renderer.cpp
++++ b/host/gpu/split_renderer.cpp
+@@ -121,6 +121,15 @@ SplitRenderer::SplitRenderer(std::unique_ptr<Renderer> inner, std::uint32_t draw
+       presents_ahead_(env_count("GE_SPLIT_PRESENTS_AHEAD", kPresentsAhead, 1u, 4u)), early_sync_(ge_split_early_sync_enabled()),
+       slow_gl_us_(env_count("GE_SPLIT_SLOW_PRESENT_US", 0u, 0u, 500000u)) {
+     g_instance = this;
++    // The drawing renderer adapts to how loaded its thread is (gfx.antialiasing=auto): the lag behind the walker, the sleep for want of
++    // work (known when the platform times the phases), and the frames skipped.
++    inner_->set_load_probe([this]() {
++        Renderer::LoadReading reading;
++        reading.lag_us = lag_us_.load(std::memory_order_relaxed);
++        reading.idle_us = phase::enabled() ? static_cast<std::int64_t>(phase::total_us(phase::GlIdle)) : -1;
++        reading.skipped = frames_skipped_.load(std::memory_order_relaxed);
++        return reading;
++    });
+ }
+ 
+ SplitRenderer::~SplitRenderer() {
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 5a4e021..48fef0a 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -32,8 +32,8 @@ const KeyInfo kTable[kKeyCount] = {
+      "Less shimmer on distant ground and walls.", 2, 0,
+      {"on", "off"}, {"On", "Off"}, {L, N}, 0, false},
+     {Key::GfxAntialiasing, "gfx.antialiasing", Page::Graphics, "Anti-aliasing",
+-     "Smooths jagged edges. MSAA needs a restart.", 4, 0,
+-     {"off", "fxaa", "msaa2", "msaa4"}, {"Off", "FXAA", "MSAA 2x", "MSAA 4x"}, {N, M, M, H}, 0x0C, false},
++     "Auto: FXAA while it fits. MSAA needs restart.", 5, 1,
++     {"auto", "off", "fxaa", "msaa2", "msaa4"}, {"Auto", "Off", "FXAA", "MSAA 2x", "MSAA 4x"}, {L, N, M, M, H}, 0x18, false},
+     {Key::GfxPixelLighting, "gfx.pixel_lighting", Page::Graphics, "Pixel lighting",
+      "Lights characters per pixel, not per vertex.", 2, 0,
+      {"off", "on"}, {"Off", "On"}, {N, H}, 0, false},
+@@ -249,7 +249,16 @@ Settings::Settings() {
+ }
+ 
+ const char *Settings::value(Key key) const noexcept { return info(key).values[index(key)]; }
+-const char *Settings::label(Key key) const noexcept { return info(key).labels[index(key)]; }
++static std::atomic<int> g_auto_aa_state{-1};
++
++const char *Settings::label(Key key) const noexcept {
++    if (key == Key::GfxAntialiasing && index(key) == static_cast<std::uint8_t>(Antialiasing::Auto)) {
++        const int state = g_auto_aa_state.load(std::memory_order_relaxed);
++        if (state == 1) return "Auto (on)";
++        if (state == 0) return "Auto (off)";
++    }
++    return info(key).labels[index(key)];
++}
+ Cost Settings::cost(Key key) const noexcept { return info(key).costs[index(key)]; }
+ bool Settings::is_default(Key key) const noexcept { return index(key) == default_[static_cast<std::size_t>(key)]; }
+ 
+@@ -510,6 +519,32 @@ Settings &settings() {
+     return instance;
+ }
+ 
++void set_auto_antialiasing_state(int state) noexcept { g_auto_aa_state.store(state, std::memory_order_relaxed); }
++int auto_antialiasing_state() noexcept { return g_auto_aa_state.load(std::memory_order_relaxed); }
++
++bool Settings::adopt_auto_antialiasing() {
++    const auto aa = static_cast<std::size_t>(Key::GfxAntialiasing);
++    const auto off = static_cast<std::uint8_t>(Antialiasing::Off), automatic = static_cast<std::uint8_t>(Antialiasing::Auto);
++    if (overridden_[aa] || default_[aa] != automatic || stored_[aa] != off || !in_file_[aa]) return false;
++    for (std::size_t i = 0; i < kKeyCount; ++i)
++        if (i != aa && stored_[i] != default_[i]) return false;   // the player has changed something: the Off may be theirs
++    stored_[aa] = automatic;
++    dirty_ = true;
++    refresh(Key::GfxAntialiasing);
++    return true;
++}
++
++void apply_vita_defaults(Settings &settings) {
++    // Split: display lists and vertex decoding on core 2, the GL calls on core 1.
++    settings.set_platform_default(Key::PerfThreadedRenderer, "split");
++    // 30 frames a second: the game's own rate, steady rather than 27-34.
++    settings.set_platform_default(Key::PerfFrameCap, "30");
++    // 500 MHz when the system allows it (the app falls back to 444 when it refuses).
++    settings.set_platform_default(Key::PerfCpuClock, "500");
++    // FXAA when the renderer has room, off when it does not (gpu/auto_aa.hpp).
++    settings.set_platform_default(Key::GfxAntialiasing, "auto");
++}
++
+ std::uint32_t msaa_samples() noexcept {
+     switch (static_cast<Antialiasing>(settings().started_index(Key::GfxAntialiasing))) {
+     case Antialiasing::Msaa2: return 2u;
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index 4c51922..6a04967 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -54,13 +54,14 @@ enum class Key : std::uint8_t {
+     Count
+ };
+ inline constexpr std::size_t kKeyCount = static_cast<std::size_t>(Key::Count);
+-inline constexpr std::size_t kMaxValues = 4;
++inline constexpr std::size_t kMaxValues = 5;
+ 
+ // The typed views of the values, in the order of each key's allowed list (default first).
+ // gfx.hd_textures: Auto is "the best pack that is present", the table's "default = best pack present".
+ enum class HdTextures : std::uint8_t { Auto, Off, X2, X4 };
+ enum class TextureFilter : std::uint8_t { Smooth, Original };
+-enum class Antialiasing : std::uint8_t { Off, Fxaa, Msaa2, Msaa4 };
++// Auto: FXAA while the renderer has room for it (gpu/auto_aa.hpp), Off while it does not; it never chooses MSAA.
++enum class Antialiasing : std::uint8_t { Auto, Off, Fxaa, Msaa2, Msaa4 };
+ enum class MovieFilter : std::uint8_t { Sharp, Bilinear };
+ enum class FrameCap : std::uint8_t { Fps60, Fps30, Off };
+ enum class ControlLayout : std::uint8_t { Modern, Classic };
+@@ -131,6 +132,8 @@ public:
+     [[nodiscard]] const char *label(Key key) const noexcept;       // "Smooth"
+     [[nodiscard]] Cost cost(Key key) const noexcept;               // of the effective value
+     [[nodiscard]] bool is_default(Key key) const noexcept;
++    // The player's own choice (what settings.txt keeps), whatever an override or a greyed row makes of the effective value.
++    [[nodiscard]] std::uint8_t stored_index(Key key) const noexcept { return stored_[static_cast<std::size_t>(key)]; }
+     // Bumped whenever an effective value changes (or a file is loaded). A reader that remembers the last number it saw
+     // knows when to look again. Never reused within a run.
+     [[nodiscard]] std::uint32_t generation() const noexcept { return generation_.load(std::memory_order_acquire); }
+@@ -145,6 +148,10 @@ public:
+     // Steps through the allowed values, skipping none, wrapping round; returns the new effective index.
+     std::uint8_t step(Key key, int direction);
+     void reset_to_defaults();
++    // 1.0's settings.txt holds every row, chosen or not, so an Off there may be the old default or a choice. A file whose rows are all
++    // at their defaults except gfx.antialiasing=off has no choice in it: this moves that Off to Auto. Any other file is left as it is.
++    // Returns whether the value moved. Call once (the Vita app records that it has), after the platform defaults are set.
++    bool adopt_auto_antialiasing();
+     // A platform's own default for a key (the Vita build: perf.threaded_renderer=split), set before init(): what the
+     // program runs with while settings.txt does not choose, and what reset_to_defaults() goes back to. The table's
+     // default (KeyInfo::default_index) stays the framework's. False for a value that is not allowed.
+@@ -214,6 +221,10 @@ private:
+ // The one instance of the program.
+ [[nodiscard]] Settings &settings();
+ 
++// The Vita's own defaults (the app and the replayer's --menu-as-vita both use this one list): the split renderer, 30 fps, 500 MHz,
++// and Auto anti-aliasing. A settings.txt that names a value keeps it.
++void apply_vita_defaults(Settings &settings);
++
+ // ---- typed accessors: what the renderer and the runtime call ------------------------------------------------------
+ [[nodiscard]] inline HdTextures hd_textures() { return static_cast<HdTextures>(settings().index(Key::GfxHdTextures)); }
+ [[nodiscard]] inline bool texture_filter_smooth() {
+@@ -223,6 +234,11 @@ private:
+ [[nodiscard]] inline Antialiasing antialiasing() { return static_cast<Antialiasing>(settings().index(Key::GfxAntialiasing)); }
+ // FXAA is a post pass and changes live; MSAA is chosen when the graphics context is made (see msaa_samples()).
+ [[nodiscard]] inline bool fxaa() { return antialiasing() == Antialiasing::Fxaa; }
++// gfx.antialiasing=auto: the renderer switches FXAA on and off by itself.
++[[nodiscard]] inline bool antialiasing_auto() { return antialiasing() == Antialiasing::Auto; }
++// What Auto is doing now, for the menu's value ("Auto (on)", "Auto (off)"): the renderer reports it (-1: nothing yet, 0 off, 1 on).
++void set_auto_antialiasing_state(int state) noexcept;
++[[nodiscard]] int auto_antialiasing_state() noexcept;
+ // The multisampling the program started with: 0, 2 or 4 samples. It comes from the value at mark_started(), because
+ // vitaGL fixes it when it is initialised; a change in the overlay shows as "restart needed" and is applied by the next
+ // start. A platform that creates the GL context early (the Vita's start-up screen) calls this after Settings::init().
+diff --git a/tests/auto_aa_tests.cpp b/tests/auto_aa_tests.cpp
+new file mode 100644
+index 0000000..3645af5
+--- /dev/null
++++ b/tests/auto_aa_tests.cpp
+@@ -0,0 +1,217 @@
++// gfx.antialiasing=auto: the state machine of host/gpu/auto_aa.hpp, driven with made-up frame timings (no GL, no clock, no threads).
++
++#include "gpu/auto_aa.hpp"
++
++#include <cstdio>
++
++namespace {
++
++using namespace portablekit::gpu;
++
++int g_failures = 0;
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++// A simulated run of presented frames at 30 Hz. `late_us` makes a frame's interval longer.
++struct Run {
++    AutoAa aa;
++    std::uint64_t now_us{1'000'000u};
++    int offs_seen{0}, ons_seen{0};
++    explicit Run(const AutoAaConfig &config = {}) : aa(config) { aa.reset(now_us); }
++
++    AutoAa::Event frame(std::uint32_t interval_us = 33'333u, bool scene = true, std::uint32_t swap_us = 1'700u, std::int32_t lag_us = 8'000,
++                        std::int32_t idle_us = 4'000, std::uint32_t skipped = 0u) {
++        now_us += interval_us;
++        AutoAaFrame f;
++        f.now_us = now_us;
++        f.interval_us = interval_us;
++        f.swap_us = swap_us;
++        f.lag_us = lag_us;
++        f.idle_us = idle_us;
++        f.skipped = skipped;
++        f.scene = scene;
++        const AutoAa::Event event = aa.update(f);
++        offs_seen += event == AutoAa::Event::TurnedOff;
++        ons_seen += event == AutoAa::Event::TurnedOn;
++        return event;
++    }
++    void healthy_seconds(double seconds, std::int32_t idle_us = 4'000) {
++        for (int i = 0, n = static_cast<int>(seconds * 30.0); i < n; ++i) frame(33'333u, true, 1'700u, 8'000, idle_us);
++    }
++    // A frame the GPU made late: 50 ms, a present that waited, the GL thread far behind.
++    AutoAa::Event gpu_late() { return frame(50'000u, true, 12'000u, 20'000, 0); }
++};
++
++} // namespace
++
++int main() {
++    {
++        Run r;
++        check(r.aa.on(), "starts with FXAA on");
++        r.healthy_seconds(30);
++        check(r.aa.on() && r.aa.changes() == 0u, "a healthy run never changes anything");
++    }
++    {
++        Run r;
++        r.healthy_seconds(2);
++        check(r.gpu_late() == AutoAa::Event::None && r.aa.on(), "one late frame does not turn FXAA off");
++        r.frame();
++        check(r.gpu_late() == AutoAa::Event::None && r.aa.on(), "a late frame, a good one, a late one: not consecutive, still on");
++        check(r.gpu_late() == AutoAa::Event::TurnedOff && !r.aa.on(), "two late frames in a row turn it off at the second");
++        check(r.aa.offs() == 1u && r.aa.changes() == 1u, "the change is counted");
++    }
++    {
++        // The game's own code being slow is not FXAA's doing: late frames with a sleeping GL thread and a quick present.
++        Run r;
++        r.healthy_seconds(2);
++        for (int i = 0; i < 20; ++i) r.frame(55'000u, true, 1'700u, 1'000, 15'000);
++        check(r.aa.on(), "late frames the GL thread was not the cause of leave FXAA on");
++        // The same with no measure of the GL thread (no split renderer): a late frame is the renderer's.
++        Run q;
++        q.healthy_seconds(2);
++        q.frame(55'000u, true, 1'700u, -1, -1);
++        check(q.frame(55'000u, true, 1'700u, -1, -1) == AutoAa::Event::TurnedOff, "without a GL-thread measure two late frames count");
++    }
++    {
++        // A skipped frame is enough on its own.
++        Run r;
++        r.healthy_seconds(2);
++        check(r.frame(66'000u, true, 1'700u, 8'000, 4'000, 1u) == AutoAa::Event::TurnedOff, "a frame skip turns FXAA off at once");
++    }
++    {
++        // Menus, movies and loads change nothing.
++        Run r;
++        r.healthy_seconds(2);
++        for (int i = 0; i < 30; ++i) r.frame(60'000u, false, 12'000u, 20'000, 0);
++        check(r.aa.on(), "late frames without a 3D scene (a menu, a movie) are not counted");
++        r.gpu_late();
++        r.frame(60'000u, false, 12'000u, 20'000, 0);
++        check(r.aa.on() && r.gpu_late() == AutoAa::Event::TurnedOff, "a 2D frame between two late 3D frames does not break the run");
++        Run l;
++        l.healthy_seconds(2);
++        l.frame(3'000'000u);   // a load
++        l.frame(3'000'000u);
++        check(l.aa.on(), "an interval over 200 ms is a pause, not a late frame");
++    }
++    {
++        // The grace after coming on: the first frames make the pass's target and may be long.
++        Run r;
++        r.aa.reset(r.now_us);
++        check(r.gpu_late() == AutoAa::Event::None && r.gpu_late() == AutoAa::Event::None && r.aa.on(), "the first two 3D frames after coming on are not counted");
++        r.gpu_late();
++        check(r.gpu_late() == AutoAa::Event::TurnedOff, "then the rule applies");
++    }
++    {
++        // Back on: after 10 quiet seconds, not before.
++        Run r;
++        r.healthy_seconds(2);
++        r.gpu_late();
++        r.gpu_late();
++        check(!r.aa.on(), "off");
++        r.healthy_seconds(9);
++        check(!r.aa.on(), "still off after 9 quiet seconds");
++        r.healthy_seconds(1.5);
++        check(r.aa.on() && r.ons_seen == 1, "back on after 10 quiet seconds");
++    }
++    {
++        // A late frame while off restarts the quiet time.
++        Run r;
++        r.healthy_seconds(2);
++        r.gpu_late();
++        r.gpu_late();
++        r.healthy_seconds(8);
++        r.gpu_late();
++        r.healthy_seconds(8);
++        check(!r.aa.on(), "a late frame while off starts the 10 seconds again");
++        r.healthy_seconds(3);
++        check(r.aa.on(), "and it comes back 10 seconds after that");
++    }
++    {
++        // A menu or a movie is no room: the quiet time needs 3D frames.
++        Run r;
++        r.healthy_seconds(2);
++        r.gpu_late();
++        r.gpu_late();
++        for (int i = 0; i < 30 * 20; ++i) r.frame(33'333u, false);
++        check(!r.aa.on(), "20 seconds of menu do not bring it back");
++        r.healthy_seconds(6);
++        check(r.aa.on(), "5 seconds of 3D frames after that do");
++    }
++    {
++        // Not enough room: the GL thread sleeps less than FXAA is assumed to need.
++        Run r;
++        r.healthy_seconds(2);
++        r.gpu_late();
++        r.gpu_late();
++        for (int i = 0; i < 30 * 30; ++i) r.frame(33'333u, true, 1'700u, 8'000, 800);
++        check(!r.aa.on(), "no room (the GL thread sleeps 0.8 ms a frame): stays off for 30 seconds");
++        for (int i = 0; i < 30 * 12; ++i) r.frame(33'333u, true, 1'700u, 8'000, 5'000);
++        check(r.aa.on(), "room again: back on");
++        // Without idle-time information the other conditions decide.
++        Run q;
++        q.healthy_seconds(2);
++        q.frame(55'000u, true, 1'700u, -1, -1);
++        q.frame(55'000u, true, 1'700u, -1, -1);
++        for (int i = 0; i < 30 * 11; ++i) q.frame(33'333u, true, 1'700u, -1, -1);
++        check(q.aa.on(), "idle time unknown: 10 quiet seconds are enough");
++    }
++    {
++        // A scene the GPU cannot afford: every try fails within a few frames; the tries get rarer and ask for more room.
++        Run r;
++        r.healthy_seconds(2);
++        std::uint64_t first_retry = r.aa.retry_us();
++        int tries = 0;
++        std::uint64_t t_start = r.now_us;
++        std::uint64_t last_on = 0, longest_wait = 0;
++        for (int step = 0; step < 30 * 600; ++step) {     // ten minutes
++            if (r.aa.on()) {
++                if (last_on == 0u) last_on = r.now_us;
++                r.gpu_late();
++            } else {
++                const std::uint64_t off_at = r.now_us;
++                r.frame(33'333u, true, 1'700u, 8'000, 8'000);
++                if (r.aa.on()) { ++tries; longest_wait = r.now_us - off_at > longest_wait ? r.now_us - off_at : longest_wait; }
++            }
++        }
++        (void)t_start;
++        check(tries >= 3 && tries <= 12, "a scene FXAA never fits is tried a handful of times in ten minutes, not a hundred");
++        check(r.aa.retry_us() > first_retry && r.aa.retry_us() <= r.aa.config().max_retry_us, "the wait grows, up to its limit");
++        check(r.aa.need_idle_us() > r.aa.config().need_idle_us && r.aa.need_idle_us() <= r.aa.config().max_need_idle_us, "and so does the room asked for, up to its limit");
++    }
++    {
++        // A try that fails doubles the wait; one that holds for a minute is forgiven.
++        Run r;
++        r.healthy_seconds(2);
++        r.gpu_late();
++        r.gpu_late();
++        check(!r.aa.on() && r.aa.retry_us() == 10'000'000u, "the first off (from the start) does not count as a failed try");
++        r.healthy_seconds(11);
++        check(r.aa.on(), "tried again");
++        for (int i = 0; i < 4; ++i) r.gpu_late();   // two frames of grace, then two late ones
++        check(!r.aa.on() && r.aa.retry_us() == 20'000'000u, "a try that fails within seconds doubles the wait");
++        r.healthy_seconds(21, 3'000);
++        check(!r.aa.on(), "after a failed try more room is asked for: 3 ms of sleep is no longer enough");
++        r.healthy_seconds(21, 6'000);
++        check(r.aa.on(), "tried after 20 seconds with 6 ms of room");
++        r.healthy_seconds(70);
++        for (int i = 0; i < 2; ++i) r.gpu_late();
++        check(!r.aa.on(), "off after a long stretch on");
++        check(r.aa.retry_us() == r.aa.config().retry_us && r.aa.need_idle_us() == r.aa.config().need_idle_us,
++              "a try that held for a minute is forgiven: back to 10 seconds");
++    }
++    {
++        // Counting and reset.
++        Run r;
++        r.healthy_seconds(1);
++        r.gpu_late();
++        r.gpu_late();
++        r.healthy_seconds(12);
++        check(r.aa.changes() == 2u && r.aa.offs() == 1u && r.aa.ons() == 1u, "offs and ons are counted");
++        r.aa.reset(r.now_us);
++        check(r.aa.on(), "reset (Auto chosen again) starts with FXAA on");
++    }
++    std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILURES");
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
+index 98c4f3b..af36133 100644
+--- a/tests/port_settings_tests.cpp
++++ b/tests/port_settings_tests.cpp
+@@ -57,7 +57,7 @@ int main() {
+         check(sane, "the key table is complete and self-consistent");
+         check(key_from_name("GFX.Texture_Filter") == Key::GfxTextureFilter, "key names are case-insensitive");
+         check(key_from_name("gfx.nothing") == Key::Count, "an unknown key name is Count");
+-        check(value_index(Key::GfxAntialiasing, "FXAA") == 1 && value_index(Key::GfxAntialiasing, "msaa8") == -1,
++        check(value_index(Key::GfxAntialiasing, "FXAA") == 2 && value_index(Key::GfxAntialiasing, "msaa8") == -1,
+               "values are found case-insensitively and unknown ones are -1");
+         check(env_name(Key::GfxTextureFilter) == "GFX_TEXTURE_FILTER", "environment names");
+         check(keys_on(Page::Graphics).size() + keys_on(Page::Performance).size() + keys_on(Page::Controls).size() == kKeyCount,
+@@ -84,7 +84,8 @@ int main() {
+     s.set(Key::GfxTextureFilter, std::uint8_t(1));
+     check(s.generation() == g1, "setting the same value does not bump");
+     check(!s.set(Key::GfxTextureFilter, std::uint8_t(7)) && !s.set(Key::GfxTextureFilter, "wobbly"), "bad values are refused");
+-    check(s.step(Key::GfxAntialiasing, +1) == 1u && s.step(Key::GfxAntialiasing, -1) == 0u && s.step(Key::GfxAntialiasing, -1) == 3u,
++    check(s.step(Key::GfxAntialiasing, +1) == 2u && s.step(Key::GfxAntialiasing, -1) == 1u && s.step(Key::GfxAntialiasing, -1) == 0u &&
++              s.step(Key::GfxAntialiasing, -1) == 4u && s.step(Key::GfxAntialiasing, +1) == 0u,
+           "step wraps in both directions");
+     check(s.set("perf.show_fps", "on") && s.index(Key::PerfShowFps) == 1u && !s.set("perf.nothing", "on"), "set by key name");
+     check(s.dirty(), "changes make the settings dirty");
+@@ -139,7 +140,7 @@ int main() {
+     Settings t3;
+     t3.set_file_ops({&fake_read, &fake_write});
+     t3.set_path("x/settings.txt");
+-    check(t3.load() && t3.index(Key::GfxAntialiasing) == 1u, "a leftover temporary file is used when the real file is gone");
++    check(t3.load() && t3.index(Key::GfxAntialiasing) == 2u, "a leftover temporary file is used when the real file is gone");
+     Settings t4;
+     t4.set_file_ops({&fake_read, &fake_write});
+     t4.set_path("nowhere/settings.txt");
+@@ -182,8 +183,11 @@ int main() {
+     check(r.restart_pending(Key::GfxAntialiasing) && r.restart_pending(), "MSAA needs a restart");
+     r.set(Key::GfxAntialiasing, "off");
+     check(!r.restart_pending(), "going back to what the run started with clears it");
+-    check(restart_for_change(Key::GfxAntialiasing, 0, 2) && restart_for_change(Key::GfxAntialiasing, 3, 1) &&
+-              !restart_for_change(Key::GfxAntialiasing, 0, 1) && !restart_for_change(Key::GfxAntialiasing, 2, 2),
++    r.set(Key::GfxAntialiasing, "auto");
++    check(!r.restart_pending(), "Auto is live (it never chooses MSAA)");
++    check(restart_for_change(Key::GfxAntialiasing, 1, 3) && restart_for_change(Key::GfxAntialiasing, 4, 2) && restart_for_change(Key::GfxAntialiasing, 0, 4) &&
++              !restart_for_change(Key::GfxAntialiasing, 1, 2) && !restart_for_change(Key::GfxAntialiasing, 3, 3) && !restart_for_change(Key::GfxAntialiasing, 0, 2) &&
++              !restart_for_change(Key::GfxAntialiasing, 0, 1),
+           "restart_for_change");
+ 
+     // The real file operations (stdio): write, replace, read back, no temporary file left behind.
+@@ -229,6 +233,82 @@ int main() {
+     settings().set(Key::GfxAntialiasing, "off");
+     settings().mark_started();
+     check(msaa_samples() == 0u, "off at start is no multisampling");
++    settings().set(Key::GfxAntialiasing, "auto");
++    settings().mark_started();
++    check(msaa_samples() == 0u && antialiasing_auto() && !fxaa(), "auto at start is no multisampling, and it is not the FXAA choice");
++
++    // gfx.antialiasing=auto: the Vita's default, Off stays the framework's, and the menu's value says what Auto is doing.
++    {
++        Settings v;
++        check(v.index(Key::GfxAntialiasing) == static_cast<std::uint8_t>(Antialiasing::Off), "the table's default is Off");
++        apply_vita_defaults(v);
++        check(v.index(Key::GfxAntialiasing) == static_cast<std::uint8_t>(Antialiasing::Auto) && v.is_default(Key::GfxAntialiasing),
++              "the Vita's default is Auto");
++        check(v.index(Key::PerfThreadedRenderer) == 2u && v.index(Key::PerfFrameCap) == 1u && v.index(Key::PerfCpuClock) == 1u,
++              "the Vita's defaults: split renderer, 30 fps, 500 MHz");
++        set_auto_antialiasing_state(-1);
++        check(std::strcmp(v.label(Key::GfxAntialiasing), "Auto") == 0, "the value reads Auto before the renderer says anything");
++        set_auto_antialiasing_state(1);
++        check(std::strcmp(v.label(Key::GfxAntialiasing), "Auto (on)") == 0, "Auto (on)");
++        set_auto_antialiasing_state(0);
++        check(std::strcmp(v.label(Key::GfxAntialiasing), "Auto (off)") == 0, "Auto (off)");
++        v.set(Key::GfxAntialiasing, "fxaa");
++        check(std::strcmp(v.label(Key::GfxAntialiasing), "FXAA") == 0, "another choice shows its own name");
++        set_auto_antialiasing_state(-1);
++        check(std::strlen("Auto (off)") <= 10u, "the longest value of the row fits its column");
++    }
++
++    // Settings from 1.0: it wrote every row, so a file whose rows are all at their defaults has no choice in it.
++    {
++        const auto vita = [](Settings &v) {
++            v.set_file_ops({&fake_read, &fake_write});
++            v.set_path("v/settings.txt");
++            apply_vita_defaults(v);
++        };
++        const std::string base =
++            "gfx.hd_textures=auto\ngfx.texture_filter=smooth\ngfx.mipmaps=on\ngfx.antialiasing=off\ngfx.pixel_lighting=off\ngfx.effects_scale=1\n"
++            "gfx.movie_filter=sharp\ngfx.hd_movies=off\nperf.frame_cap=30\nperf.frame_skip=auto\nperf.show_fps=off\nperf.resolution=960x544\n"
++            "perf.threaded_renderer=split\nperf.cpu_clock=500\nperf.enemy_density=100\nperf.view_distance=100\ncontrols.layout=modern\n"
++            "controls.auto_fire=on\nfuture.key=1\n";
++        g_files.clear();
++        {
++            Settings v;
++            vita(v);
++            v.load_text(base);
++            check(v.index(Key::GfxAntialiasing) == static_cast<std::uint8_t>(Antialiasing::Off), "a 1.0 file says Off");
++            check(v.adopt_auto_antialiasing() && v.index(Key::GfxAntialiasing) == static_cast<std::uint8_t>(Antialiasing::Auto) && v.dirty(),
++                  "an untouched 1.0 file moves to Auto");
++            check(v.save() && g_files["v/settings.txt"].find("gfx.antialiasing=auto") != std::string::npos &&
++                      g_files["v/settings.txt"].find("future.key=1") != std::string::npos,
++                  "and it is saved, with the unknown line kept");
++            check(!v.adopt_auto_antialiasing(), "a second call changes nothing");
++        }
++        const auto changed = [&](const char *from, const char *to) {
++            std::string text = base;
++            text.replace(text.find(from), std::strlen(from), to);
++            Settings v;
++            vita(v);
++            v.load_text(text);
++            return v.adopt_auto_antialiasing();
++        };
++        check(!changed("perf.show_fps=off", "perf.show_fps=on"), "a file with any other row changed is left alone (the Off may be a choice)");
++        check(!changed("gfx.mipmaps=on", "gfx.mipmaps=off"), "...whichever row it is");
++        check(!changed("gfx.antialiasing=off", "gfx.antialiasing=fxaa") && !changed("gfx.antialiasing=off", "gfx.antialiasing=msaa4"),
++              "a real anti-aliasing choice is kept");
++        {
++            Settings v;
++            vita(v);
++            v.load_text(base);
++            v.override_value(Key::GfxAntialiasing, "off");
++            check(!v.adopt_auto_antialiasing(), "a config.txt override is left alone");
++            Settings w;
++            vita(w);
++            check(!w.adopt_auto_antialiasing(), "no file, nothing to move");
++            Settings x;
++            x.load_text(base);
++            check(!x.adopt_auto_antialiasing(), "without the Vita's default there is nothing to adopt");
++        }
++    }
+ 
+     // The gameplay rows are the game profile's to enable; a program without one keeps them greyed, and their hints are honest.
+     {
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index 0db28ad..fdd3fc2 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -731,9 +731,7 @@ int main(int argc, char **argv) {
+     if (gl != nullptr && options.menu_page != 0) {
+         if (options.menu_as_vita) {   // for pictures of the menu: the Vita's own defaults, and the rows the Vita app makes usable
+             port::Settings &s = port::settings();
+-            s.set_platform_default(port::Key::PerfThreadedRenderer, "split");
+-            s.set_platform_default(port::Key::PerfFrameCap, "30");
+-            s.set_platform_default(port::Key::PerfCpuClock, "500");
++            port::apply_vita_defaults(s);
+             for (port::Key key : {port::Key::GfxHdTextures, port::Key::PerfThreadedRenderer, port::Key::PerfCpuClock,
+                                   port::Key::PerfEnemyDensity, port::Key::PerfViewDistance})
+                 s.set_unavailable(key, nullptr);
+-- 
+2.43.0
+
