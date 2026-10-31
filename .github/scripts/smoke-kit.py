@@ -67,8 +67,14 @@ def main():
 
     env = {'PATH': os.path.join(work, 'emptybin'), 'TMPDIR': os.path.join(work, 'tmp'), 'TEMP': os.path.join(work, 'tmp'),
            'TMP': os.path.join(work, 'tmp'), 'LC_ALL': 'C'}
+    if sys.platform.startswith('linux'):
+        env['PWD'] = '/proc/self/cwd'      # as the builder does: GCC streams the working directory into LTO objects, from $PWD when that names it
     for k in ('SYSTEMROOT', 'SystemRoot', 'windir', 'COMSPEC', 'HOME'):      # Windows needs these to start any program
         if k in os.environ: env[k] = os.environ[k]
+
+    fw = lambda p: p.replace('\\', '/')
+    # {kit} and {work} are the prefix maps' folders (forward slashes: GCC on Windows spells its own paths that way, and the maps are text)
+    fill = lambda x: x.replace('{kit}', fw(kit)).replace('{work}', fw(work))
 
     def run(label, argv, cwd, capture=False):
         t = time.time()
@@ -89,7 +95,7 @@ def main():
     stems = [os.path.basename(s)[:-4] for s in sources]
     log('   %d files' % len(stems))
     def compile_one(stem):
-        a = [x.replace('{stem}', stem) for x in r['compile']['args']]
+        a = [fill(x).replace('{stem}', stem) for x in r['compile']['args']]
         run('compile ' + stem, [tool('cxx')] + a, work)
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         list(ex.map(compile_one, stems))
@@ -108,6 +114,7 @@ def main():
     def link(label, pad_obj=None):
         a = []
         for l in link_args:
+            l = fill(l)
             for k, v in (('{lean}', lib), ('{out}', elf), ('{jobs}', str(jobs))):
                 l = l.replace(k, v)
             if pad_obj and l == r['textPad']['object']:
@@ -136,7 +143,7 @@ def main():
         pad = r['textPad']['hint'] + need + 4096 - free
         log('   padding .text by %d bytes and linking again' % pad)
         pobj = os.path.join(work, 'text_pad.o')
-        fix = [x.replace('{pad}', str(pad)).replace('{padObject}', pobj) for x in r['textPad']['fix']['args']]
+        fix = [fill(x).replace('{pad}', str(pad)).replace('{padObject}', pobj) for x in r['textPad']['fix']['args']]
         run('textpad', [tool('cxx')] + fix, kit)
         link('link2', pobj)
 
@@ -146,7 +153,6 @@ def main():
     # vita-elf-create writes the module name (the ELF's file name) into the program by splitting the path at '/': on Windows a path
     # with backslashes would give "\infected.elf" instead of "infected.elf", so these three paths are given with forward slashes
     # (Windows accepts them). The builder must do the same.
-    fw = lambda p: p.replace('\\', '/')
     run('elf-create', [tool('elfCreate')] + [x.replace('{elf}', fw(elf)).replace('{velf}', fw(velf)) for x in r['elfCreate']['args']], kit)
     run('fself', [tool('fself')] + [x.replace('{velf}', fw(velf)).replace('{eboot}', fw(eboot)) for x in r['fself']['args']], kit)
 

@@ -52,6 +52,15 @@ jobs:
           "$P" --progress --gen .github/smoke/gen --work "$S/work dir" --out "$S/o" --jobs 2 --keep | tee "$T/progress.txt" | head -60
           echo "EBOOT $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest())' "$S/o/infected.vpk")"
           cat "$S/work dir/build.log" | grep -c "partitions\|ltrans" || true
+      - name: vita-elf-create by hand
+        run: |
+          S="$T/smoke test"; K="$S/the kit"; E="$S/work dir/infected.elf"
+          grep -n "vita-elf-create\|vita-make-fself" "$S/work dir/build.log" | cut -c1-300
+          for v in "-s" ""; do
+            "$K/toolchain/bin/vita-elf-create${{ matrix.exe }}" $v "$E" "$S/x.velf"; echo "exit $?"
+            ls -l "$S/x.velf"; sha256sum "$S/x.velf"
+          done
+          sha256sum "$E"
       - name: Kill the program while it compiles (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

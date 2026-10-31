@@ -242,6 +242,8 @@ jobs:
           print('infected-build eboot.bin', got, '\ntool calls   eboot.bin', want)
           if got != want:
               print('::warning title=infected-build differs::eboot.bin of infected-build differs from the direct tool calls in the same folders')
+          with open(sys.argv[2], 'a') as f:      # the compare job requires this one to be the same on every computer
+              f.write('ib-eboot-sha256 %s\n' % got)
           PY
       - uses: actions/upload-artifact@v4
         with:
@@ -281,19 +283,30 @@ jobs:
               rows[d['kit'].strip()]['segments'] = [l for l in lines if l.startswith('segment ')]
           names = ['linux', 'windows', 'mac-intel', 'mac-arm']
           missing = [n for n in names if n not in rows]
-          out = ['| kit | size | segments-sha256 | eboot.bin sha256 |', '|---|---|---|---|']
+          out = ['| kit | size | segments-sha256 | eboot.bin (direct tool calls) | eboot.bin (infected-build) |', '|---|---|---|---|---|']
           for n in names:
               r = rows.get(n, {})
-              out.append('| %s | %.1f MB | `%s` | `%s` |' % (n, int(r.get('kit-bytes', 0)) / 1e6, r.get('segments-sha256', '-')[:16], r.get('eboot-sha256', '-')[:16]))
+              out.append('| %s | %.1f MB | `%s` | `%s` | `%s` |' % (n, int(r.get('kit-bytes', 0)) / 1e6, r.get('segments-sha256', '-')[:16], r.get('eboot-sha256', '-')[:16], r.get('ib-eboot-sha256', '-')[:16]))
           text = '\n'.join(out)
           print(text)
-          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('### Kits and cross-host comparison\n\n' + text + '\n\nThe program (every loadable segment of the Sony ELF, from the same synthetic input) must be identical; eboot.bin as a whole also holds the build folder\'s name in its debug info, so it differs from host to host.\n')
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('### Kits and cross-host comparison\n\n' + text + '\n\nThe program (every loadable segment of the Sony ELF, from the same synthetic input) must be identical, and so must the eboot.bin that infected-build makes from it: it is the same file on Linux, Windows and both Macs.\n')
           if missing:
               sys.exit('no result from: %s' % ', '.join(missing))
           if len({rows[n]['segments-sha256'] for n in names}) != 1:
               for n in names:
                   print('--', n); print('\n'.join(rows[n]['segments']))
               sys.exit('FAIL: the four kits did not make the same program')
+          have = [n for n in names if 'ib-eboot-sha256' in rows[n]]
+          if not have:
+              print('::warning title=No infected-build result::no kit has an infected-build result (builder/cmd/infected-build is absent or has no --gen): the eboot.bin of infected-build was not compared')
+          elif len(have) != len(names):
+              sys.exit('FAIL: infected-build made an eboot.bin on %s but not on %s' % (', '.join(have), ', '.join(n for n in names if n not in have)))
+          elif len({rows[n]['ib-eboot-sha256'] for n in names}) != 1:
+              for n in names:
+                  print('%-10s %s' % (n, rows[n]['ib-eboot-sha256']))
+              sys.exit('FAIL: infected-build made a different eboot.bin on different computers')
+          else:
+              print('OK: infected-build made the same eboot.bin on all four computers')
           print('OK: all four kits made the same program')
           PY
 

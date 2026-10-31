@@ -39,7 +39,10 @@ infected-build --gen DIR [--out DIR] [--work DIR] ...        (no disc: build fro
 
 Started without arguments (a double-click) it asks you to drag the .iso onto the window and waits for Enter at the end.
 Exit status: 0 success, 1 failure (one plain-English line on stderr), 2 bad command line, 130 cancelled (Ctrl-C or SIGTERM; child
-processes are killed and the work folder is removed).
+processes are killed and the work folder is removed). The tools run as a process tree (gcc starts cc1plus, lto1, as, ld and this
+program as make), so cancelling kills the whole tree: a process group on Linux and macOS, `taskkill /T /F` on Windows. On Windows
+the program also puts itself into a job object that kills every process in it when the program ends in any way (window closed, the
+installer ends it with TerminateProcess, a crash), so no compiler is left running without its parent.
 
 `--progress` lines (anything else on stdout is ignored by readers):
 
@@ -147,6 +150,23 @@ kit in `.../ku2 (b)/with space` with `--work` elsewhere and `--gen`, both under 
 without `-g0`. On **macOS and Windows** nothing like `/proc/self/cwd` was found, so the working directory still ends up in the objects there: the
 `eboot.bin` can differ between work folders by some hundred bytes of branch-stub order (nothing else, and nothing that matters on the Vita);
 this was not measured on those systems. Use the same `--work` folder on the same system when you compare builds.
+
+### The same eboot.bin on every computer (Linux, Windows, both Macs)
+
+CI builds the synthetic corpus (`.github/smoke/gen`, no game data) with the unpacked kit of each computer through `infected-build --gen`, and the
+`compare` job of `kits.yml` fails unless the four `eboot.bin` are byte for byte the same. Two things had to be right for Windows:
+
+- **`-ffile-prefix-map` is text.** GCC on Windows spells its own paths with forward slashes (`D:/a/_temp/smoke test/the kit/toolchain/bin/../lib/...`), so
+  the builder expands `{kit}` and `{work}` with forward slashes; a map written with backslashes matches nothing there. (The working
+  directory that GCC streams into the LTO objects is not mapped on Windows; there, two work folders of different length gave the same
+  `eboot.bin` in the test.)
+- **`vita-elf-create -s`.** `vita-make-fself` computes the module NID of the program from a hash of the *whole* Sony ELF file, not only of the
+  segments the Vita loads, and that file carried the linker's symbol table. `ld` writes global symbols in the order of its hash table
+  (`bfd_hash_hash`, table size 16381), and its hash is an `unsigned long`: 64 bits on Linux and macOS, 32 bits in the Windows build. Symbols with long C++ names
+  (mostly `std::_Hashtable<...>` instantiations) get another bucket there, so the `.symtab`/`.strtab`/`.rel.*` sections differ
+  (30 of 10,180 global symbols moved in the test), the NID differs, and so does `eboot.bin` (4 bytes of the code segment, its compressed
+  tail and the header digest), although every loadable segment is the same. `-s` leaves the Sony ELF without sections, so nothing that depends on the
+  linker's symbol order is left in the file; `kit_tool.py` puts it into `elfCreate.args` of `kit.json`. (The eboot.bin has no section headers anyway.)
 
 Against the normal CMake build (`vita/app/build.sh`) the `eboot.bin` is **not** identical: the kit links stripped objects named
 `game/link/obj/...` with `-g0`, CMake links `CMakeFiles/.../*.obj` with `-g`. With the same game library, a kit link with `-g` (before `-g0` was added) and the CMake link
