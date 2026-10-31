@@ -234,7 +234,7 @@ func TestBuiltins(t *testing.T) {
 	os.WriteFile(in, []byte("data"), 0o644)
 	old := time.Unix(1_600_000_000, 0)
 	os.Chtimes(in, old, old)
-	rr := &recipeRunner{stdout: os.Stdout, stderr: os.Stderr}
+	rr := &recipeRunner{stdout: os.Stdout, stderr: os.Stderr, winBackslash: runtime.GOOS == "windows"}
 	line := fmt.Sprintf("@-touch -r %s %s.tem > /dev/null 2>&1 && mv %s.tem %s", in, in, in, in)
 	if err := rr.run(line); err != nil {
 		t.Fatal(err)
@@ -292,7 +292,7 @@ func TestQuoteLeadingProgram(t *testing.T) {
 	prog := filepath.Join(dir, "gcc")
 	os.WriteFile(prog, []byte("x"), 0o755)
 	line := prog + "  '-xlto' '-c' '-o' 'out file.o'"
-	cmds, _, err := parseRecipeLine("@"+line, false)
+	cmds, _, err := parseRecipeLine("@"+line, runtime.GOOS == "windows")
 	if err != nil || len(cmds) != 1 || cmds[0].words[0] != prog || cmds[0].words[1] != "-xlto" || cmds[0].words[4] != "out file.o" {
 		t.Fatalf("%v %q", err, cmds)
 	}

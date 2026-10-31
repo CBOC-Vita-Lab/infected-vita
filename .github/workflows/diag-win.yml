@@ -1,0 +1,46 @@
+name: diag-win (temporary)
+on:
+  push:
+    branches: ['builder-win']
+    paths: ['.github/workflows/diag-win.yml']
+permissions:
+  contents: read
+  actions: read
+env:
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux,   runner: ubuntu-22.04, exe: '' }
+          - { name: windows, runner: windows-2022, exe: '.exe' }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kit of the earlier run
+        run: |
+          T="$RUNNER_TEMP"; [ "$RUNNER_OS" = Windows ] && T="$(cygpath -u "$RUNNER_TEMP")"
+          echo "T=$T" >> "$GITHUB_ENV"
+          mkdir -p "$T/dl"; gh run download 41182193164 --repo "$GITHUB_REPOSITORY" -n kit-${{ matrix.name }} -D "$T/dl"
+          S="$T/smoke test"; mkdir -p "$S/the kit"; tar -xzf "$T/dl/Infected-Vita-builder-${{ matrix.name }}.tar.gz" -C "$S/the kit"
+      - name: infected-build, keeping the work folder
+        run: |
+          S="$T/smoke test"; P="$S/the kit/infected-build${{ matrix.exe }}"
+          "$P" --gen .github/smoke/gen --work "$S/work dir" --out "$S/out dir" --jobs 2 --keep
+          sha256sum "$S/out dir/infected.vpk" "$S/work dir/eboot.bin" "$S/work dir/infected.elf" "$S/work dir/infected.velf"
+          ls -lR "$S/work dir" | head -80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/smoke test/work dir/obj
+            ${{ runner.temp }}/smoke test/work dir/*.elf
+            ${{ runner.temp }}/smoke test/work dir/*.velf
+            ${{ runner.temp }}/smoke test/work dir/*.log
+            ${{ runner.temp }}/smoke test/work dir/eboot.bin
+          retention-days: 1

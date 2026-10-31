@@ -328,6 +328,17 @@ func parseRecipeLine(line string, winBackslash bool) (cmds []simpleCommand, igno
 	return cmds, ignoreErr, nil
 }
 
+// isFile reports whether path names an existing file. Windows ignores trailing spaces and dots in a name ("C:\kit\gcc " finds
+// "C:\kit\gcc"), so a name that ends in one is never taken as the name of a program: otherwise the longest candidate ending at a
+// space would swallow the space after the program.
+func isFile(path string) bool {
+	if path == "" || strings.HasSuffix(path, " ") || strings.HasSuffix(path, ".") || strings.HasSuffix(path, "\t") {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
 // quoteLeadingProgram puts quotes around the program of a command line when its path has spaces or parentheses and is not quoted, as
 // GCC writes it ("/home/John Smith/kit (2)/toolchain/bin/arm-vita-eabi-gcc  '-xlto' ...): the longest start of the line, ending at a
 // space and before the first quote, that is an existing file.
@@ -341,7 +352,7 @@ func quoteLeadingProgram(line string) string {
 		if line[i] != ' ' {
 			continue
 		}
-		if st, err := os.Stat(line[:i]); err == nil && !st.IsDir() {
+		if isFile(line[:i]) {
 			best = i
 		}
 	}
@@ -360,7 +371,7 @@ func resolveProgram(words []string) (string, []string) {
 	p := words[0]
 	for i := 1; i < len(words); i++ {
 		p += " " + words[i]
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		if isFile(p) {
 			return p, words[i+1:]
 		}
 	}
