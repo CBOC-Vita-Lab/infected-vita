@@ -26,24 +26,23 @@ jobs:
           gh api 'repos/vitasdk/autobuilds/releases?per_page=100' --jq '.[] | "\(.tag_name) \(.published_at) \([.assets[].name] | join(","))"' | grep -i '2026-09\|2026-10' | head -40 || true
       - name: Fetch this OS's toolchain
         run: |
-          case "$RUNNER_OS" in
-            Linux) pat='linux' ;;
-            Windows) pat='w64|windows|mingw' ;;
-            macOS) pat='darwin|osx|macos' ;;
+          case "$RUNNER_OS-$(uname -m)" in
+            Linux-*) t=x86_64-linux-gnu ;;
+            Windows-*) t=x86_64-w64-mingw32 ;;
+            macOS-x86_64) t=x86_64-apple-darwin ;;
+            macOS-arm64) t=arm64-apple-darwin ;;
           esac
-          tag=$(gh release list --repo vitasdk/autobuilds --limit 1 --json tagName --jq '.[0].tagName')
-          name=$(gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[].name' | grep -Ei "$pat" | grep -Ei "$(uname -m | sed 's/x86_64/x86_64|amd64/;s/arm64/arm64|aarch64/')" | head -1)
-          [ -n "$name" ] || name=$(gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[].name' | grep -Ei "$pat" | head -1)
-          echo "asset: $name"
-          gh release download "$tag" --repo vitasdk/autobuilds --pattern "$name" --dir dl
-          mkdir sdk && tar -xf dl/* -C sdk || (cd sdk && 7z x ../dl/* >/dev/null)
-          ls sdk; root=$(dirname $(find sdk -name 'arm-vita-eabi-gcc*' -path '*bin*' | head -1))/..
-          echo "root $root"; cat $root/version_info.txt || true
-          du -sh $root; du -sh $root/* | sort -h
-          $root/bin/arm-vita-eabi-gcc --version | head -1
-          ls $root/bin | head -80
-          ls $root/libexec/gcc/arm-vita-eabi/*/ || true
-          for f in $root/bin/arm-vita-eabi-g++* $root/bin/vita-elf-create* $root/bin/vita-make-fself* $root/libexec/gcc/arm-vita-eabi/*/cc1plus* $root/libexec/gcc/arm-vita-eabi/*/lto1* $root/libexec/gcc/arm-vita-eabi/*/liblto_plugin*; do
+          tag=sdk-snapshot-20260926.790.1
+          gh release view "$tag" --repo vitasdk/autobuilds --json assets --jq '.assets[] | "\(.name) \(.size)"' | grep "$t"
+          gh release download "$tag" --repo vitasdk/autobuilds --pattern "vitasdk-$t-*.tar.bz2" --dir dl
+          mkdir sdk && tar -xjf dl/*.tar.bz2 -C sdk
+          root=$(cd "$(dirname "$(find sdk -name 'arm-vita-eabi-gcc' -o -name 'arm-vita-eabi-gcc.exe' | head -1)")/.." && pwd)
+          echo "root $root"; cat "$root/version_info.txt" || true
+          du -sh "$root"; du -sh "$root"/* | sort -h
+          "$root/bin/arm-vita-eabi-gcc" --version | head -1
+          ls "$root/bin" | tr '\n' ' '; echo
+          ls "$root"/libexec/gcc/arm-vita-eabi/*/ || true
+          for f in "$root"/bin/arm-vita-eabi-g++* "$root"/bin/arm-vita-eabi-as* "$root"/bin/vita-elf-create* "$root"/bin/vita-make-fself* "$root"/libexec/gcc/arm-vita-eabi/*/cc1plus* "$root"/libexec/gcc/arm-vita-eabi/*/lto1* "$root"/libexec/gcc/arm-vita-eabi/*/liblto_plugin* "$root"/arm-vita-eabi/bin/ld*; do
             echo "== $f"; ls -la "$f"
             case "$RUNNER_OS" in
               Linux) file "$f"; ldd "$f" || true ;;
@@ -51,5 +50,8 @@ jobs:
               Windows) objdump -p "$f" | grep -E 'DLL Name|MajorOSVersion|MajorSubsystemVersion' || true ;;
             esac
           done
-          ls $root/bin/*.dll 2>/dev/null || true
-          find $root -name '*.yml' -o -name 'db*.json' | head
+          find "$root" -name '*.dll' | head -20
+          find "$root/share" -maxdepth 2 | head -20
+          printf 'int main(){return 0;}\n' > t.cpp
+          time "$root/bin/arm-vita-eabi-g++" -O2 -flto -c t.cpp -o t.o && ls -la t.o
+          time "$root/bin/arm-vita-eabi-g++" -O2 -flto=2 t.o -Wl,-q -o t.elf && "$root/bin/vita-elf-create" t.elf t.velf && "$root/bin/vita-make-fself" -s t.velf eboot.bin && sha256sum eboot.bin t.o || true
