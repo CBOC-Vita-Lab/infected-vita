@@ -585,6 +585,9 @@ func (b *Builder) runLink(ctx context.Context, padObject, elf string) error {
 		}
 		args = append(args, e)
 	}
+	if d := os.Getenv("IB_DIAG_LINKARGS"); d != "" { // TEMPORARY experiment hook
+		args = append(args, strings.Split(d, ";;")...)
+	}
 	os.Remove(b.progFile)
 	stop := b.watchPartitions(ctx)
 	defer stop()

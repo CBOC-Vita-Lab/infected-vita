@@ -13,6 +13,7 @@ import (
 
 // TestMain lets the test binary act as the "compiler" that the makefile recipes run: `<test binary> -helper OUTFILE [fail]`.
 func TestMain(m *testing.M) {
+	treeHelper()
 	if len(os.Args) >= 3 && os.Args[1] == "-helper" {
 		out := os.Args[2]
 		running := out + ".running"

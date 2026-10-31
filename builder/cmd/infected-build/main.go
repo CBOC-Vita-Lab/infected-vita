@@ -221,6 +221,7 @@ func cleanDroppedPath(s string) string {
 
 // runBuild runs the build with signal handling and prints the outcome. It returns the exit status.
 func runBuild(o cliOptions, self string, stdout, stderr io.Writer) int {
+	killChildrenWithMe()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sig := make(chan os.Signal, 2)

@@ -35,27 +35,20 @@ jobs:
       - name: Build infected-build from this tree
         run: |
           cd builder && go build -trimpath -ldflags='-s -w' -o "$T/smoke test/the kit/infected-build${{ matrix.exe }}" ./cmd/infected-build
-      - name: Variants
+      - name: Link with -save-temps and a map
         run: |
           S="$T/smoke test"; P="$S/the kit/infected-build${{ matrix.exe }}"
-          one() { # name, work dir, extra env
-            rm -rf "$S/o"; IB_DIAG_ENV="$3" "$P" --gen .github/smoke/gen --work "$2" --out "$S/o" --jobs 2 --keep > "$S/$1.log" 2>&1 || { cat "$S/$1.log"; echo "FAILED $1"; return; }
-            printf '%-12s %s  elf %s\n' "$1" "$(sha256sum < "$2/eboot.bin" | cut -c1-16)" "$(sha256sum < "$2/infected.elf" | cut -c1-16)"
-            ls -l "$2/obj/lean_000.o" | awk '{print "   lean_000.o", $5}'
-          }
-          one base "$S/work dir" ""
-          mkdir -p "$S/another place (2)/deeper"
-          one otherdir "$S/another place (2)/deeper/w ork" ""
-          D="$(cd "$S" && pwd -W 2>/dev/null || pwd)"
-          echo "drive/dir: $D"
-          rm -rf "$S/save"; mkdir -p "$S/save"; cp "$S/work dir/obj/lean_000.o" "$S/save/"
+          rm -rf "$S/o"
+          IB_DIAG_LINKARGS="-save-temps;;-Wl,-Map=$S/work dir/link.map;;-Wl,--trace-symbol=main" "$P" --gen .github/smoke/gen --work "$S/work dir" --out "$S/o" --jobs 2 --keep
+          sha256sum "$S/work dir/eboot.bin"
+          mkdir -p "$S/temps"; cd "$S/the kit"; ls | head -50; cp -v *.ltrans* *.wpa* *.ltrans.o* "$S/temps/" 2>/dev/null || true
+          ls -l "$S/temps"
+          cp "$S/work dir/link.map" "$S/temps/"
       - uses: actions/upload-artifact@v4
         with:
           name: diag-${{ matrix.name }}
           path: |
-            ${{ runner.temp }}/smoke test/work dir/obj
+            ${{ runner.temp }}/smoke test/temps
             ${{ runner.temp }}/smoke test/work dir/*.elf
-            ${{ runner.temp }}/smoke test/work dir/*.velf
             ${{ runner.temp }}/smoke test/work dir/*.log
-            ${{ runner.temp }}/smoke test/work dir/eboot.bin
           retention-days: 1

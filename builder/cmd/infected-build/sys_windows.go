@@ -17,6 +17,9 @@ var (
 	procSetPriorityClass   = kernel32.NewProc("SetPriorityClass")
 	procGetShortPathName   = kernel32.NewProc("GetShortPathNameW")
 	procGetCurrentProcess  = kernel32.NewProc("GetCurrentProcess")
+	procCreateJobObject    = kernel32.NewProc("CreateJobObjectW")
+	procSetInfoJobObject   = kernel32.NewProc("SetInformationJobObject")
+	procAssignProcessToJob = kernel32.NewProc("AssignProcessToJobObject")
 )
 
 const (
@@ -40,6 +43,58 @@ func killTree(p *os.Process) error {
 		return p.Kill()
 	}
 	return nil
+}
+
+// The parts of JOBOBJECT_EXTENDED_LIMIT_INFORMATION that matter here (64-bit layout; on a 32-bit build the size is wrong, the call
+// fails and the job is simply not used).
+type jobBasicLimit struct {
+	PerProcessUserTimeLimit int64
+	PerJobUserTimeLimit     int64
+	LimitFlags              uint32
+	MinimumWorkingSetSize   uintptr
+	MaximumWorkingSetSize   uintptr
+	ActiveProcessLimit      uint32
+	Affinity                uintptr
+	PriorityClass           uint32
+	SchedulingClass         uint32
+}
+
+type jobExtendedLimit struct {
+	Basic                 jobBasicLimit
+	IoInfo                [6]uint64
+	ProcessMemoryLimit    uintptr
+	JobMemoryLimit        uintptr
+	PeakProcessMemoryUsed uintptr
+	PeakJobMemoryUsed     uintptr
+}
+
+const (
+	jobObjectLimitKillOnJobClose = 0x2000
+	jobObjectExtendedLimitInfo   = 9
+)
+
+// killChildrenWithMe puts this program into a job object that kills every process in it when the last handle to the job closes,
+// which is when this program ends in any way (closed window, the installer's TerminateProcess, a crash): without it the compiler
+// processes it started would run on, and a half-finished link would hold files in the work folder. Processes started later (gcc,
+// cc1plus, lto1, ld, this program as make) inherit the job. Best effort: a computer where this program already runs inside a job that
+// does not allow nesting (Windows 7) just does without.
+func killChildrenWithMe() {
+	h, _, _ := procCreateJobObject.Call(0, 0)
+	if h == 0 {
+		return
+	}
+	var info jobExtendedLimit
+	info.Basic.LimitFlags = jobObjectLimitKillOnJobClose
+	r, _, _ := procSetInfoJobObject.Call(h, jobObjectExtendedLimitInfo, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+	if r == 0 {
+		syscall.CloseHandle(syscall.Handle(h))
+		return
+	}
+	self, _, _ := procGetCurrentProcess.Call()
+	if r, _, _ := procAssignProcessToJob.Call(h, self); r == 0 {
+		syscall.CloseHandle(syscall.Handle(h))
+	}
+	// the handle stays open until the program ends
 }
 
 func freeDiskBytes(dir string) (int64, error) {

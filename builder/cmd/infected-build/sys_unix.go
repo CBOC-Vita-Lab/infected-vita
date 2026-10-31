@@ -41,3 +41,6 @@ func isTerminal(f *os.File) bool {
 
 // shortPath: only Windows has short names.
 func shortPath(p string) string { return p }
+
+// killChildrenWithMe is for Windows (a job object); the tools here are killed by killTree through their process group.
+func killChildrenWithMe() {}
