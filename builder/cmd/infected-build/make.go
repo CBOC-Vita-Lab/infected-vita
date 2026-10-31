@@ -739,7 +739,17 @@ func runMake(args []string, stdout, stderr io.Writer, getenv func(string) string
 		total:  mf.countRecipes(goals),
 	}
 	if pf := getenv(progressFileEnv); pf != "" {
-		m.onFinish = func(done, total int) { writeProgressFile(pf, done, total) }
+		// Recipes finish on several goroutines: write in order, never a smaller count after a larger one.
+		var pmu sync.Mutex
+		best := 0
+		m.onFinish = func(done, total int) {
+			pmu.Lock()
+			defer pmu.Unlock()
+			if done > best {
+				best = done
+				writeProgressFile(pf, done, total)
+			}
+		}
 		writeProgressFile(pf, 0, m.total)
 	}
 	var wg sync.WaitGroup
