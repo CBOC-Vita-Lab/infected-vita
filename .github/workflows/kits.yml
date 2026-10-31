@@ -114,7 +114,7 @@ jobs:
           echo "VITASDK=$RUNNER_TEMP/sdk/vitasdk" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/sdk/vitasdk/bin" >> "$GITHUB_PATH"
       - name: Tools
-        run: python3 -m pip install --user Pillow && cmake --version | head -1 && python3 --version
+        run: sudo python3 -m pip install Pillow && cmake --version | head -1 && python3 --version
       # The third-party libraries (vitaGL, FFmpeg, ...) take about ten minutes; they depend only on the SDK and on vita/scripts.
       - name: Libraries from cache
         id: sysroot
