@@ -127,6 +127,22 @@ folder, where the link runs), else a copy in a space-free temporary folder, else
 temporary folder (the makefile names its targets there unquoted): `<work>/tmp`, or a space-free folder elsewhere when the work folder
 has a space (`runner.go`: `makeProgram`, `spacelessDir`).
 
+### Folder names
+
+The kit may be unpacked, and the work folder may be, in a folder whose name has spaces, parentheses, `&`, apostrophes or accented letters
+(CI builds the synthetic corpus from `Kit B (2)`, `Kit & more`, `John Smith's kit`, `O'Brien (home) & Sons` and `José Ångström` on all four systems; `eboot.bin` is
+identical). Three details come from GCC:
+
+- **Program paths in the LTO makefile are not quoted** (`/home/John Smith/kit (2)/toolchain/bin/arm-vita-eabi-g++  '-xlto' ...`). The make
+  stand-in takes the longest start of the line that is an existing file (a name ending in a space or dot is never taken: Windows ignores both when it
+  opens a file) and quotes it.
+- **Arguments are quoted without escaping**: a kit in `John Smith's kit` gives `'-ffile-prefix-map=/x/John Smith's kit=/kit'`. An apostrophe followed by a letter, a digit or
+  another character of a name is part of the text; a quote ends before a space, an operator or an escaped apostrophe.
+- **On Windows the programs are MinGW programs** and know only the ANSI code page. A folder with letters outside plain ASCII is used through its 8.3 short name
+  (`C:\Users\JOS~1\...`), which needs short names on that volume and letters that exist in the code page (the compiler turns a short name back into the long
+  one; Cyrillic or Chinese letters are lost on a Western Windows). Where that fails, `infected-build` stops at once and asks for a plain folder
+  such as `C:\InfectedBuilder`; the same goes for `--work`.
+
 ## Determinism: the same eboot from any folder
 
 GCC streams file names and directories into LTO objects, and the final link orders some branch stubs by them, so the same sources used to
