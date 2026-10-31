@@ -56,7 +56,7 @@ jobs:
         run: |
           S="$T/smoke test"
           try() {
-            K2="$S/$1"; rm -rf "$S/$1" "$S/o2" "$S/w2"; mkdir -p "$K2"; cp -r "$S/the kit/." "$K2/"
+            K2="${B:-$S}/$1"; rm -rf "$K2" "$S/o2" "$S/w2"; mkdir -p "$K2"; cp -r "$S/the kit/." "$K2/"
             if "$K2/infected-build${{ matrix.exe }}" --gen .github/smoke/gen --out "$S/o2" --work "$S/w2" --keep --jobs 2 > "$S/try.log" 2>&1; then
               echo "OK   [$1] $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest()[:16])' "$S/o2/infected.vpk")"
             else
@@ -71,6 +71,12 @@ jobs:
           try $'\xd0\x98\xd0\xb2\xd0\xb0\xd0\xbd/kit'
           try $'\xe6\x97\xa5\xe6\x9c\xac/kit'
           try "O'Brien (home) & Sons/kit"
+          if [ "$RUNNER_OS" = Windows ]; then
+            export B=/c/Users/Public/ibdiag
+            try $'Jos\xc3\xa9 \xc3\x85ngstr\xc3\xb6m/kit'
+            try $'\xd0\x98\xd0\xb2\xd0\xb0\xd0\xbd/kit'
+            try $'\xe6\x97\xa5\xe6\x9c\xac/kit'
+          fi
       - name: Kill the program while it compiles (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
