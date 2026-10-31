@@ -67,7 +67,10 @@ jobs:
           try "John Smith/kit"
           try "Kit & more/kit"
           try "John Smith's kit/kit"
-          try "Jos\u00e9 \u00c5ngstr\u00f6m/kit"
+          try $'Jos\xc3\xa9 \xc3\x85ngstr\xc3\xb6m/kit'
+          try $'\xd0\x98\xd0\xb2\xd0\xb0\xd0\xbd/kit'
+          try $'\xe6\x97\xa5\xe6\x9c\xac/kit'
+          try "O'Brien (home) & Sons/kit"
       - name: Kill the program while it compiles (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

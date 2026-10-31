@@ -288,20 +288,37 @@ func TestShellFallback(t *testing.T) {
 }
 
 func TestQuoteLeadingProgram(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "John Smith", "Kit B (2)")
-	os.MkdirAll(dir, 0o755)
-	prog := filepath.Join(dir, "gcc")
-	os.WriteFile(prog, []byte("x"), 0o755)
-	line := prog + "  '-xlto' '-c' '-o' 'out file.o'"
-	cmds, _, err := parseRecipeLine("@"+line, runtime.GOOS == "windows")
-	if err != nil || len(cmds) != 1 || cmds[0].words[0] != prog || cmds[0].words[1] != "-xlto" || cmds[0].words[4] != "out file.o" {
-		t.Fatalf("%v %q", err, cmds)
+	win := runtime.GOOS == "windows"
+	for _, base := range []string{"John Smith", "O'Brien", "John Smith's folder"} {
+		dir := filepath.Join(t.TempDir(), base, "Kit B (2)")
+		os.MkdirAll(dir, 0o755)
+		prog := filepath.Join(dir, "gcc")
+		os.WriteFile(prog, []byte("x"), 0o755)
+		line := prog + "  '-xlto' '-c' '-o' 'out file.o' '-fmap=" + strings.ReplaceAll(dir, "'", `'\''`) + "=/kit'"
+		cmds, _, err := parseRecipeLine("@"+line, win)
+		if err != nil || len(cmds) != 1 || len(cmds[0].words) != 6 || cmds[0].words[0] != prog || cmds[0].words[1] != "-xlto" || cmds[0].words[4] != "out file.o" ||
+			cmds[0].words[5] != "-fmap="+dir+"=/kit" {
+			t.Fatalf("%q: %v %q", base, err, cmds)
+		}
 	}
 	// a plain path is left alone, and so is a line whose program does not exist
-	if got := quoteLeadingProgram("/bin/sh -c 'x'"); got != "/bin/sh -c 'x'" {
+	if got := quoteLeadingProgram("/bin/sh -c 'x'", false); got != "/bin/sh -c 'x'" {
 		t.Fatalf("%q", got)
 	}
-	if got := quoteLeadingProgram("/no/such dir/gcc 'x'"); got != "/no/such dir/gcc 'x'" {
+	if got := quoteLeadingProgram("/no/such dir/gcc 'x'", false); got != "/no/such dir/gcc 'x'" {
 		t.Fatalf("%q", got)
+	}
+}
+
+// GCC writes an apostrophe inside a quoted argument as quote, backslash, quote, quote on every system; on Windows a backslash outside quotes is otherwise an
+// ordinary character.
+func TestWindowsApostropheArgument(t *testing.T) {
+	words, err := splitWords(`'-fmap=C:\Users\O'\''Brien\kit=/kit' 'C:\x y\z'`, true)
+	if err != nil || len(words) != 2 || words[0].text != `-fmap=C:\Users\O'Brien\kit=/kit` || words[1].text != `C:\x y\z` {
+		t.Fatalf("%v %+v", err, words)
+	}
+	words, err = splitWords(`'it'\''s'`, false)
+	if err != nil || len(words) != 1 || words[0].text != "it's" {
+		t.Fatalf("%v %+v", err, words)
 	}
 }

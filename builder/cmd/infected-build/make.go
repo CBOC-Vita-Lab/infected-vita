@@ -251,6 +251,11 @@ func splitWords(s string, winBackslash bool) ([]shellWord, error) {
 			if i >= len(s) {
 				return nil, errors.New("unterminated quote")
 			}
+		case c == '\\' && winBackslash && i > 0 && s[i-1] == '\'' && i+2 < len(s) && s[i+1] == '\'' && s[i+2] == '\'':
+			// GCC writes an apostrophe inside a quoted argument as quote, backslash, quote, quote even on Windows: close, escaped apostrophe, open again
+			cur.WriteByte('\'')
+			i++ // the escaped apostrophe; the next one opens the quote again
+			have, quoted = true, true
 		case c == '\\' && !winBackslash:
 			if i+1 < len(s) {
 				i++
@@ -282,7 +287,7 @@ func parseRecipeLine(line string, winBackslash bool) (cmds []simpleCommand, igno
 		line = strings.TrimLeft(line[1:], " \t")
 	}
 	line = strings.ReplaceAll(line, "$$", "$")
-	line = quoteLeadingProgram(line)
+	line = quoteLeadingProgram(line, winBackslash)
 	words, err := splitWords(line, winBackslash)
 	if err != nil {
 		return nil, ignoreErr, err
@@ -339,27 +344,29 @@ func isFile(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// quoteLeadingProgram puts quotes around the program of a command line when its path has spaces or parentheses and is not quoted, as
-// GCC writes it ("/home/John Smith/kit (2)/toolchain/bin/arm-vita-eabi-gcc  '-xlto' ...): the longest start of the line, ending at a
-// space and before the first quote, that is an existing file.
-func quoteLeadingProgram(line string) string {
-	limit := strings.IndexAny(line, "'\"")
-	if limit < 0 {
-		limit = len(line)
-	}
+// quoteLeadingProgram puts quotes around the program of a command line when its path has spaces, parentheses or an apostrophe and is
+// not quoted, as GCC writes it ("/home/John Smith/kit (2)/toolchain/bin/arm-vita-eabi-gcc  '-xlto' ...): the longest start of the line,
+// ending at a space, that is an existing file. (A start that begins with a quote is never a file, so a quoted program is left alone;
+// the quotes of the arguments after an unquoted program do not matter, as an apostrophe in the folder name shows: "/home/O'Brien/kit/gcc".)
+func quoteLeadingProgram(line string, winBackslash bool) string {
 	best := -1
-	for i := 1; i < limit; i++ {
-		if line[i] != ' ' {
-			continue
-		}
-		if isFile(line[:i]) {
+	for i := 1; i < len(line); i++ {
+		if (line[i] == ' ' || line[i] == '\t') && isFile(line[:i]) {
 			best = i
 		}
 	}
-	if best < 0 || !strings.ContainsAny(line[:best], " \t()") {
+	if best < 0 || !strings.ContainsAny(line[:best], " \t()'\"") {
 		return line
 	}
-	return "'" + strings.ReplaceAll(line[:best], "'", "'\\''") + "'" + line[best:]
+	prog := line[:best]
+	if winBackslash {
+		// no backslash escapes here (they are the separators of paths); a Windows file name has no double quote
+		if strings.Contains(prog, "'") {
+			return "\"" + prog + "\"" + line[best:]
+		}
+		return "'" + prog + "'" + line[best:]
+	}
+	return "'" + strings.ReplaceAll(prog, "'", "'\\''") + "'" + line[best:]
 }
 
 // resolveProgram finds the program of a command whose path has spaces in it and is not quoted (as GCC writes it): the longest
