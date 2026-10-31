@@ -1,0 +1,328 @@
+name: Builder kits
+
+# Builds the Infected "builder kits" (one per kind of computer) that the CBOC Vita Installer downloads to build the game on the
+# player's own computer from their own disc. Nothing in a kit comes from the game: the kit holds a trimmed VitaSDK, the prebuilt
+# application and its libraries, and the program (infected-build) that does the rest.
+#
+#   plan          reads CHANGELOG.md: is the first heading "## Version X.Y - <date>" (not "(unreleased)") and is vX.Y still unreleased?
+#   orchestrator  builds infected-build for the four computers with Go 1.20.14 (skipped, with a warning, while the program is absent)
+#   target        the part every kit shares: libraries (cached), the application's objects, game/link, game/vpk, headers, target files
+#   host          per computer: the host programs from that OS's VitaSDK + infected-build -> .tar.gz, then a smoke test of the
+#                 UNPACKED kit on that same computer (compile, LTO link, nm, vita-elf-create, vita-make-fself, VPK on a synthetic
+#                 corpus; no disc)
+#   compare       the program the four kits made must be byte for byte the same
+#   release       only on main with a new version: creates the release (draft first, published when every file is up)
+#
+# Pushes to builder* branches and manual runs build everything and keep the files as workflow artifacts only. A push to main that is
+# not a new version stops after `plan`. A release is never re-uploaded: if vX.Y exists, nothing is built or changed.
+on:
+  push:
+    branches: [main, 'builder*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kits-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: |
+          heading="$(grep -m1 '^## ' CHANGELOG.md || true)"
+          parsed="$(printf '%s\n' "$heading" | sed -nE 's/^## +Version +([0-9]+(\.[0-9]+)*) +(—|–|-) +(.*)$/\1|\4/p')"
+          version="${parsed%%|*}"; when="${parsed#*|}"
+          release=false
+          if [ -n "$parsed" ] && ! printf '%s' "$when" | grep -qi 'unreleased'; then
+            if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              if out="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$version" 2>&1)"; then
+                echo "v$version is already released: nothing to publish"
+              elif printf '%s' "$out" | grep -q 'Not Found'; then
+                release=true
+              else
+                printf '%s\n' "$out" >&2; exit 1
+              fi
+            fi
+          fi
+          build=true
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$release" != true ]; then build=false; fi
+          echo "first heading: $heading -> version '${version}', release=$release, build=$build"
+          { echo "build=$build"; echo "release=$release"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
+          { echo "### Plan"; echo "First CHANGELOG heading: \`$heading\`"; echo; echo "build=$build release=$release version=$version"; } >> "$GITHUB_STEP_SUMMARY"
+
+  orchestrator:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    outputs:
+      present: ${{ steps.find.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          if [ -d builder/cmd/infected-build ]; then echo present=true >> "$GITHUB_OUTPUT"
+          else
+            echo present=false >> "$GITHUB_OUTPUT"
+            echo "::warning title=No orchestrator::builder/cmd/infected-build does not exist on this branch: the kits are built WITHOUT the infected-build program (smoke test and compare still run)"
+          fi
+      - uses: actions/setup-go@v5
+        if: steps.find.outputs.present == 'true'
+        with:
+          go-version: '1.20.14'
+          cache: false
+      - name: Build infected-build for the four computers
+        if: steps.find.outputs.present == 'true'
+        working-directory: builder
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          go version
+          for t in windows/amd64 darwin/amd64 darwin/arm64 linux/amd64; do
+            os="${t%/*}"; arch="${t#*/}"; exe=""; [ "$os" = windows ] && exe=".exe"
+            echo "== $os/$arch"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "$RUNNER_TEMP/orchestrator/$os-$arch/infected-build$exe" ./cmd/infected-build
+          done
+          ls -lR "$RUNNER_TEMP/orchestrator"
+      - uses: actions/upload-artifact@v4
+        if: steps.find.outputs.present == 'true'
+        with:
+          name: orchestrator
+          path: ${{ runner.temp }}/orchestrator
+          retention-days: 7
+
+  target:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: VitaSDK (pinned)
+        run: |
+          .github/scripts/fetch-vitasdk.sh x86_64-linux-gnu "$RUNNER_TEMP/sdk"
+          echo "VITASDK=$RUNNER_TEMP/sdk/vitasdk" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/sdk/vitasdk/bin" >> "$GITHUB_PATH"
+      - name: Tools
+        run: sudo python3 -m pip install Pillow && cmake --version | head -1 && python3 --version
+      # The third-party libraries (vitaGL, FFmpeg, ...) take about ten minutes; they depend only on the SDK and on vita/scripts.
+      - name: Libraries from cache
+        id: sysroot
+        uses: actions/cache/restore@v4
+        with:
+          path: vita/sysroot
+          key: sysroot-v1-sdk-20260926.790.1-${{ hashFiles('vita/scripts/**') }}
+      - name: Build the libraries
+        if: steps.sysroot.outputs.cache-hit != 'true'
+        run: |
+          vita/scripts/fetch-third-party.sh
+          vita/scripts/build-sysroot.sh
+      - name: Keep the libraries for next time
+        if: steps.sysroot.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vita/sysroot
+          key: ${{ steps.sysroot.outputs.cache-primary-key }}
+      - name: PortableKit
+        run: scripts/get-portablekit.sh
+      - name: Target part of the kit
+        run: |
+          bash builder/kit/make-kit.sh target --sdk "$VITASDK" --sysroot vita/sysroot --repo . \
+               --out "$RUNNER_TEMP/target" --work "$RUNNER_TEMP/target-work"
+          { echo "### Target part"; du -sh "$RUNNER_TEMP"/target/* | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: target-part
+          path: ${{ runner.temp }}/target
+          retention-days: 7
+
+  host:
+    needs: [plan, orchestrator, target]
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux,     runner: ubuntu-22.04,   triple: x86_64-linux-gnu,    os: linux,   arch: amd64, gokey: linux-amd64,   exe: '' }
+          - { name: windows,   runner: windows-2022,   triple: x86_64-w64-mingw32,  os: windows, arch: amd64, gokey: windows-amd64, exe: '.exe' }
+          - { name: mac-intel, runner: macos-15-intel, triple: x86_64-apple-darwin, os: mac,     arch: amd64, gokey: darwin-amd64,  exe: '' }
+          - { name: mac-arm,   runner: macos-14,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '' }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      KIT_FILE: Infected-Vita-builder-${{ matrix.name }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python 3 under the name python3 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          command -v python3 >/dev/null 2>&1 || {
+            mkdir -p "$RUNNER_TEMP/shim"
+            printf '#!/bin/sh\nexec python "$@"\n' > "$RUNNER_TEMP/shim/python3"
+            echo "$(cygpath -u "$RUNNER_TEMP")/shim" >> "$GITHUB_PATH"
+          }
+          python --version
+      - name: Folders
+        run: |
+          T="$RUNNER_TEMP"; [ "$RUNNER_OS" = Windows ] && T="$(cygpath -u "$RUNNER_TEMP")"
+          echo "T=$T" >> "$GITHUB_ENV"
+          bash --version | head -1
+      - name: VitaSDK for this computer (pinned)
+        run: .github/scripts/fetch-vitasdk.sh "${{ matrix.triple }}" "$T/sdk"
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-part
+          path: ${{ runner.temp }}/target
+      - uses: actions/download-artifact@v4
+        if: needs.orchestrator.outputs.present == 'true'
+        with:
+          name: orchestrator
+          path: ${{ runner.temp }}/orchestrator
+      - name: Host part of the kit
+        run: |
+          extra=()
+          # macOS: programs are copied as they are (a stripped Mach-O would lose its signature, which Apple silicon requires)
+          [ "${{ matrix.os }}" = mac ] && extra=(--strip /usr/bin/true)
+          bash builder/kit/make-kit.sh host --target-dir "$T/target" --out "$T/kit" --host-sdk "$T/sdk/vitasdk" \
+               --host-os "${{ matrix.os }}" --host-arch "${{ matrix.arch }}" ${extra[@]+"${extra[@]}"}
+      - name: The infected-build program
+        run: |
+          src="$T/orchestrator/${{ matrix.gokey }}/infected-build${{ matrix.exe }}"
+          if [ -f "$src" ]; then
+            cp "$src" "$T/kit/infected-build${{ matrix.exe }}"; chmod 755 "$T/kit/infected-build${{ matrix.exe }}"
+            ls -l "$T/kit/infected-build${{ matrix.exe }}"
+          else
+            echo "::warning title=No infected-build::the ${{ matrix.name }} kit is built without the infected-build program (builder/cmd/infected-build is absent on this branch)"
+          fi
+      - name: Pack
+        run: |
+          mkdir -p "$T/out"
+          python3 -I .github/scripts/pack-kit.py "$T/kit" "$T/out/$KIT_FILE" | tee "$T/pack.log"
+          rm -rf "$T/kit"
+      # The unpacked archive, in a fresh folder with spaces in its name, is what is tested: this is what the installer will have.
+      - name: Smoke test (unpacked kit, no disc)
+        run: |
+          S="$T/smoke test"; rm -rf "$S"; mkdir -p "$S/the kit"
+          tar -xzf "$T/out/$KIT_FILE" -C "$S/the kit"
+          python3 -I .github/scripts/smoke-kit.py "$S/the kit" "$S/work dir" "$S/out dir" --jobs 2 | tee "$T/smoke.log"
+          mkdir -p "$T/result"
+          {
+            echo "kit ${{ matrix.name }}"
+            echo "kit-sha256 $(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$T/out/$KIT_FILE")"
+            echo "kit-bytes $(python3 -I -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$T/out/$KIT_FILE")"
+            grep -E '^(segment [0-9]|(segments|eboot|vpk)-sha256 )' "$T/smoke.log"
+          } > "$T/result/${{ matrix.name }}.txt"
+          cat "$T/result/${{ matrix.name }}.txt"
+      # When the program exists and can build from already generated C++ (--gen DIR, see the report), its result must be the same
+      # as the direct tool calls above made from the same folders.
+      - name: Smoke test with infected-build
+        run: |
+          S="$T/smoke test"; P="$S/the kit/infected-build${{ matrix.exe }}"
+          if [ ! -f "$P" ]; then echo "no infected-build in this kit: skipped"; exit 0; fi
+          "$P" --help > "$T/help.txt" 2>&1 || true
+          if ! grep -q -- '--gen' "$T/help.txt"; then echo "infected-build has no --gen DIR yet: skipped"; cat "$T/help.txt" | head -20; exit 0; fi
+          rm -rf "$S/work dir" "$S/out dir"
+          "$P" --gen .github/smoke/gen --work "$S/work dir" --out "$S/out dir" --jobs 2 --keep
+          python3 -I - "$S/out dir/infected.vpk" "$T/result/${{ matrix.name }}.txt" <<'PY'
+          import hashlib, sys, zipfile
+          got = hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read('eboot.bin')).hexdigest()
+          want = [l.split()[1] for l in open(sys.argv[2]) if l.startswith('eboot-sha256 ')][0]
+          print('infected-build eboot.bin', got, '\ntool calls   eboot.bin', want)
+          if got != want:
+              print('::warning title=infected-build differs::eboot.bin of infected-build differs from the direct tool calls in the same folders')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kit-${{ matrix.name }}
+          path: ${{ runner.temp }}/out/${{ env.KIT_FILE }}
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-out-${{ matrix.name }}
+          path: ${{ runner.temp }}/smoke test/out dir
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.name }}
+          path: ${{ runner.temp }}/result
+          retention-days: 14
+
+  compare:
+    needs: host
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+      - name: Every kit must make the same program
+        run: |
+          python3 -I - <<'PY'
+          import glob, os, sys
+          rows = {}
+          for p in sorted(glob.glob('results/*/*.txt')):
+              lines = open(p).read().splitlines()
+              d = dict(l.split(None, 1) for l in lines if l.strip() and not l.startswith('segment '))
+              rows[d['kit'].strip()] = {k: v.strip() for k, v in d.items()}
+              rows[d['kit'].strip()]['segments'] = [l for l in lines if l.startswith('segment ')]
+          names = ['linux', 'windows', 'mac-intel', 'mac-arm']
+          missing = [n for n in names if n not in rows]
+          out = ['| kit | size | segments-sha256 | eboot.bin sha256 |', '|---|---|---|---|']
+          for n in names:
+              r = rows.get(n, {})
+              out.append('| %s | %.1f MB | `%s` | `%s` |' % (n, int(r.get('kit-bytes', 0)) / 1e6, r.get('segments-sha256', '-')[:16], r.get('eboot-sha256', '-')[:16]))
+          text = '\n'.join(out)
+          print(text)
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('### Kits and cross-host comparison\n\n' + text + '\n\nThe program (every loadable segment of the Sony ELF, from the same synthetic input) must be identical; eboot.bin as a whole also holds the build folder\'s name in its debug info, so it differs from host to host.\n')
+          if missing:
+              sys.exit('no result from: %s' % ', '.join(missing))
+          if len({rows[n]['segments-sha256'] for n in names}) != 1:
+              for n in names:
+                  print('--', n); print('\n'.join(rows[n]['segments']))
+              sys.exit('FAIL: the four kits did not make the same program')
+          print('OK: all four kits made the same program')
+          PY
+
+  release:
+    needs: [plan, host, compare]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kit-*
+          merge-multiple: true
+          path: kits
+      - name: Release
+        run: |
+          version="${{ needs.plan.outputs.version }}"; tag="v$version"
+          ls -l kits
+          if out="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2>&1)"; then echo "$tag exists: leaving it alone"; exit 0; fi
+          printf '%s' "$out" | grep -q 'Not Found' || { printf '%s\n' "$out" >&2; exit 1; }
+          python3 -I .github/scripts/make-manifest.py kits release
+          cp kits/*.tar.gz release/
+          awk '/^## /{n++; next} n==1' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "---"
+            echo "These files are not the game. The CBOC Vita Installer downloads the kit for your computer and builds Infected from your own disc on it; nothing leaves your computer."
+          } >> notes.md
+          gh release create "$tag" release/* --draft --target "$GITHUB_SHA" --title "Infected $version" --notes-file notes.md
+          gh release edit "$tag" --draft=false --latest

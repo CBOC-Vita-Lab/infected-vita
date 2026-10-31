@@ -1,0 +1,46 @@
+name: CI
+
+# Cheap checks of the builder (the Go program and the kit scripts). The kits themselves are built by kits.yml.
+on:
+  pull_request:
+  push:
+    branches: ['builder*']
+    paths: ['builder/**', '.github/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.20.14'      # the oldest Go the builder supports (Windows 7+, macOS 10.13+ at run time)
+          cache: false
+      - name: vet
+        working-directory: builder
+        run: go vet ./...
+      - name: test
+        working-directory: builder
+        run: go test ./...
+
+  scripts:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse and are free of errors
+        run: |
+          for f in builder/kit/*.sh .github/scripts/*.sh scripts/*.sh vita/scripts/*.sh vita/app/build.sh; do bash -n "$f"; done
+          shellcheck --severity=error builder/kit/*.sh .github/scripts/*.sh
+      - name: Python scripts compile
+        run: python3 -m py_compile builder/kit/kit_tool.py .github/scripts/*.py
