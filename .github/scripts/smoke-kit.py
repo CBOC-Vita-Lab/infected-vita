@@ -143,8 +143,12 @@ def main():
     # ---- vita-elf-create, vita-make-fself
     log('== vita-elf-create, vita-make-fself')
     velf, eboot = os.path.join(work, 'infected.velf'), os.path.join(out, 'eboot.bin')
-    run('elf-create', [tool('elfCreate')] + [x.replace('{elf}', elf).replace('{velf}', velf) for x in r['elfCreate']['args']], kit)
-    run('fself', [tool('fself')] + [x.replace('{velf}', velf).replace('{eboot}', eboot) for x in r['fself']['args']], kit)
+    # vita-elf-create writes the module name (the ELF's file name) into the program by splitting the path at '/': on Windows a path
+    # with backslashes would give "\infected.elf" instead of "infected.elf", so these three paths are given with forward slashes
+    # (Windows accepts them). The builder must do the same.
+    fw = lambda p: p.replace('\\', '/')
+    run('elf-create', [tool('elfCreate')] + [x.replace('{elf}', fw(elf)).replace('{velf}', fw(velf)) for x in r['elfCreate']['args']], kit)
+    run('fself', [tool('fself')] + [x.replace('{velf}', fw(velf)).replace('{eboot}', fw(eboot)) for x in r['fself']['args']], kit)
 
     # ---- the package
     log('== package')
