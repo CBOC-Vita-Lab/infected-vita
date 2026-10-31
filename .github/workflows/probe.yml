@@ -41,8 +41,9 @@ jobs:
           du -sh "$root"; du -sh "$root"/* | sort -h
           "$root/bin/arm-vita-eabi-gcc" --version | head -1
           ls "$root/bin" | tr '\n' ' '; echo
-          ls "$root"/libexec/gcc/arm-vita-eabi/*/ || true
-          for f in "$root"/bin/arm-vita-eabi-g++* "$root"/bin/arm-vita-eabi-as* "$root"/bin/vita-elf-create* "$root"/bin/vita-make-fself* "$root"/libexec/gcc/arm-vita-eabi/*/cc1plus* "$root"/libexec/gcc/arm-vita-eabi/*/lto1* "$root"/libexec/gcc/arm-vita-eabi/*/liblto_plugin* "$root"/arm-vita-eabi/bin/ld*; do
+          ls "$root"/lib/gcc/arm-vita-eabi/*/ || true
+          set +e
+          for f in "$root"/bin/arm-vita-eabi-g++* "$root"/bin/arm-vita-eabi-as* "$root"/bin/vita-elf-create* "$root"/bin/vita-make-fself* "$root"/lib/gcc/arm-vita-eabi/*/cc1plus* "$root"/lib/gcc/arm-vita-eabi/*/lto1* "$root"/lib/gcc/arm-vita-eabi/*/liblto_plugin* "$root"/arm-vita-eabi/bin/ld* "$root"/lib/bfd-plugins/*; do
             echo "== $f"; ls -la "$f"
             case "$RUNNER_OS" in
               Linux) file "$f"; ldd "$f" || true ;;
