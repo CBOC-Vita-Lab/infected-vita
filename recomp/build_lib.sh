@@ -55,6 +55,14 @@ case $TARGET in
   *) echo "unknown target $TARGET" >&2; exit 2 ;;
 esac
 if [ "${LEAN_PRINT_FLAGS:-0}" = 1 ]; then printf '%s\n' "$FLAGS"; exit 0; fi
+# What builder/kit does about the machine's folders, so that these objects equal the ones infected-build compiles: the toolchain's
+# system headers get a fixed name (the kit maps its own folder, in which the SDK sits as toolchain/, to /kit), and on Linux GCC is told
+# that the working directory reads /proc/self/cwd (GCC streams the working directory into LTO objects and takes $PWD for it).
+PWDFIX=
+if [ -n "${SUFFIX:-}" ]; then
+  FLAGS="$FLAGS -ffile-prefix-map=$SDK=/kit/toolchain"
+  [ "$(uname -s)" = Linux ] && PWDFIX="PWD=/proc/self/cwd"
+fi
 [ -n "${SUFFIX:-}" ] && OUT=$OUT/lto
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
@@ -71,7 +79,7 @@ for f in "$GEN"/lean_[0-9]*.cpp "$GEN"/lean_table.cpp; do
   if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$HERE/lean_abi.h" -nt "$o" ] || [ "$HERE/lean_vfpu.h" -nt "$o" ] || [ "$HERE/lean_vfpu_fast.h" -nt "$o" ] || [ "$GEN/lean_decls.h" -nt "$o" ]; then
     echo "$f"
   fi
-done | nice -n 10 xargs -P "$JOBS" -I{} sh -c 'f={}; b=$(basename $f .cpp); o='"$OUT"'/$b.o; s=$(date +%s); seed=; src=$f; if [ "'"${SUFFIX:-}"'" = _lto ]; then seed=-frandom-seed=$b; src=gen/$b.cpp; cd '"$STAGE"'; fi; '"$CXX $FLAGS"' $seed -c $src -o $o || exit 255; echo "$(basename $f) $(( $(date +%s) - s ))s" >> '"$OUT"'/compile_times.txt'
+done | nice -n 10 xargs -P "$JOBS" -I{} sh -c 'f={}; b=$(basename $f .cpp); o='"$OUT"'/$b.o; s=$(date +%s); seed=; src=$f; if [ "'"${SUFFIX:-}"'" = _lto ]; then seed=-frandom-seed=$b; src=gen/$b.cpp; cd '"$STAGE"'; fi; '"$PWDFIX $CXX $FLAGS"' $seed -c $src -o $o || exit 255; echo "$(basename $f) $(( $(date +%s) - s ))s" >> '"$OUT"'/compile_times.txt'
 rm -f "$OUT/liblean_$TARGET${SUFFIX:-}.a"
 "$AR" rcs "$OUT/liblean_$TARGET${SUFFIX:-}.a" "$OUT"/lean_[0-9]*.o "$OUT"/lean_table.o
 echo "built $OUT/liblean_$TARGET${SUFFIX:-}.a"

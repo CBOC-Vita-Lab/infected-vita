@@ -6,9 +6,10 @@
   recipe      write kit.json
   host-copy   copy the host programs of a VitaSDK tree of one host OS into the kit's toolchain/
   trace       turn strace logs into lists/target-files.txt and lists/host-files.txt
+  pack        write the kit as a reproducible .tar.gz (flat, kit.json first, exec bits and symlinks kept)
   manifest    sha256 of every file of a folder (used by recipe)
 """
-import argparse, glob, hashlib, json, os, re, shlex, shutil, stat, subprocess, sys
+import argparse, glob, gzip, hashlib, json, os, re, shlex, shutil, stat, subprocess, sys, tarfile
 
 # --------------------------------------------------------------------------------------------------------- small helpers
 def sha256(path):
@@ -63,7 +64,7 @@ def cmd_game_link(a):
     shutil.rmtree(os.path.join(kit, 'game', 'link'), ignore_errors=True)
     os.makedirs(out_obj); os.makedirs(out_lib)
     ldirs = [t[2:] for t in toks if t.startswith('-L')]
-    args, copied, libdir_emitted = [], {}, False
+    args, copied, libdir_emitted, have_seed = [], {}, False, False
     i = 1                                   # toks[0] is the compiler
     while i < len(toks):
         t = toks[i]
@@ -71,6 +72,8 @@ def cmd_game_link(a):
             args += ['-o', '{out}']; i += 2; continue
         if t.startswith('-flto='):
             args.append('-flto={jobs}'); i += 1; continue
+        if t.startswith('-frandom-seed='):
+            have_seed = True
         if t.startswith('-L'):
             if not libdir_emitted:
                 args.append('-Lgame/link/lib'); libdir_emitted = True
@@ -101,6 +104,11 @@ def cmd_game_link(a):
         args.append(t); i += 1
     if '{lean}' not in args or '{out}' not in args:
         die('link.txt has no lean library or no -o: %s' % link)
+    if not have_seed:
+        # vita/app/CMakeLists.txt passes -frandom-seed=infected with the LTO link (a build tree made before that change lacks it): without
+        # a fixed seed GCC names the LTO partitions from the clock and two links of the same objects differ in a few hundred bytes
+        args.insert(args.index('-flto={jobs}') + 1, '-frandom-seed=infected')
+        print('note: link.txt had no -frandom-seed; added -frandom-seed=infected to link.args')
     with open(os.path.join(kit, 'game', 'link', 'link.args'), 'w') as f:
         f.write('\n'.join(args) + '\n')
     print('game/link: %d link arguments, %d objects, %d libraries' % (len(args), sum(len(fs) for _, _, fs in os.walk(out_obj)), len(copied)))
@@ -174,7 +182,14 @@ def cmd_recipe(a):
         if f.startswith('-I'):
             continue
         cflags.append(f)
-    compile_args = cflags + ['-frandom-seed={stem}', '-Iinc', '-Igen', '-c', 'gen/{stem}.cpp', '-o', 'obj/{stem}.o']
+    # {kit} and {work} are the absolute folders of this run; mapping them to fixed names keeps them out of the LTO streams
+    # (a system header is streamed with its absolute path, the compile happens in the work folder), so the objects and the
+    # final link do not depend on where the player unpacked the kit or where the work folder is
+    pmap = ['-ffile-prefix-map={kit}=/kit', '-ffile-prefix-map={work}=/work']
+    # -g0 at the link: link.args carries CMake's -g, which makes the LTO link write DWARF (28 MB of it, with the folder names in it) that
+    # vita-elf-create then has to carry; without it the ELF is half the size and has no folder names. (Code generation does depend on -g:
+    # the eboot of a -g link differs from a -g0 one in a few hundred bytes of branch stubs.)
+    compile_args = cflags + ['-frandom-seed={stem}'] + pmap + ['-Iinc', '-Igen', '-c', 'gen/{stem}.cpp', '-o', 'obj/{stem}.o']
     # vita-elf-create / vita-make-fself exactly as CMake runs them
     velf = parse_cmd(os.path.join(a.build, 'CMakeFiles', 'infected-velf.dir', 'build.make'), 'vita-elf-create')
     fself = parse_cmd(os.path.join(a.build, 'CMakeFiles', 'infected.self-self.dir', 'build.make'), 'vita-make-fself')
@@ -196,21 +211,26 @@ def cmd_recipe(a):
                   'readelf': tool('arm-vita-eabi-readelf'), 'elfCreate': tool('vita-elf-create'), 'fself': tool('vita-make-fself')},
         'profile': 'game/profile.json',
         'placeholders': {
-                         '{stem}': 'a generated file name without .cpp (also the fixed -frandom-seed: LTO objects are only reproducible with one)', '{objs}': 'all objects (work/obj), in the order of "archive.order"',
+                         '{stem}': 'a generated file name without .cpp (also the fixed -frandom-seed: LTO objects are only reproducible with one)',
+                         '{kit}': 'the absolute folder of the kit', '{work}': 'the absolute work folder', '{objs}': 'all objects (work/obj), in the order of "archive.order"',
                          '{lib}': 'the game archive made by "archive"', '{lean}': 'the same archive in link.args',
                          '{out}': 'the output ELF', '{jobs}': 'LTO partitions compiled in parallel (-flto=N)',
                          '{elf}': 'the linked ELF', '{velf}': 'the Sony ELF', '{eboot}': 'eboot.bin'},
         'compile': {'tool': 'cxx', 'args': compile_args, 'cwd': 'work',
                     'stage': {'inc': 'copy of the kit folder game/include', 'gen': 'the generated C++ (lean_NNN.cpp, lean_table.cpp, lean_decls.h)',
                               'obj': 'empty folder for the objects'},
-                    'why': 'cwd is a work folder holding inc/, gen/ and obj/, with relative names, because GCC streams the names of the headers, the '
-                           'absolute working directory and the absolute location of the toolchain into the LTO objects, and the final link orders a few '
-                           'branch stubs by them. The eboot.bin is the same for the same toolchain folder and work folder; for other folders it differs '
-                           'in some hundred bytes of .text (branch stub order), nothing else. -frandom-seed is needed for the same reason (the clock).',
+                    'why': 'cwd is a work folder holding inc/, gen/ and obj/, and every name on the command line is relative to it: GCC streams file names into the '
+                           'LTO objects and the final link orders a few branch stubs by them. -ffile-prefix-map={kit}=/kit gives the system headers of the '
+                           'toolchain a fixed name. GCC also streams the absolute working directory, unmapped (no prefix map reaches it); on Linux the builder '
+                           'sets PWD=/proc/self/cwd, which GCC accepts as the working directory and which reads the same on every machine. -frandom-seed is '
+                           'needed because the seed would come from the clock otherwise. With these the eboot.bin is byte-identical for any kit folder and any '
+                           'work folder on Linux. On macOS and Windows the working directory still ends up in the objects: the eboot.bin then differs between '
+                           'work folders in some hundred bytes of .text (branch stub order), nothing else.',
                     'sources': ['lean_[0-9]*.cpp', 'lean_table.cpp'], 'parallel': True},
         'archive': {'tool': 'ar', 'args': ['rcs', '{lib}', '{objs}'], 'order': ['lean_[0-9]*.o', 'lean_table.o'],
                     'deleteFirst': True},
-        'link': {'tool': 'cxx', 'argsFile': 'game/link/link.args', 'lean': '{lean}', 'out': '{out}', 'jobs': 2,
+        'requires': {'macos': 14},
+        'link': {'tool': 'cxx', 'argsFile': 'game/link/link.args', 'lean': '{lean}', 'out': '{out}', 'jobs': 2, 'extraArgs': pmap + ['-g0'],
                  'tempDirEnv': 'TMPDIR', 'tempDirNote': 'the LTO link writes about 50 MB of temporary files; point TMPDIR (TEMP and TMP on Windows) at the work folder'},
         'postLinkCheck': {'tool': 'nm', 'args': ['{out}'], 'failIfLineMatches': '^ +w (pthread_|sched_)',
                           'message': 'pthread functions are weak and undefined: add them to the -u list (vita/app/CMakeLists.txt)'},
@@ -398,6 +418,43 @@ def cmd_zip(a):
                 z.writestr(zi, f.read(), zipfile.ZIP_DEFLATED, 9)
     print('%s: %d files, %d bytes' % (a.out, len(names), os.path.getsize(a.out)))
 
+def cmd_pack(a):
+    """kit folder -> .tar.gz. Flat (no top folder), kit.json first, then the rest in name order; directories included; modes kept (exec
+    bits), symlinks kept, owner root, time fixed: the same kit gives the same bytes."""
+    root = os.path.abspath(a.kit)
+    if a.exe:
+        name = 'infected-build.exe' if json.load(open(os.path.join(root, 'kit.json'))).get('os') == 'windows' else 'infected-build'
+        shutil.copyfile(a.exe, os.path.join(root, name))
+        os.chmod(os.path.join(root, name), 0o755)
+    entries = []
+    for dp, dn, fn in os.walk(root):
+        dn.sort()
+        for n in dn + sorted(fn):
+            entries.append(os.path.relpath(os.path.join(dp, n), root))
+    entries.sort(key=lambda r: (r != 'kit.json', r))
+    if os.path.exists(a.out): os.remove(a.out)
+    with open(a.out, 'wb') as raw:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=raw, compresslevel=9, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tf:
+                for rel in entries:
+                    p = os.path.join(root, rel)
+                    st = os.lstat(p)
+                    ti = tarfile.TarInfo(rel.replace(os.sep, '/'))
+                    ti.mtime = 1767225600                       # 2026-01-01 00:00:00 UTC
+                    ti.uid = ti.gid = 0; ti.uname = ti.gname = ''
+                    if stat.S_ISLNK(st.st_mode):
+                        ti.type = tarfile.SYMTYPE; ti.linkname = os.readlink(p); ti.mode = 0o777
+                        tf.addfile(ti)
+                    elif stat.S_ISDIR(st.st_mode):
+                        ti.type = tarfile.DIRTYPE; ti.mode = 0o755
+                        tf.addfile(ti)
+                    else:
+                        ti.type = tarfile.REGTYPE; ti.size = st.st_size
+                        ti.mode = 0o755 if st.st_mode & stat.S_IXUSR else 0o644
+                        with open(p, 'rb') as f:
+                            tf.addfile(ti, f)
+    print('%s: %d entries, %d bytes' % (a.out, len(entries), os.path.getsize(a.out)))
+
 def cmd_manifest(a):
     for dp, dn, fn in os.walk(a.dir):
         for n in sorted(fn):
@@ -422,9 +479,10 @@ def main():
     p.add_argument('--exclude', default=None); p.add_argument('logs', nargs='+')
     p = sub.add_parser('manifest'); p.add_argument('dir')
     p = sub.add_parser('zip'); p.add_argument('--kit', required=True); p.add_argument('--out', required=True); p.add_argument('--top', default='')
+    p = sub.add_parser('pack'); p.add_argument('--kit', required=True); p.add_argument('--out', required=True); p.add_argument('--exe', default=None)
     a = ap.parse_args()
     {'game-link': cmd_game_link, 'game-vpk': cmd_game_vpk, 'pad-object': cmd_pad_object, 'recipe': cmd_recipe, 'finalize': cmd_finalize, 'host-copy': cmd_host_copy,
-     'trace': cmd_trace, 'zip': cmd_zip, 'manifest': cmd_manifest}[a.cmd](a)
+     'trace': cmd_trace, 'zip': cmd_zip, 'pack': cmd_pack, 'manifest': cmd_manifest}[a.cmd](a)
 
 if __name__ == '__main__':
     main()

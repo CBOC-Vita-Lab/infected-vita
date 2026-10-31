@@ -45,9 +45,9 @@ run() {    # run LABEL cmd args...
   local label=$1; shift
   if [ -n "$KIT_TRACE_DIR" ]; then
     mkdir -p "$KIT_TRACE_DIR"
-    nice -n 10 strace -f -o "$KIT_TRACE_DIR/$label.log" -e trace=execve,openat,open,stat,newfstatat,statx,access,faccessat2,readlink,readlinkat "$@"
+    nice -n 10 strace -f -o "$KIT_TRACE_DIR/$label.log" -e trace=execve,openat,open,stat,newfstatat,statx,access,faccessat2,readlink,readlinkat env PWD=/proc/self/cwd "$@"
   else
-    nice -n 10 "$@"
+    nice -n 10 env PWD=/proc/self/cwd "$@"      # the builder does the same: GCC streams $PWD into the LTO objects; this reads the same everywhere
   fi
 }
 sub() {    # substitute placeholders: sub KEY=VALUE... < args
@@ -73,10 +73,11 @@ echo "   ${#srcs[@]} files"
 mkdir -p "$WORK/inc" "$WORK/gen" "$WORK/obj"
 cp -R "$KIT/game/include/." "$WORK/inc/"; cp -R "$GEN/." "$WORK/gen/"     # the Go program writes the generated files straight into work/gen
 export -f run
+export KIT WORK
 cd "$WORK"
 printf '%s\0' "${srcs[@]}" | xargs -0 -P "$JOBS" -I{} bash -c '
   stem=$(basename "$1" .cpp); shift
-  args=(); for a in "$@"; do a=${a//\{stem\}/$stem}; args+=("$a"); done
+  args=(); for a in "$@"; do a=${a//\{stem\}/$stem}; a=${a//\{kit\}/$KIT}; a=${a//\{work\}/$WORK}; args+=("$a"); done
   run "compile-$stem" '"$CXX"' "${args[@]}"' _ {} "${CARGS[@]}"
 cd "$KIT"
 took
@@ -92,7 +93,7 @@ fi
 
 # ------------------------------------------------------------------------------------------------------------- link
 link() {   # link LABEL PADOBJ
-  mapfile -t LARGS < <(sub lean="$LIB" out="$WORK/infected.elf" jobs="$JOBS" < game/link/link.args)
+  mapfile -t LARGS < <( { cat game/link/link.args; kjl "r['link'].get('extraArgs', [])"; } | sub lean="$LIB" out="$WORK/infected.elf" jobs="$JOBS" kit="$KIT" work="$WORK")
   if [ -n "${2:-}" ]; then
     local pobj; pobj=$(kj "r['textPad']['object']")
     for i in "${!LARGS[@]}"; do [ "${LARGS[$i]}" = "$pobj" ] && LARGS[$i]=$2; done

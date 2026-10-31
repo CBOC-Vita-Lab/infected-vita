@@ -10,10 +10,11 @@
 #   HOST part (programs that run on the player's computer; copied from a VitaSDK tree OF THAT OS):
 #       the programs and data files in lists/host-files.txt, with the OS's file names (see below)
 #
-#   make-kit.sh target --sdk SDK --sysroot DIR --repo DIR --out DIR [--build-dir DIR] [--text-pad N] [--work DIR]
+#   make-kit.sh target --sdk SDK --sysroot DIR --repo DIR --out DIR [--build-dir DIR] [--shader-cache DIR] [--text-pad N] [--work DIR]
 #   make-kit.sh host   --target-dir DIR --out DIR [--host-sdk DIR] [--host-os linux|windows|mac] [--host-arch amd64|arm64] [--strip PROG]
-#   make-kit.sh zip    --kit DIR --out FILE.zip
-#   make-kit.sh all    --sdk SDK --sysroot DIR --repo DIR --out FILE.zip [--work DIR]        (target + host for this Linux + zip)
+#   make-kit.sh pack   --kit DIR --out FILE.tar.gz [--exe infected-build]                      (the archive that is published; `zip` is the old name)
+#   make-kit.sh all    --sdk SDK --sysroot DIR --repo DIR --out FILE.tar.gz [--work DIR] [--exe FILE] [--shader-cache DIR]
+#                                                                                              (target + host for this Linux + pack)
 #   make-kit.sh trace  --target-dir DIR --sdk SDK --gen DIR [--work DIR]                     (rewrites lists/*.txt from strace logs)
 #
 #   --sdk         the VitaSDK tree (the "vitasdk" folder) used for the target part; --host-sdk defaults to it.
@@ -23,6 +24,8 @@
 #   --build-dir   an existing, built CMake tree of vita/app (vita/app/build.sh --lean-lib ...) to take objects and VPK files from;
 #                 without it the script builds one with a stub game library (no disc is needed or touched; the link of the stub is
 #                 only there to produce the object files and link.txt).
+#   --shader-cache DIR   a vitaGL shader cache (the folder that holds v3/) to ship in the VPK, passed on to vita/app/build.sh (target, without --build-dir).
+#   --exe FILE    pack: put this infected-build program into the kit folder first (as infected-build, or infected-build.exe for a windows kit).
 #   --text-pad    bytes of .text padding the real game link needs (default: builder/kit/text-pad.txt).
 #
 # Host file names per OS (lists/host-files.txt has one entry per file, keyed by the Linux path relative to the VitaSDK root):
@@ -35,13 +38,13 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOOL="python3 -I $HERE/kit_tool.py"
 cmd=${1:-}; shift || true
-SDK=""; HOST_SDK=""; SYSROOT=""; REPO=""; OUT=""; BUILD=""; TEXTPAD=""; WORK=""; TARGET_DIR=""; HOST_OS=""; HOST_ARCH=""; KIT=""; GEN=""; STRIP=""
+SDK=""; HOST_SDK=""; SYSROOT=""; REPO=""; OUT=""; BUILD=""; TEXTPAD=""; WORK=""; TARGET_DIR=""; HOST_OS=""; HOST_ARCH=""; KIT=""; GEN=""; STRIP=""; SHADER_CACHE=""; EXE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --sdk) SDK=$2; shift 2;; --host-sdk) HOST_SDK=$2; shift 2;; --sysroot) SYSROOT=$2; shift 2;; --repo) REPO=$2; shift 2;;
     --out) OUT=$2; shift 2;; --build-dir) BUILD=$2; shift 2;; --text-pad) TEXTPAD=$2; shift 2;; --work) WORK=$2; shift 2;;
     --target-dir) TARGET_DIR=$2; shift 2;; --host-os) HOST_OS=$2; shift 2;; --host-arch) HOST_ARCH=$2; shift 2;;
-    --kit) KIT=$2; shift 2;; --gen) GEN=$2; shift 2;; --strip) STRIP=$2; shift 2;;
+    --kit) KIT=$2; shift 2;; --gen) GEN=$2; shift 2;; --strip) STRIP=$2; shift 2;; --shader-cache) SHADER_CACHE=$2; shift 2;; --exe) EXE=$2; shift 2;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
@@ -68,7 +71,8 @@ do_target() {
     rm -f "$WORK/stub/liblean_stub_lto.a"; "$SDK/bin/arm-vita-eabi-ar" rcs "$WORK/stub/liblean_stub_lto.a" "$WORK/stub/stub.o"
     # same source paths in every build of the kit: the prefix map keeps the repository and work folder out of assert strings
     CFLAGS="-ffile-prefix-map=$REPO=/src -ffile-prefix-map=$WORK=/build" CXXFLAGS="-ffile-prefix-map=$REPO=/src -ffile-prefix-map=$WORK=/build" \
-      "$REPO/vita/app/build.sh" --lean-lib "$WORK/stub/liblean_stub_lto.a" --portablekit "$PK" --outdir "$WORK/build" --dist "$WORK/dist"
+      "$REPO/vita/app/build.sh" --lean-lib "$WORK/stub/liblean_stub_lto.a" --portablekit "$PK" --outdir "$WORK/build" --dist "$WORK/dist" \
+        ${SHADER_CACHE:+--shader-cache "$SHADER_CACHE"}
     BUILD=$WORK/build
   fi
   BUILD=$(abspath "$BUILD")
@@ -151,9 +155,9 @@ do_host() {
   du -sh "$OUT" "$OUT/toolchain" "$OUT/game" | cat
 }
 
-do_zip() {
-  [ -n "$KIT" ] && [ -n "$OUT" ] || { echo "zip needs --kit --out" >&2; exit 2; }
-  $TOOL zip --kit "$KIT" --out "$OUT"
+do_pack() {
+  [ -n "$KIT" ] && [ -n "$OUT" ] || { echo "pack needs --kit --out" >&2; exit 2; }
+  $TOOL pack --kit "$KIT" --out "$OUT" ${EXE:+--exe "$EXE"}
 }
 
 # ================================================================================================================ evidence
@@ -175,13 +179,13 @@ do_trace() {
 case "$cmd" in
   target) do_target;;
   host) do_host;;
-  zip) do_zip;;
+  pack|zip) do_pack;;
   trace) do_trace;;
   all)
-    [ -n "$OUT" ] || { echo "all needs --out FILE.zip" >&2; exit 2; }
-    zipout=$OUT
-    OUT=${WORK:-$(dirname "$zipout")/kit-work}/target; do_target
-    TARGET_DIR=$OUT; OUT=${WORK:-$(dirname "$zipout")/kit-work}/kit; do_host
-    KIT=$OUT; OUT=$zipout; do_zip;;
+    [ -n "$OUT" ] || { echo "all needs --out FILE.tar.gz" >&2; exit 2; }
+    packout=$OUT
+    OUT=${WORK:-$(dirname "$packout")/kit-work}/target; do_target
+    TARGET_DIR=$OUT; OUT=${WORK:-$(dirname "$packout")/kit-work}/kit; do_host
+    KIT=$OUT; OUT=$packout; do_pack;;
   *) sed -n 2,28p "$0"; exit 2;;
 esac

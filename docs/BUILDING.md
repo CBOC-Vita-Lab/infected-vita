@@ -1,8 +1,25 @@
 # Building the VPK from your own disc
 
 The package that runs on the Vita contains code translated from the game, so it cannot be shared and there is nothing to download.
-You build it once, on a PC, from your own copy of **Infected** (US, ULUS-10054, 1.02) as an ISO. Installing the result is
+You build it once, on a computer, from your own copy of **Infected** (US, ULUS-10054, 1.02) as an ISO. Installing the result is
 [`INSTALL.md`](../INSTALL.md).
+
+## The easy way
+
+You need no SDK, no compiler and no terminal.
+
+- **CBOC Vita Installer** (Windows, macOS, Linux): choose Infected, point it at your `Infected.iso`, and press the button. The installer
+  downloads the builder kit for your computer, builds the package (about 10 minutes on a computer with 2 cores, less with more) and installs it on your Vita.
+- **`infected-build`**, from the release page: download `Infected-Vita-builder-<your system>.tar.gz`, unpack it, and run
+  `infected-build Infected.iso` (on Windows you can also double-click `infected-build.exe` and drag the .iso onto the window).
+  It writes `infected.vpk` next to the .iso; copy that to your Vita and install it with VitaShell. It needs about 700 MB of free disk
+  space and 1.5 GB of memory for each compiler process it runs (it chooses how many from the free memory); macOS needs version 14 or newer.
+  How it works and how the kit is made: [`builder/README.md`](../builder/README.md).
+
+Both build the same package as the manual way below, from the same source, with the same compiler. The rest of this page is the manual
+way: it builds everything yourself, which you want when you change the source.
+
+## The manual way
 
 Sections 2 to 4 were run on a Linux x86-64 machine (2 cores, 7 GB of memory) from a clean copy of this repository on 23 Oct 2026, and the
 VPK they made has the program, the core-3 module, the shader list and the bubble art in it. Where a step has not
