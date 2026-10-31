@@ -52,12 +52,22 @@ jobs:
           "$P" --progress --gen .github/smoke/gen --work "$S/work dir" --out "$S/o" --jobs 2 --keep | tee "$T/progress.txt" | head -60
           echo "EBOOT $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest())' "$S/o/infected.vpk")"
           cat "$S/work dir/build.log" | grep -c "partitions\|ltrans" || true
-      - name: Kit in a folder with spaces and parentheses
+      - name: Kit in folders with odd characters
         run: |
-          S="$T/smoke test"; K2="$S/Kit B (2) & more/John Smith's kit"; mkdir -p "$K2"; cp -r "$S/the kit/." "$K2/"
-          rm -rf "$S/o2"
-          "$K2/infected-build${{ matrix.exe }}" --progress --gen .github/smoke/gen --out "$S/o2" --jobs 2 | tail -5
-          echo "EBOOT2 $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest())' "$S/o2/infected.vpk")"
+          S="$T/smoke test"
+          try() {
+            K2="$S/$1"; rm -rf "$S/$1" "$S/o2" "$S/w2"; mkdir -p "$K2"; cp -r "$S/the kit/." "$K2/"
+            if "$K2/infected-build${{ matrix.exe }}" --gen .github/smoke/gen --out "$S/o2" --work "$S/w2" --keep --jobs 2 > "$S/try.log" 2>&1; then
+              echo "OK   [$1] $(python3 -I -c 'import hashlib,sys,zipfile; print(hashlib.sha256(zipfile.ZipFile(sys.argv[1]).read("eboot.bin")).hexdigest()[:16])' "$S/o2/infected.vpk")"
+            else
+              echo "FAIL [$1]"; tail -3 "$S/try.log"; grep -v "^\$" "$S/w2/build.log" | tail -8 | cut -c1-400
+            fi
+          }
+          try "Kit B (2)/kit"
+          try "John Smith/kit"
+          try "Kit & more/kit"
+          try "John Smith's kit/kit"
+          try "Jos\u00e9 \u00c5ngstr\u00f6m/kit"
       - name: Kill the program while it compiles (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
