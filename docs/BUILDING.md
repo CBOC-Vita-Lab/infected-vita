@@ -1,25 +1,26 @@
 # Building the VPK from your own disc
 
 The package that runs on the Vita contains code translated from the game, so it cannot be shared and there is nothing to download.
-You build it once, on a computer, from your own copy of **Infected** (US, ULUS-10054, 1.02) as an ISO. Installing the result is
-[`INSTALL.md`](../INSTALL.md).
+You build it once, on a computer, from your own copy of **Infected** (US, ULUS-10054, 1.02) as an ISO. **Most people should use "The easy way"
+below.** The manual route further down is for developers. Installing the result by hand is [`INSTALL.md`](../INSTALL.md).
 
 ## The easy way
 
-You need no SDK, no compiler and no terminal.
+You need no SDK, no compiler, no Python and no terminal.
 
-- **CBOC Vita Installer** (Windows, macOS, Linux): choose Infected, point it at your `Infected.iso`, and press the button. The installer
-  downloads the builder kit for your computer, builds the package (about 10 minutes on a computer with 2 cores, less with more) and installs it on your Vita.
+- **CBOC Vita Installer** (version 2.0 or newer; Windows 64-bit, macOS 10.13+ on Intel and 11+ on Apple silicon, Linux 64-bit): choose Infected, point it at your `Infected.iso`
+  (it checks the disc at once), press **Install** and **Allow**. The installer downloads the builder kit for your computer once (40-50 MB), builds the package (about 10 minutes: 9 to 9.5 on a slow 2-core PC, less on most
+  computers) and installs it on your Vita. Nothing is uploaded. On another computer (32-bit or ARM Windows, ARM Linux) build on one of the above and choose the finished `infected.vpk`.
 - **`infected-build`**, from the release page: download `Infected-Vita-builder-<your system>.tar.gz`, unpack it, and run
   `infected-build Infected.iso` (on Windows you can also double-click `infected-build.exe` and drag the .iso onto the window).
   It writes `infected.vpk` next to the .iso; copy that to your Vita and install it with VitaShell. It needs about 700 MB of free disk
   space and 1.5 GB of memory for each compiler process it runs (it chooses how many from the free memory); macOS needs version 10.13 or newer on an Intel Mac and 11 or newer on an Apple silicon Mac.
   How it works and how the kit is made: [`builder/README.md`](../builder/README.md).
 
-Both build the same package as the manual way below, from the same source, with the same compiler. The rest of this page is the manual
-way: it builds everything yourself, which you want when you change the source.
+Both build the same package as the manual way below, from the same source, with the same compiler, and every system makes the byte-identical game.
+The rest of this page is the manual route, **for developers**: it builds everything yourself, which you want when you change the source.
 
-## The manual way
+## The manual way (for developers)
 
 Sections 2 to 4 were run on a Linux x86-64 machine (2 cores, 7 GB of memory) from a clean copy of this repository on 23 Oct 2026, and the
 VPK they made has the program, the core-3 module, the shader list and the bubble art in it. Where a step has not

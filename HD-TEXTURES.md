@@ -1,11 +1,11 @@
 # Optional HD Textures
 
-Skip this page for normal installation. HDcube is a **computer-side texture
-model**, not Vita software. Do not copy its `.pth` file to the console.
+**This is optional, and it is slow: making the packs takes hours on a PC.** Skip this page for a normal install; the game looks and runs
+well without them. HDcube is a **computer-side texture model**, not Vita software. Do not copy its `.pth` file to the console.
 
 ## Easiest Method
 
-The texture builder is included. First prepare PortableKit using
+The texture builder is part of this repository, so you need a copy of it, Python and a Linux-style shell. First prepare PortableKit using
 [Building](docs/BUILDING.md), then run this from the repository/package root:
 
 ```sh
@@ -44,6 +44,9 @@ from the author and follow the [model license](https://github.com/Venomalia/HDcu
 2. Copy your compatible generated pack into **`ux0:data/infected/`**, keeping
    its exact name: use generated `texpack_2x.bin` as-is. For the mixed Vita
    pack, copy `texpack_4x_mixed.bin` and name the copy `texpack_4x.bin`.
+   (The CBOC Vita Installer does this for you: choose `texpack_2x.bin` and
+   `texpack_4x_mixed.bin` where it asks, and it saves the mixed pack as
+   `texpack_4x.bin`.)
 3. Reopen Infected and check its HD texture setting; use `auto` to let the
    app select an available pack.
 

@@ -2,10 +2,34 @@
 
 ## Version 1.1 — (unreleased)
 
-**Smoother and smoother-looking, with nothing to set**
-- New anti-aliasing choice, **Auto**, now the default: the game turns on FXAA (a cheaper version than before) when the Vita's graphics chip has room and switches it off again the moment a scene needs the time, so edges are smoother without losing frames. The menu shows **Auto (on)** or **Auto (off)**.
+**The install update.** Your own disc in, a finished game on your Vita out, in about 10 minutes, and smoother pictures with nothing to set.
+
+**Easier install**
+- The CBOC Vita Installer (version 2.0) now builds Infected on your own computer from your own disc. Pick the disc, press **Allow**, and it downloads a 40-50 MB builder once, builds the game in about 10 minutes (9 to 9.5 minutes on a slow 2-core PC; faster on most computers) and sends it to your Vita. Nothing is uploaded, and there is no terminal, Python or SDK.
+- It runs on Windows 64-bit, macOS (10.13 and newer on Intel, 11 and newer on Apple silicon) and Linux 64-bit.
+- It checks your disc the moment you pick it and says so plainly: wrong version, damaged copy, or a CSO/PBP file.
+- **Prepare your Vita** installs ShaRKBR33D, which gets the optional shader compiler (it needs Wi-Fi on the Vita).
+- Other computers (32-bit or ARM Windows, ARM Linux) can build on another machine and pick the finished `infected.vpk`.
+- Not using the installer? The release has the same builder for each system, `infected-build`: drag your ISO onto it on Windows, or run `infected-build Infected.iso`, and it writes `infected.vpk`. Every system makes the byte-identical game.
+
+**Smoother play**
+- **Auto anti-aliasing is the new default.** FXAA is on while the GPU has room and switches off for heavy moments; as a last step the 3D scene is drawn at 85% for a few seconds while the HUD stays sharp. The menu shows **Auto (on)** or **Auto (off)**.
+- **A lighter FXAA:** 5 to 7 screen reads instead of 9, and about half the shader maths. On a real Vita, mission 1 with FXAA and the 2x textures held 30 fps (give or take 1) for 164 of 181 seconds; 1.0's FXAA ran at 21 to 30, mostly in the mid-20s.
+- The PSP's alpha test is skipped wherever it can't fail: draws covering 71% of the alpha-tested area, against 46% before, with a pixel-identical picture.
+- Recoloured HD textures are stored compressed: 8 times less memory for them, and 2.4 times less HD texture memory overall in a mission-1 sample (7.8 to 3.3 MB).
+- The latest vitaGL (2 November 2026).
 - Players coming from 1.0 who never changed a setting move to Auto by themselves; anyone who changed settings keeps their anti-aliasing as it was.
-- The log lists every speed feature the run has on (`[gl] speed features: ...`), and the settings menu was checked row by row, value by value (new automatic test).
+
+**500 MHz**
+- With the PSVshellPlus plugin installed, the game sets up its own 500 MHz profile and never overwrites one of yours. It takes effect from the next start.
+- The CPU clock row shows the clock it measured (495 MHz on a real Vita, 1 November 2026).
+
+**Fixes**
+- The HD textures row no longer shows greyed out at start.
+- Plain boot-screen messages if the shader compiler or memory is missing.
+- Every one of the 18 menu rows and 46 values was tested.
+
+Everything above is on by default for players who never open Settings. The full engineering record is in [docs/STATUS.md](docs/STATUS.md) and [vita/LOG.md](vita/LOG.md).
 
 ## Version 1.0 — October 23, 2026
 
@@ -33,6 +57,6 @@
 - Optional higher enemy density (up to 200 %) and view distance (up to 200 %).
 
 **Under the hood**
-- Builds from your own disc in about 20 minutes. RetroFlow cover art is set up automatically, and you can use your own bubble art.
+- Built from your own disc on a PC (1.1 does this for you in about 10 minutes). RetroFlow cover art is set up automatically, and you can use your own bubble art.
 
 The full engineering record, with every measurement and its date, is in [docs/STATUS.md](docs/STATUS.md) and the logs in [docs/history/](docs/history).

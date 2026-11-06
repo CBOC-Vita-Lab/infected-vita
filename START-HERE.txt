@@ -1,32 +1,57 @@
-Infected for PS Vita - Version 1.0
+Infected for PS Vita - Version 1.1
 ==================================
 
 Thanks for trying the native Vita port of Infected! It runs the game
-directly on the Vita (no emulator) at 30 frames a second.
+directly on the Vita (no emulator) at 30 frames a second, and the
+CBOC Vita Installer puts it on your Vita from your own disc in about
+10 minutes.
 
 
 What you need
 -------------
 - A Vita or PS TV with HENkaku or Enso, and VitaShell
-- libshacccg.suprx in ur0:data/ (the shader compiler vitaGL games use)
+- The CBOC Vita Installer (version 2.0 or newer), for Windows 64-bit,
+  macOS (10.13+ on Intel, 11+ on Apple silicon) or Linux 64-bit:
+  https://github.com/CBOC-Vita-Lab/vita-installer/releases/latest
 - Your own Infected disc image: US version, ULUS-10054, 1.02 (.iso)
-- A PC to build the game package once (about 20 minutes)
+- About 1 GB of free disk space on the computer while it builds
 
-There is no ready-made VPK to download: the package contains code
-translated from your disc, so you build it yourself.
+There is no ready-made game to download: the package contains code
+translated from your disc, so the installer builds it on your own
+computer. Nothing is uploaded.
 
 
-Install in four steps
+Install in five steps
 ---------------------
-1. Build infected.vpk from your disc: see docs/BUILDING.md
-2. Copy infected.vpk to the Vita, open it in VitaShell, press Cross
-3. Copy your ISO into ux0:data/infected/
-4. Open the Infected bubble
+1. Dump your UMD. A Vita has no UMD drive, so use a PSP 1000, 2000 or
+   3000 with custom firmware such as ARK: put the UMD in, press SELECT
+   on the home screen for the VSH menu, set USB Device to "UMD Disc",
+   open Settings > USB Connection, and copy the .iso to your computer.
+   (CSO and PBP files do not work.)
+2. Open the installer on your computer and VitaShell on your Vita
+   (press SELECT in VitaShell so the installer can find it).
+3. Pick Infected and choose your .iso. The installer checks it at once.
+4. Press Install, then Allow. It downloads the builder (40-50 MB, once),
+   builds the game in about 10 minutes and sends it to your Vita.
+5. Open the Infected bubble on the Vita's home screen.
+
+If the installer offers "Prepare your Vita", that installs ShaRKBR33D
+(it needs Wi-Fi on the Vita) for the optional shader compiler.
+
+
+Another way
+-----------
+The release also has the same builder for each computer, infected-build.
+On Windows drag your .iso onto it; elsewhere run: infected-build Infected.iso
+It writes infected.vpk. Copy that to the Vita and install it in VitaShell,
+or choose it in the installer. Then copy your ISO into ux0:data/infected/
+(the installer does this for you). Details: INSTALL.md
 
 
 Updating
 --------
-Install the new VPK over the old one. Your saves and settings stay.
+Install the new version the same way, or install the new VPK over the
+old one. Your saves and settings stay.
 
 
 While you play
@@ -41,5 +66,5 @@ Have fun
 Install details ......... INSTALL.md
 Every setting ........... SETTINGS.md
 Controls ................ CONTROLS.md
-Sharper textures ........ HD-TEXTURES.md
+Sharper textures ........ HD-TEXTURES.md (optional, takes hours on a PC)
 Known issues ............ KNOWN-ISSUES.md

@@ -42,5 +42,7 @@ jobs:
         run: |
           for f in builder/kit/*.sh builder/hosttool/*.sh .github/scripts/*.sh scripts/*.sh vita/scripts/*.sh vita/app/build.sh; do bash -n "$f"; done
           shellcheck --severity=error builder/kit/*.sh builder/hosttool/*.sh .github/scripts/*.sh
+      - name: The install manifest has the disc check
+        run: python3 -I .github/scripts/test_make_manifest.py
       - name: Python scripts compile
         run: python3 -m py_compile builder/kit/kit_tool.py builder/hosttool/*.py .github/scripts/*.py

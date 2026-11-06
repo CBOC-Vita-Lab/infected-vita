@@ -16,6 +16,14 @@ KITS = [  # installer key, file
     ('linux-amd64', 'Infected-Vita-builder-linux.tar.gz'),
 ]
 
+# The installer reads this file inside the player's disc the moment it is chosen (release-format.md, "check"), so another version of the
+# game is refused before the download and the build. The hash is the one the builder kit checks (kit.json game.bootSha256).
+DISC_CHECK = {
+    'file': 'PSP_GAME/SYSDIR/BOOT.BIN',
+    'sha256': '952d4bb2c08209f4cbc0020d95c4cc601e9944cad5c7ade4c1d060fe8daab1bc',
+    'message': 'This is not the US 1.02 version of Infected (ULUS-10054).',
+}
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -48,13 +56,14 @@ def main():
         },
         'needs': [
             {'id': 'disc', 'type': 'psp-iso', 'gameId': 'ULUS-10054', 'to': 'ux0:data/infected/Infected.iso',
-             'label': 'Your Infected UMD backup (PSP, USA, ISO)', 'prepare': [{'step': 'build'}]},
+             'label': 'Your Infected UMD backup (PSP, USA, ISO)', 'prepare': [{'step': 'build'}],
+             'check': DISC_CHECK},
             {'id': 'hd-2x', 'type': 'file', 'to': 'ux0:data/infected/texpack_2x.bin', 'ext': ['.bin'], 'optional': True,
              'label': 'HD textures, 2x pack (optional)', 'names': ['texpack_2x.bin'], 'maxBytes': 120 << 20,
              'help': 'texpack_2x.bin, made from your own disc with the texture builder'},
             {'id': 'hd-4x', 'type': 'file', 'to': 'ux0:data/infected/texpack_4x.bin', 'ext': ['.bin'], 'optional': True,
-             'label': 'HD textures, Vita 4x pack (optional)', 'names': ['texpack_4x_mixed.bin'], 'maxBytes': 160 << 20,
-             'help': 'texpack_4x_mixed.bin (not the full 4x pack, which is too big for the Vita)'},
+             'label': 'HD textures, Vita 4x pack (optional)', 'names': ['texpack_4x_mixed.bin', 'texpack_4x.bin'], 'maxBytes': 160 << 20,
+             'help': 'texpack_4x_mixed.bin, saved on the Vita as texpack_4x.bin (not the full 4x pack, which is too big for the Vita)'},
             {'id': 'shader', 'type': 'shader-compiler', 'optional': True},
         ],
     }

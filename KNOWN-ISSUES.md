@@ -5,9 +5,13 @@ here, please [open an issue](https://github.com/CBOC-Vita-Lab/infected-vita/issu
 
 ## The short version
 
-* **Performance.** Mission 1 holds 30 fps on the default settings. FXAA, pixel lighting and double-resolution effects all cost
-  frames; with all of them on (and the 4x pack) it drops to 10-14 fps. A short stutter can still happen in heavy moments.
+* **Performance.** Mission 1 held 30 fps (give or take 1) for 164 of 181 seconds with FXAA and the 2x textures on a real Vita. Pixel lighting, MSAA and
+  double-resolution effects all cost frames; with everything on (and the 4x pack) version 1.0 dropped to 10-14 fps. A short stutter can still happen in heavy moments.
+  Anti-aliasing **Auto**, the new default, switches FXAA off when the GPU is busy, so the picture can look slightly softer for a moment in the heaviest scenes.
 * **Only mission 1 has been played on a real Vita.** Later missions run on a PC build and should work, but haven't been checked on a console yet.
+* **Install.** The installer builds on Windows 64-bit, macOS and Linux 64-bit. On 32-bit or ARM Windows and ARM Linux, build on another computer and choose the finished `infected.vpk`.
+  ShaRKBR33D (from **Prepare your Vita**) needs Wi-Fi on the Vita. The shader compiler is optional: without it a few rarely used effects are skipped.
+* **500 MHz takes effect from the next start.** With PSVshellPlus, the first start after the game writes its profile still runs at 444 MHz; the menu says `500 MHz from the next start`.
 * **Visual glitches.** Thin horizontal tear lines in the intro movie, and sharp horizontal bands across some fire and explosions.
 * **New picture options pause once.** Turning on pixel lighting or FXAA prepares new shaders the first time each effect is seen
   (a fraction of a second each, only once).
@@ -29,7 +33,7 @@ Delete `ux0:data/infected/settings.txt` to put every setting back to its default
 
 # Details for testers
 
-Everything wrong or unchecked in version 1.0.
+Everything wrong or unchecked in version 1.1.
 
 ## Seen on the console
 
@@ -55,7 +59,9 @@ Everything wrong or unchecked in version 1.0.
 * The gain of each speed feature on its own (four scenes per frame, compact vertices, the HUD upscale, shader pre-linking, the music
   decoded ahead, link-time optimisation, the fourth core). Each has a switch to turn it off (`SETTINGS.md`, `vita/README-VITA.md`); none has
   been compared on its own in a mission.
-* The 500 MHz profile has been measured to run (494 MHz) but not its effect on a whole mission. The game now writes that profile itself (PSVshellPlus applies it at the next start, so the first start after installing runs at 444); this has not run on a console yet.
+* The 500 MHz profile (written by the game, applied by PSVshellPlus at the next start) measured 495 MHz on a console on 1 November 2026; its effect on a whole mission has not been measured.
+* Anti-aliasing Auto as the default over a whole mission, and the 85% scene size it uses as a last step: the FXAA figures above were taken with FXAA always on. How often Auto has FXAA on in a mission is for the next console run to show.
+* The newest vitaGL (2 November 2026) and the compressed HD recolours: checked on a PC; a whole mission on a console with them is still to come.
 * Other firmware for the fourth core. The module (`vita/core3/`) has run on a 3.74 console: it loads, a thread runs on core 3 and the
   helper threads and the music decoder move there. Other firmware versions in 3.60-3.74 are not tried. A start that loaded it and crashed
   leaves `core3_unlock.pending` in `ux0:data/infected/`, and later starts leave the module out; `config.txt core3_unlock=0` turns it off.
@@ -85,8 +91,6 @@ They exist for repeatable speed tests, not for play.
 
 ## Smaller things
 
-* The first lines of `log.txt` list the settings before the renderer has looked for the texture packs, so the HD textures row can read
-  `[greyed: No texture pack installed.]` there even with a pack in place; the later `[hdtex] mode ... pack of N textures` line and the menu are right.
 * Enemy density applies at the next mission load. View distance is subtle in mission 1 (a closed street).
 * The radar texture changes colour all the time; with HD on it is rebuilt a few times and then shown as the original until it is quiet.
 * Only the **US version 1.02** (ULUS-10054) is supported. Other versions are refused with a message.
