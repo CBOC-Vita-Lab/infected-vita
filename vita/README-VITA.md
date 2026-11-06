@@ -170,7 +170,7 @@ Everything has a default; the file is only needed to change something.
   then part of the frame). `guest` is the game's own busy time: the frame less what it slept (`idle`), of which `gesync` waited in
   `sceGeDrawSync`/`sceGeListSync` for the renderer and `flipwait` at a flip for a renderer frames behind. The thread nearest 100 %
   is the bottleneck. `(vertex=N)` is the part of `gewalk` spent decoding (and skinning) the draws' vertices; it is already inside `gewalk`, not beside it.
-  With anti-aliasing Auto the line ends with `| aa=auto:on(off 1, on 1)`: FXAA on or off now, and how many times Auto has switched it off and back on since the start.
+  With anti-aliasing Auto the line ends with `| aa=auto:on(off 1, on 1)`: FXAA on or off now, and how many times Auto has switched it off and back on since the start. While the last rung of Auto is in use (`gl_scene_scale`, not `0`) the line also has `| ss=full(down 0, up 0, 0 frames)`: whether the 3D picture is drawn at the smaller size now (`scaled`) or at full size (`full`), how often Auto went down to the smaller size and back, and how many frames were drawn small.
   `[split] walker on core 2, GL on core 1; 1024 draw slots, ...` once at start says the split is running, and
   `[split] thread_local storage is shared between threads` would mean a build whose C++ runtime is single-threaded (VITAGL_NOTES.md section 4).
   `[gl-time] slow texture upload 11.2 ms: 0x... 256x128 format 5 ... | HD replacement ... | pack read 0.0 ms, GPU waits 0.0 ms`: an upload that
