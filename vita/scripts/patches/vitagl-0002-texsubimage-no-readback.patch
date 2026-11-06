@@ -1,5 +1,7 @@
+Rebased onto upstream e119b3e (2 Nov 2026), which adds fbb190f (the depth/stencil leak fix), f10e8e6 (warnings for dummy functions) and e119b3e (HAVE_ACCURATE_MSAA, left off): hunks moved, no change of behaviour.
+
 diff --git a/source/textures.c b/source/textures.c
-index 0864ddf..e626c7c 100644
+index e9d3e60..de23d4c 100644
 --- a/source/textures.c
 +++ b/source/textures.c
 @@ -1000,7 +1000,11 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,

@@ -18,7 +18,7 @@ Third-party trees live in `third_party/` and build output in `build/`, `sysroot/
 
 | What | URL | Version |
 |---|---|---|
-| vitaGL | https://github.com/Rinnegatamante/vitaGL | `9bf3e3f4e55efd1f4a191b179144f7f9a98cd925` (2026-10-30, "Avoid setting dirty flags when program doesn't change in glUseProgram.") plus `scripts/patches/vitagl-0001..0004` (was `dca4b9d143290d78ec043131a19be36c78cdc7b5`, 2026-10-07, until 30 Oct; see "30 Oct 2026" below) |
+| vitaGL | https://github.com/Rinnegatamante/vitaGL | `e119b3ec158067725659a25b650ebb8f537d1e8f` ("Add HAVE_ACCURATE_MSAA for per-fbo MSAA settings."; was `9bf3e3f4e55efd1f4a191b179144f7f9a98cd925` until 6 Nov 2026, see "6 Nov 2026" below) plus `scripts/patches/vitagl-0001..0004` (was `dca4b9d143290d78ec043131a19be36c78cdc7b5`, 2026-10-07, until 30 Oct; see "30 Oct 2026" below) |
 | vitaShaRK | https://github.com/Rinnegatamante/vitaShaRK | `df24065e65098b2d1ac533760109ad4367573f28` |
 | SceShaccCgExt | https://github.com/Rinnegatamante/SceShaccCgExt | `102192366c25fe7b8fec073d665494b6172605c3` |
 | math-neon | https://github.com/Rinnegatamante/math-neon | `0faab814782c071ff4015527f1ca955ab1ccc470` |
@@ -171,3 +171,12 @@ See `VITAGL_NOTES.md` section 13 and `vita/README.md` section 7. Short form: `AT
 reported by `sceKernelGetCpuId` and thread priority range (T4), BGM port at 44.1 kHz (T5), shader compiler memory and runtime GLSL on hardware (T6), FBO
 orientation / depth survival (T6/T7), per-draw CPU costs and the best path (T8), FFmpeg `pt` at runtime and decoder cost (T9), memory-card throughput (T10),
 SceVideodec/SceAvcdec usability next to the vitaGL pools (not exercised).
+
+## 6 Nov 2026 - vitaGL moved from `9bf3e3f` to `e119b3e`
+
+Three upstream commits: `fbb190f` (fixes a leak when a depth-stencil buffer with stencil is destroyed), `f10e8e6` (runtime warnings for
+dummy functions) and `e119b3e` (HAVE_ACCURATE_MSAA, per-FBO MSAA settings; **left off**, the port does not use MSAA). No change to the
+shader-cache hash or layout, so the v3 cache stays valid. Patches 0001-0004 were rebased (context only), except 0003: with the new
+`shared.h` the fragment-program setup exists in two variants (`#ifdef HAVE_ACCURATE_MSAA` and the plain one), and 0003 now routes both
+through `rs_set_fragment_program`. Built and checked on the PC only for the patch application; the console run is the first test of the
+new tree.

@@ -123,6 +123,7 @@ A text file `ux0:data/infected/config.txt` with `name=value` lines changes thing
 | `gl_skip_invisible=0` | Draws the fully transparent sprites anyway. |
 | `gl_compact_vertices=0`, `gl_vgl_skip_redundant=0`, `gl_rt_scenes=0`, `gl_alpha_elide=0`, `gl_alpha_elide_range=0` | Turn off the other drawing speed-ups, to compare. `log.txt` lists them in its `[gl] speed features:` line. |
 | `gl_aa_auto=0` / `gl_aa_auto=2` | Anti-aliasing Auto behaves as Off (the way it was before Auto existed) / as FXAA always. `gfx.antialiasing=off` fixes the menu row to Off. |
+| `gl_scene_scale=0` / `hd_recolour_dxt=0` | no temporary 85% scene size as Auto's last step / recoloured HD textures stay RGBA8 (more memory). |
 | `gl_fxaa_quality=high` | The first, dearer version of the FXAA filter. |
 | `log_sync=1` | Saves every log line as it is written. Slower; use it when the game crashes, so the last lines are kept. |
 

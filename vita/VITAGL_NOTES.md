@@ -57,7 +57,7 @@ the shader cache of 7; `HAVE_VERTEX_LAYOUT_CACHE` caches the per-draw vertex pro
   true) set it in `gl_init` (vitaGL's own default is true/true). It is a no-op in the other libraries.
 * `SAMPLERS_SPEEDHACK`: no null checks on sampler units.
 
-**Speed options.** Each option was read in the patched source (`third_party/vitaGL/source`, commit `dca4b9d` plus our patches 0003 and 0004; unchanged by the move to `9bf3e3f`, section 14)
+**Speed options.** Each option was read in the patched source (`third_party/vitaGL/source`, commit `dca4b9d` plus our patches 0003 and 0004; unchanged by the move to `9bf3e3f`, section 14; `e119b3e` since 6 Nov 2026, section 15)
 and checked against the port's own GL calls: only 16-bit `glDrawElements` from a scratch buffer, `glDrawArrays` for blits, an overlay and a
 platform composite from client arrays, one `sampler2D` (unit 0) or none per program, `GL_TRIANGLES` and `GL_LINES`, no `glBufferSubData`,
 no `glOrtho`/`glFrustum`, a `glReadPixels` only for screenshots. **None of this has run on the console**; the two enabled options are
@@ -508,3 +508,10 @@ A device that ran 1.0 keeps `ux0:data/infected/shader_cache/v2` and gets `v3` ne
 ### Comparing old and new on the console
 
 Everything but patch 0003 is compiled in, so the A side is the 1.0 `eboot.bin` (vitaGL `dca4b9d`). Steps are in `LOG.md` (30 Oct 2026 entry).
+
+## 15. The move from `9bf3e3f` to `e119b3e` (6 Nov 2026)
+
+Pin: `e119b3ec158067725659a25b650ebb8f537d1e8f`. Upstream added `fbb190f` (leak fix for stencil depth-stencil destruction), `f10e8e6`
+(warnings when a dummy function is called) and `e119b3e` (`HAVE_ACCURATE_MSAA`, off in our build). The shader cache is untouched. Our four
+patches apply with small offsets; 0003 additionally covers the second `setup_frag_program` variant that `HAVE_ACCURATE_MSAA` introduced.
+**UNVERIFIED** on hardware until the first console run.

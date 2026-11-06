@@ -10,7 +10,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-$here/third_party/PortableKit}
 url=${PORTABLEKIT_URL:-https://github.com/TeamGDB/PortableKit.git}
 base=33800c4060c53f3233e08f8ab2cc4590a0872063          # upstream main when the port was last synchronised
-tree=6b1eb8838f52a6928ee4e622c4cb356ebecea2f3          # the tree the patched checkout must have
+tree=fcbf2518beca959ce662079e36b6e7520baf5090          # the tree the patched checkout must have
 
 if [ -e "$dest/.git" ]; then
   echo "$dest already holds a checkout; remove it first to start again" >&2; exit 1

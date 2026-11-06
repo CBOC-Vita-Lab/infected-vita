@@ -1,0 +1,878 @@
+From 0da2e19e188c16c2fa553025471c204c8d6b511a Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:10:41 -0500
+Subject: [PATCH 75/75] gl: a resolution rung at the end of Auto, and cull
+ statistics in ge_replay
+
+After FXAA is off, Auto can drop the 3D scene to 85% of the display size
+(pre-allocated twin target, enlarged before the HUD) and recover after
+headroom, with the same hysteresis and back-off. gl_scene_scale=0 disables it.
+ge_replay --cull-stats counts the triangles submitted with culling on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/gpu/auto_aa.hpp          |  88 +++++++++++++++-
+ host/gpu/gl/gl_post.inc       | 191 +++++++++++++++++++++++++++++++++-
+ host/gpu/gl/gl_renderer.cpp   |  26 ++++-
+ host/gpu/gl/gl_renderer.hpp   |  18 ++++
+ tests/auto_aa_tests.cpp       | 130 +++++++++++++++++++++++
+ tools/ge_replay/ge_replay.cpp |  91 ++++++++++++++++
+ 6 files changed, 539 insertions(+), 5 deletions(-)
+
+diff --git a/host/gpu/auto_aa.hpp b/host/gpu/auto_aa.hpp
+index 054efca..5210511 100644
+--- a/host/gpu/auto_aa.hpp
++++ b/host/gpu/auto_aa.hpp
+@@ -17,7 +17,14 @@
+ //     this test). A try that fails within `trial_us` (6 s) doubles the wait (up to `max_retry_us`) and raises the room asked for,
+ //     so a scene the GPU cannot afford is tried a few times a minute at most; a try that lasts `settle_us` (60 s) forgives it.
+ //   * The first `grace_frames` 3D frames after FXAA comes on are not counted: the pass makes its target the first time.
++//   * A last rung (`scale_rung`, off unless the renderer turns it on): with FXAA already off, `late_frames_off` more late 3D frames
++//     in a row (after `grace_frames` of them for the FXAA change to show) drop the 3D picture to a smaller render scale
++//     (ScaledDown, scaled() true; the renderer chooses the size, the HUD stays at full size). The way back is the same shape as
++//     FXAA's, one rung at a time: after `res_retry_us` (10 s) with no late frame, `min_scene_frames` of them 3D and the GL thread
++//     asleep `res_need_idle_us` per frame on average, the full size is tried again (ScaledUp, then FXAA's own wait begins).
++//     A scale-up that fails within `trial_us` doubles the wait (up to `res_max_retry_us`) and raises the room asked for.
+ //
++
+ // All times are microseconds. Values: docs/GRAPHICS_OPTIONS.md, README-VITA.md (gl_aa_auto*).
+ #include <algorithm>
+ #include <cstdint>
+@@ -39,6 +46,12 @@ struct AutoAaConfig {
+     std::uint32_t min_scene_frames{150};    // 3D frames in the quiet time (5 s of play): a menu does not count as room
+     std::uint32_t need_idle_us{3'000};      // GL-thread sleep per frame that FXAA's pass is assumed to need
+     std::uint32_t max_need_idle_us{9'000};
++    bool scale_rung{false};                    // the resolution rung below FXAA-off exists
++    std::uint64_t res_retry_us{10'000'000};    // quiet time before the full size is tried again
++    std::uint64_t res_max_retry_us{80'000'000};
++    std::uint32_t res_need_idle_us{4'000};     // GL-thread sleep per frame at the smaller size that the full size is assumed to need
++    std::uint32_t res_max_need_idle_us{10'000};
++    std::uint32_t res_grace_frames{4};         // 3D frames after a size change that are not counted (the target is made, the first frame is slow)
+ };
+ 
+ struct AutoAaFrame {
+@@ -53,11 +66,17 @@ struct AutoAaFrame {
+ 
+ class AutoAa {
+ public:
+-    enum class Event : std::uint8_t { None, TurnedOff, TurnedOn };
++    enum class Event : std::uint8_t { None, TurnedOff, TurnedOn, ScaledDown, ScaledUp };
+ 
+     explicit AutoAa(const AutoAaConfig &config = {}) : config_(config) { reset(0u); }
+ 
+     [[nodiscard]] bool on() const noexcept { return on_; }
++    // The 3D picture is at the smaller scale now (only with scale_rung; FXAA is off then).
++    [[nodiscard]] bool scaled() const noexcept { return scaled_; }
++    [[nodiscard]] std::uint32_t scale_downs() const noexcept { return downs_; }
++    [[nodiscard]] std::uint32_t scale_ups() const noexcept { return ups_; }
++    [[nodiscard]] std::uint64_t res_retry_us() const noexcept { return res_retry_us_; }
++    [[nodiscard]] std::uint32_t res_need_idle_us() const noexcept { return res_need_idle_us_; }
+     [[nodiscard]] const AutoAaConfig &config() const noexcept { return config_; }
+     [[nodiscard]] std::uint32_t changes() const noexcept { return offs_ + ons_; }
+     [[nodiscard]] std::uint32_t offs() const noexcept { return offs_; }
+@@ -68,6 +87,10 @@ public:
+     // Starts over with FXAA on (the player chose Auto, or the game began).
+     void reset(std::uint64_t now_us) noexcept {
+         on_ = true;
++        scaled_ = false;
++        res_trial_ = false;
++        res_retry_us_ = config_.res_retry_us;
++        res_need_idle_us_ = config_.res_need_idle_us;
+         late_run_ = 0u;
+         grace_ = config_.grace_frames;
+         retry_us_ = config_.retry_us;
+@@ -99,6 +122,7 @@ public:
+         }
+         const bool blame = (late(f) || f.skipped != 0u) && renderer_to_blame(f);
+         if (on_) return update_on(f, blame);
++        if (scaled_) return update_scaled(f, blame);
+         return update_off(f, blame);
+     }
+ 
+@@ -131,10 +155,36 @@ private:
+         since_change_us_ = f.now_us;
+         restart_quiet(f.now_us);
+         trial_ = false;
++        grace_ = config_.grace_frames;   // the rung below counts late frames only once FXAA's absence has shown
+         return Event::TurnedOff;
+     }
+ 
+     Event update_off(const AutoAaFrame &f, bool blame) noexcept {
++        if (res_trial_ && f.now_us - since_change_us_ >= config_.settle_us) {   // the full size held: its failures are forgotten
++            res_trial_ = false;
++            res_retry_us_ = config_.res_retry_us;
++            res_need_idle_us_ = config_.res_need_idle_us;
++        }
++        if (config_.scale_rung && f.scene) {
++            if (grace_ != 0u) {
++                --grace_;
++            } else if (!blame) {
++                late_run_ = 0u;
++            } else if (++late_run_ >= config_.late_frames_off || f.skipped != 0u) {
++                scaled_ = true;
++                ++downs_;
++                late_run_ = 0u;
++                grace_ = config_.res_grace_frames;
++                if (res_trial_ && f.now_us - since_change_us_ < config_.trial_us) {   // a failed try of the full size
++                    res_retry_us_ = std::min(res_retry_us_ * 2u, config_.res_max_retry_us);
++                    res_need_idle_us_ = std::min(res_need_idle_us_ + res_need_idle_us_ / 2u, config_.res_max_need_idle_us);
++                }
++                res_trial_ = false;
++                since_change_us_ = f.now_us;
++                restart_quiet(f.now_us);
++                return Event::ScaledDown;
++            }
++        }
+         if (blame) {   // not FXAA's doing now, but the renderer has no room: the quiet time starts again
+             restart_quiet(f.now_us);
+             return Event::None;
+@@ -160,6 +210,37 @@ private:
+         return Event::TurnedOn;
+     }
+ 
++    Event update_scaled(const AutoAaFrame &f, bool blame) noexcept {
++        if (blame) {   // still too slow even at the smaller size: nothing left to give, and the quiet time starts again
++            restart_quiet(f.now_us);
++            return Event::None;
++        }
++        if (f.scene) {
++            if (grace_ != 0u) {
++                --grace_;
++                return Event::None;
++            }
++            ++scene_frames_;
++            if (f.idle_us >= 0) {
++                idle_sum_ += static_cast<std::uint64_t>(f.idle_us);
++                ++idle_frames_;
++            }
++        }
++        if (f.now_us - quiet_since_us_ < res_retry_us_ || scene_frames_ < config_.min_scene_frames) return Event::None;
++        if (idle_frames_ != 0u && idle_sum_ / idle_frames_ < res_need_idle_us_) {
++            restart_quiet(f.now_us);
++            return Event::None;
++        }
++        scaled_ = false;
++        ++ups_;
++        res_trial_ = true;
++        late_run_ = 0u;
++        grace_ = config_.res_grace_frames;
++        since_change_us_ = f.now_us;
++        restart_quiet(f.now_us);   // FXAA's own wait starts here
++        return Event::ScaledUp;
++    }
++
+     void restart_quiet(std::uint64_t now_us) noexcept {
+         quiet_since_us_ = now_us;
+         scene_frames_ = 0u;
+@@ -169,6 +250,11 @@ private:
+ 
+     AutoAaConfig config_;
+     bool on_{true};
++    bool scaled_{false};
++    bool res_trial_{false};   // the full size is back after a scale-down (a try)
++    std::uint32_t downs_{0}, ups_{0};
++    std::uint64_t res_retry_us_{0};
++    std::uint32_t res_need_idle_us_{0};
+     bool trial_{false};   // FXAA is on again after an off (a try), not from the start
+     std::uint32_t late_run_{0};
+     std::uint32_t grace_{0};
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index 9bd82e0..f98fae5 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -16,6 +16,7 @@
+         bool mips{};
+         bool fxaa{};          // FXAA is applied to the next frame (chosen, or Auto and the room is there)
+         bool aa_auto{};       // gfx.antialiasing=auto with the adaptive controller (gl_aa_auto=1)
++        bool scene_scale{};   // Auto's last rung: the next frame's 3D picture is drawn at settings.scene_scale_percent
+         bool pixel_light{};
+         bool movie_sharp{};
+         bool show_fps{};
+@@ -55,6 +56,7 @@
+         next.fxaa = port::fxaa() || (auto_may_fxaa && (settings.aa_auto == 2u || (next.aa_auto && auto_aa.on())));
+         // The menu's value: "Auto (on)" / "Auto (off)" once something is known; plain "Auto" otherwise.
+         port::set_auto_antialiasing_state(!automatic ? -1 : (next.fxaa ? 1 : ((settings.aa_auto == 0u || !auto_may_fxaa || aa_state_known) ? 0 : -1)));
++        next.scene_scale = next.aa_auto && auto_aa.scaled();
+         next.pixel_light = port::pixel_lighting();
+         next.movie_sharp = port::movie_filter() == port::MovieFilter::Sharp;
+         next.show_fps = port::show_fps();
+@@ -76,6 +78,9 @@
+     bool fxaa_warm_done{};
+     std::atomic<std::uint32_t> aa_offs{0u}, aa_ons{0u};
+     std::atomic<int> aa_on_now{-1};   // -1 Auto is not adaptive now, 0 off, 1 on
++    std::atomic<int> ss_scaled_now{-1};
++    std::atomic<std::uint32_t> ss_downs{0u}, ss_ups{0u};
++    std::atomic<std::uint64_t> ss_frames{0u};
+ 
+     [[nodiscard]] static std::uint64_t clock_us(Clock::time_point t) {
+         return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count());
+@@ -90,6 +95,10 @@
+             config.pause_us = std::max(config.pause_us, config.budget_us * 6u);
+         }
+         if (settings.aa_auto_min_frames != 0u) config.min_scene_frames = settings.aa_auto_min_frames;
++        // The resolution rung: only when the display is at its full size already (display_scale_percent is a smaller one chosen at the start).
++        config.scale_rung = settings.scene_scale == 1u && settings.display_scale_percent == 0u && ssaa_scale == 0u;
++        if (settings.scene_scale_retry_s != 0u) config.res_retry_us = static_cast<std::uint64_t>(settings.scene_scale_retry_s) * 1'000'000u;
++        if (settings.scene_scale_need_idle_us != 0u) config.res_need_idle_us = settings.scene_scale_need_idle_us;
+         auto_aa = AutoAa(config);
+         auto_aa.reset(clock_us(Clock::now()));
+         aa_have_last = false;
+@@ -126,11 +135,27 @@
+         aa_state_known = true;
+         const AutoAa::Event event = auto_aa.update(sample);
+         opt.fxaa = auto_aa.on();
++        opt.scene_scale = auto_aa.scaled();
++        ss_scaled_now.store(auto_aa.config().scale_rung ? (auto_aa.scaled() ? 1 : 0) : -1, std::memory_order_relaxed);
++        ss_downs.store(auto_aa.scale_downs(), std::memory_order_relaxed);
++        ss_ups.store(auto_aa.scale_ups(), std::memory_order_relaxed);
+         aa_on_now.store(auto_aa.on() ? 1 : 0, std::memory_order_relaxed);
+         port::set_auto_antialiasing_state(auto_aa.on() ? 1 : 0);
+         if (event == AutoAa::Event::None) return;
+-        (event == AutoAa::Event::TurnedOff ? aa_offs : aa_ons).fetch_add(1u, std::memory_order_relaxed);
+         char line[256];
++        if (event == AutoAa::Event::ScaledDown || event == AutoAa::Event::ScaledUp) {
++            if (event == AutoAa::Event::ScaledDown)
++                std::snprintf(line, sizeof line,
++                              "[aa] auto: 3D picture at %u%% (gpu still late with fxaa off: frame %.1f ms, present %.1f ms, gl lag %.1f ms, skipped %u; next try of full size in %llu s, room needed %.1f ms) [scale-downs %u]",
++                              settings.scene_scale_percent, sample.interval_us / 1000.0, sample.swap_us / 1000.0, sample.lag_us / 1000.0, sample.skipped,
++                              static_cast<unsigned long long>(auto_aa.res_retry_us() / 1'000'000u), auto_aa.res_need_idle_us() / 1000.0, auto_aa.scale_downs());
++            else
++                std::snprintf(line, sizeof line, "[aa] auto: 3D picture back at full size (quiet and %s, last frame %.1f ms) [scale-ups %u]",
++                              sample.idle_us >= 0 ? "the gl thread has room" : "no late frame", sample.interval_us / 1000.0, auto_aa.scale_ups());
++            std::cout << line << std::endl;
++            return;
++        }
++        (event == AutoAa::Event::TurnedOff ? aa_offs : aa_ons).fetch_add(1u, std::memory_order_relaxed);
+         if (event == AutoAa::Event::TurnedOff) {
+             std::snprintf(line, sizeof line,
+                           "[aa] auto: fxaa off (gpu late: frame %.1f ms, present %.1f ms, gl lag %.1f ms, skipped %u; next try in %llu s, room needed %.1f ms) [change %u]",
+@@ -273,6 +298,170 @@
+         ++target.draw_serial;   // the picture changed under whoever copied it
+     }
+ 
++
++    // ---- the last rung of Auto: the 3D picture at a smaller scale --------------------------------------------------------
++    // A frame of the game draws the 3D world into the display target, then the glow and blur chain (targets of their own that
++    // sample the display and are composited back onto it), then the HUD (through-mode draws and a few 3D ones, after a depth
++    // clear of its own). With the rung on, a frame that begins with a full-screen clear of the display target (a frame the
++    // one before it showed to be a 3D frame) draws everything up to the HUD into a smaller twin of that target: the twin takes the
++    // display target's place in `targets`, so the glow chain samples it and draws back into it by address, as before. Where the
++    // HUD begins (the rule of FXAA's scene step: a through draw after 32 3D draws that does not sample a target, or a 3D draw after
++    // a composite) the twin is enlarged into the display target with one bilinear pass, the display target's depth is cleared as a
++    // new target's is, and the display target takes its place again: the HUD and the rest of the frame run at full size. A frame
++    // that turns out not to be a 3D one (a through draw before 32 3D draws: a menu) does the same at once, the twin holding no
++    // more than the clear, and draws at full size the rest of the way.
++    enum class SsPhase : std::uint8_t { Idle, Active, Done };
++    SsPhase ss_phase{SsPhase::Done};
++    std::unique_ptr<Target> ss_twin;     // the smaller target, made once (a pre-allocated pair: colour and depth)
++    std::unique_ptr<Target> ss_parked;   // the display target while the twin stands in for it
++    std::uint32_t ss_key{};
++    std::uint32_t ss_draws{};            // 3D draws on the twin this frame
++    bool ss_composite{};
++    bool ss_ended_early{};               // this frame went back to full size before the HUD (not counted as a scaled frame)
++    bool ss_active_frame{};              // this frame began at the smaller scale
++    bool ss_depth_cleared{};
++    std::uint32_t ss_frame_xform{};      // 3D draws on a display-sized target this frame, whether the rung runs or not
++    bool ss_prev_scene{};                // the last frame was a 3D one
++
++    [[nodiscard]] bool scene_scale_armed() const {
++        return settings.scene_scale == 2u || (settings.scene_scale == 1u && opt.scene_scale);
++    }
++
++    // After a present: what the next frame does.
++    void scene_scale_frame_start() {
++        ss_prev_scene = ss_frame_xform >= kFxaaMinDraws;
++        ss_frame_xform = 0u;
++        ss_draws = 0u;
++        ss_composite = false;
++        ss_ended_early = false;
++        ss_active_frame = false;
++        ss_depth_cleared = false;
++        ss_phase = scene_scale_armed() ? SsPhase::Idle : SsPhase::Done;
++    }
++
++    // `call` covers the whole display: a clear of the target as a sprite or as the GE's clear mode.
++    [[nodiscard]] static bool covers_display(const DrawCall &call, const Target &display) {
++        if (call.vertices.size() < 2u || call.texture.enabled) return false;
++        if (!call.through && !call.clear_mode) return false;
++        if (call.primitive != PrimitiveType::Sprites && !call.clear_mode) return false;
++        if (call.pixel_mask_rgb != 0u) return false;   // a depth-only clear leaves the colour: the twin would not hold it
++        const float x0 = std::min(call.vertices[0].position[0], call.vertices[1].position[0]);
++        const float x1 = std::max(call.vertices[0].position[0], call.vertices[1].position[0]);
++        const float y0 = std::min(call.vertices[0].position[1], call.vertices[1].position[1]);
++        const float y1 = std::max(call.vertices[0].position[1], call.vertices[1].position[1]);
++        return x0 <= 0.5f && y0 <= 0.5f && x1 >= static_cast<float>(display.psp_width) - 0.5f && y1 >= static_cast<float>(display.psp_height) - 0.5f;
++    }
++
++    // Makes the twin of a new display target when Auto may need it (so the first scale-down is not a render-target allocation in
++    // the middle of a slow frame: some 3 MB of colour and depth on the console).
++    void scene_scale_prepare(const Target &display) {
++        const bool may = settings.scene_scale == 2u || (settings.scene_scale == 1u && opt.aa_auto && settings.display_scale_percent == 0u && ssaa_scale == 0u);
++        if (!may || display.fbo == 0u) return;
++        if (!ss_twin) ss_twin = std::make_unique<Target>();
++        scene_scale_size_twin(*ss_twin, display);
++    }
++
++    // Gives `twin` the size of `display` at the scene scale, allocating its colour and depth when that changes.
++    void scene_scale_size_twin(Target &twin, const Target &display) {
++        const float scale = display.scale * static_cast<float>(settings.scene_scale_percent) / 100.0f;
++        if (twin.fbo != 0u && twin.stride == display.stride && twin.psp_width == display.psp_width && twin.psp_height == display.psp_height &&
++            twin.scale == scale && twin.format == display.format)
++            return;
++        twin.scene_twin = true;
++        twin.stride = display.stride;
++        twin.format = display.format;
++        twin.psp_width = display.psp_width;
++        twin.psp_height = display.psp_height;
++        twin.scale = scale;
++        allocate_target(twin);
++    }
++
++    bool scene_scale_begin(std::uint32_t key, const DrawCall &call) {
++        const auto found = targets.find(key);
++        if (found == targets.end() || found->second->fbo == 0u || found->second->scene_twin) return false;
++        Target &display = *found->second;
++        if (!covers_display(call, display)) return false;
++        flush();
++        if (!ss_twin) ss_twin = std::make_unique<Target>();
++        Target &twin = *ss_twin;
++        scene_scale_size_twin(twin, display);
++        twin.address = key;
++        twin.guest_words.clear();
++        twin.last_drawn_frame = ~0ull;
++        twin.copy_serial = ~0ull;
++        twin.draw_serial = display.draw_serial + 1u;
++        ss_parked = std::move(found->second);
++        found->second = std::move(ss_twin);
++        ss_key = key;
++        ss_draws = 0u;
++        ss_composite = false;
++        ss_phase = SsPhase::Active;
++        return true;
++    }
++
++    // Enlarges the twin into the display target and puts the display target back. `early`: the frame was no 3D picture after all.
++    void scene_scale_end(bool early) {
++        if (ss_phase != SsPhase::Active) return;
++        flush();
++        const auto found = targets.find(ss_key);
++        Target &twin = *found->second;
++        Target &display = *ss_parked;
++        bind_target(display, "scene scale: enlarge");
++        blit(twin.color, 0, 0, static_cast<std::int32_t>(display.width), static_cast<std::int32_t>(display.height), false, true);
++        ++display.draw_serial;
++        display.guest_words.clear();
++        ss_twin = std::move(found->second);
++        found->second = std::move(ss_parked);
++        ss_phase = SsPhase::Done;
++        ss_ended_early = early;
++        ++st().scene_scale_resolves;
++        if (early) ++st().scene_scale_aborts; else { ++st().scene_scaled_frames; ss_frames.fetch_add(1u, std::memory_order_relaxed); }
++    }
++
++    // Called for every draw on a display-sized target before its target is looked up.
++    void scene_scale_step(const DrawCall &call, const GuestMemory &memory) {
++        if (!call.through && !call.clear_mode) ++ss_frame_xform;
++        if (ss_phase == SsPhase::Done) {
++            // After the enlargement the display target's depth is empty: a 3D draw that tests depth before the game's own depth clear
++            // (a through draw that writes depth) would have met the scene's depth. Counted, to see that it does not happen.
++            if (ss_active_frame && !ss_ended_early && !ss_depth_cleared) {
++                if (call.through && call.depth.write_enabled) ss_depth_cleared = true;
++                else if (!call.through && !call.clear_mode && call.depth.test_enabled) ++st().scene_scale_late_3d;
++            }
++            return;
++        }
++        const std::uint32_t key = GuestMemory::canonical(call.target.color_address);
++        if (ss_phase == SsPhase::Idle) {
++            // The first draw on a display-sized target this frame.
++            ss_phase = SsPhase::Done;
++            if (settings.scene_scale == 2u || ss_prev_scene) {
++                if (scene_scale_begin(key, call)) {
++                    ss_active_frame = true;
++                    ss_phase = SsPhase::Active;
++                }
++            }
++            return;
++        }
++        if (key != ss_key) {   // the other display buffer: this frame is not what the twin was made for
++            scene_scale_end(true);
++            return;
++        }
++        if (call.clear_mode) return;
++        if (call.through) {
++            if (ss_draws < kFxaaMinDraws) {
++                scene_scale_end(true);
++            } else {
++                const bool samples = call.texture.enabled && settings.target_textures && find_target_texture(memory, call.texture).target != nullptr;
++                if (samples) ss_composite = true;
++                else scene_scale_end(false);
++            }
++        } else if (ss_composite && ss_draws >= kFxaaMinDraws) {
++            scene_scale_end(false);
++        } else {
++            ++ss_draws;
++        }
++    }
++
+     // ---- the picture on show, the overlay and the counter --------------------------------------------------------
+     struct Composed {
+         GLuint fbo{};
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index f6283f6..f437fb7 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -218,6 +218,7 @@ struct Target {
+     GLuint color{};
+     GLuint depth{};
+     GLuint copy{};  // a copy of the colour, for a draw that samples the target it draws into
++    bool scene_twin{};  // the smaller stand-in for a display target during the 3D picture (settings.scene_scale): keeps its own scale
+     GLuint post{};  // the colour texture a post pass draws into; it swaps places with `color` (gfx.antialiasing=fxaa)
+     std::uint64_t copy_serial{~0ull};
+     std::uint64_t draw_serial{};
+@@ -946,7 +947,7 @@ struct GlRenderer::Impl {
+             found->second->address = key;
+         }
+         Target &target = *found->second;
+-        const float scale = scale_for(stride);
++        const float scale = target.scene_twin ? target.scale : scale_for(stride);
+         std::uint32_t width = 0u, height = 0u;
+         size_for(stride, width, height);
+         if (target.fbo == 0u || target.stride != stride || target.psp_width != width || target.scale != scale) {
+@@ -958,6 +959,7 @@ struct GlRenderer::Impl {
+             target.psp_height = height;
+             target.scale = scale;
+             allocate_target(target);
++            if (stride >= 512u && !target.scene_twin) scene_scale_prepare(target);   // the pre-allocated smaller twin, before any frame needs it
+             if (pending_picture == &target) pending_picture = nullptr;   // the picture was in the old allocation
+             target.guest_words.clear();
+             if (created) ++st().targets_created;
+@@ -1930,6 +1932,10 @@ struct GlRenderer::Impl {
+         }
+         st().indices_uploaded += batch_indices.size();
+         st().triangles += state.mode == GL_LINES ? batch_indices.size() / 2u : batch_indices.size() / 3u;
++        if (state.cull != 0u) {
++            ++st().cull_draws;
++            st().cull_triangles += batch_indices.size() / 3u;
++        }
+         check("draw");
+     }
+ 
+@@ -2731,6 +2737,7 @@ struct GlRenderer::Impl {
+             ++st().skipped_draws;
+             return;
+         }
++        if (call.target.color_stride >= 512u) scene_scale_step(call, memory);
+         Target &target = target_for(call.target.color_address, call.target.color_stride, call.target.color_format);
+         resolve_picture(target);
+         if (target.last_drawn_frame != frames || target.guest_words.empty()) {
+@@ -3086,6 +3093,7 @@ struct GlRenderer::Impl {
+     void upload(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width, std::uint32_t height,
+                 std::uint32_t stride) {
+         if (!ready || pixels == nullptr || width == 0u || height == 0u || stride < width) return;
++        scene_scale_end(true);
+         flush();
+         Target &target = target_for(display_address, 512u, 3u);
+         // upload_texture is about to change: a different target still waiting for its enlargement gets it now (the same
+@@ -3123,6 +3131,7 @@ struct GlRenderer::Impl {
+         const std::uint64_t ge_draws = frame_draws;
+         frame_draws = 0;
+         if (!ready) return false;
++        scene_scale_end(false);   // a 3D picture still at the smaller scale is enlarged now, before anything shows or reads the display target
+         flush();
+         Target *target = find_target(display_address);
+         if (target == nullptr) target = &target_for(display_address, 512u, 3u);
+@@ -3152,6 +3161,7 @@ struct GlRenderer::Impl {
+         fxaa_done = false;
+         // The options change between frames: the next frame sees what the overlay has set by now.
+         refresh_options(false);
++        scene_scale_frame_start();
+         hold_frame_cap();
+         return true;
+     }
+@@ -3233,6 +3243,10 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "fxaa_quality") settings.fxaa_quality = (value == "high" || value == "1" || value == "full") ? 1u : 0u;
+     else if (name == "aa_auto") settings.aa_auto = std::min(u32, 2u);
+     else if (name == "aa_auto_retry_s") settings.aa_auto_retry_s = u32;
++    else if (name == "scene_scale") settings.scene_scale = std::min(u32, 2u);
++    else if (name == "scene_scale_percent") settings.scene_scale_percent = std::clamp(u32, 50u, 100u);
++    else if (name == "scene_scale_retry_s") settings.scene_scale_retry_s = u32;
++    else if (name == "scene_scale_need_idle_us") settings.scene_scale_need_idle_us = u32;
+     else if (name == "aa_auto_budget_ms") settings.aa_auto_budget_ms = u32;
+     else if (name == "aa_auto_min_frames") settings.aa_auto_min_frames = u32;
+     else if (name == "test_slow_ms") settings.test_slow_ms = u32;
+@@ -3270,7 +3284,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "aa_auto", "aa_auto_retry_s", "aa_auto_need_idle_us", "aa_auto_budget_ms", "aa_auto_min_frames", "test_slow_ms", "test_slow_from", "test_slow_frames", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "aa_auto", "scene_scale", "scene_scale_percent", "scene_scale_retry_s", "scene_scale_need_idle_us", "aa_auto_retry_s", "aa_auto_need_idle_us", "aa_auto_budget_ms", "aa_auto_min_frames", "test_slow_ms", "test_slow_from", "test_slow_frames", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+@@ -3310,7 +3324,7 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+                   << " skip_invisible=" << g.skip_invisible << " compact_vertices=" << g.compact_vertices
+                   << " vgl_skip_redundant=" << g.vgl_skip_redundant << " scratch_buffers=" << g.scratch_buffers
+                   << " merge=" << g.merge_draws << " ui_upscale=" << g.ui_upscale << " prewarm=" << g.prewarm
+-                  << " fxaa_quality=" << (g.fxaa_quality == 0u ? "fast" : "high") << " aa_auto=" << g.aa_auto << "\n";
++                  << " fxaa_quality=" << (g.fxaa_quality == 0u ? "fast" : "high") << " aa_auto=" << g.aa_auto << " scene_scale=" << g.scene_scale << "/" << g.scene_scale_percent << "%\n";
+     }
+     // MSAA is the Vita's: vitaGL is started with it (port::msaa_samples(), read when the context is made). The desktop has
+     // no such mode on its offscreen targets, so it shows a supersampled preview: the display is drawn at 1.5 times (msaa2) or
+@@ -3394,6 +3408,7 @@ void GlRenderer::write_back_frame(GuestMemory &memory) {
+     Impl &impl = *impl_;
+     if (!impl.ready || !impl.has_presented || impl.settings.writeback == 0u) return;
+     if (++impl.writeback_frames % impl.settings.writeback != 0u) return;
++    impl.scene_scale_end(false);
+     Target *target = impl.find_target(impl.presented);
+     if (target != nullptr) impl.store_target(*target, memory);
+ }
+@@ -3401,6 +3416,7 @@ void GlRenderer::write_back_frame(GuestMemory &memory) {
+ void GlRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &memory) {
+     Impl &impl = *impl_;
+     if (!impl.ready) return;
++    impl.scene_scale_end(false);
+     const std::uint32_t wanted = GuestMemory::canonical(source);
+     for (auto &entry : impl.targets) {
+         Target &target = *entry.second;
+@@ -3440,6 +3456,10 @@ GlRenderer::AutoAaInfo GlRenderer::auto_aa_info() const noexcept {
+     info.state = impl_->aa_on_now.load(std::memory_order_relaxed);
+     info.offs = impl_->aa_offs.load(std::memory_order_relaxed);
+     info.ons = impl_->aa_ons.load(std::memory_order_relaxed);
++    info.scaled = impl_->ss_scaled_now.load(std::memory_order_relaxed);
++    info.scale_downs = impl_->ss_downs.load(std::memory_order_relaxed);
++    info.scale_ups = impl_->ss_ups.load(std::memory_order_relaxed);
++    info.scaled_frames = impl_->ss_frames.load(std::memory_order_relaxed);
+     return info;
+ }
+ 
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index 66f67d1..c3f3072 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -93,6 +93,14 @@ struct GlSettings {
+     // `test_slow_ms` milliseconds, as a frame the GPU could not finish would, to see Auto turn FXAA off.
+     std::uint32_t aa_auto_budget_ms{0u};
+     std::uint32_t aa_auto_min_frames{0u};
++    // The last rung of Auto (gl_scene_scale): with FXAA already off and the GPU still late, the 3D picture of a frame is drawn
++    // at scene_scale_percent of the display's size (85: 816x462 of 960x544) and enlarged into the display target when the HUD
++    // begins; the HUD, the menus and the movies stay at full size. 1 = Auto may do it (default), 0 never, 2 always (to compare and
++    // for pictures). Only with gfx.antialiasing=auto; without a split renderer there is no load measure and a late frame is the renderer's.
++    std::uint32_t scene_scale{1u};
++    std::uint32_t scene_scale_percent{85u};
++    std::uint32_t scene_scale_retry_s{0u};      // gl_scene_scale_retry_s: quiet time before the full size is tried again (0: 10 s)
++    std::uint32_t scene_scale_need_idle_us{0u}; // the GL-thread sleep per frame asked for before it (0: 4000)
+     std::uint32_t test_slow_ms{0u};
+     std::uint32_t test_slow_from{0u};
+     std::uint32_t test_slow_frames{0u};
+@@ -192,6 +200,12 @@ struct GlStats {
+     std::uint64_t blend_changes{};
+     std::uint64_t depth_changes{};
+     std::uint64_t cull_changes{};
++    std::uint64_t scene_scaled_frames{};  // frames whose 3D picture was drawn at the smaller scale and enlarged
++    std::uint64_t scene_scale_aborts{};   // frames that began scaled and went back to full size at once (not a 3D frame after all)
++    std::uint64_t scene_scale_late_3d{};  // 3D draws with a depth test on the display target after the enlargement and before the game's depth clear (should be 0)
++    std::uint64_t scene_scale_resolves{}; // enlargements (one per scaled frame)
++    std::uint64_t cull_draws{};         // glDraw* calls made with the cull test on
++    std::uint64_t cull_triangles{};     // ... and the triangles in them
+     std::uint64_t scissor_changes{};
+     std::uint64_t viewport_changes{};
+     std::uint64_t mask_changes{};
+@@ -287,6 +301,10 @@ public:
+         int state{-1};
+         std::uint32_t offs{};
+         std::uint32_t ons{};
++        int scaled{-1};                // the last rung: -1 not in use (no rung), 0 full size, 1 the 3D picture at the smaller scale now
++        std::uint32_t scale_downs{};   // times Auto dropped to the smaller scale and returned to full size since the start
++        std::uint32_t scale_ups{};
++        std::uint64_t scaled_frames{}; // frames drawn at the smaller scale
+     };
+     [[nodiscard]] AutoAaInfo auto_aa_info() const noexcept;
+ 
+diff --git a/tests/auto_aa_tests.cpp b/tests/auto_aa_tests.cpp
+index 3645af5..7c446aa 100644
+--- a/tests/auto_aa_tests.cpp
++++ b/tests/auto_aa_tests.cpp
+@@ -212,6 +212,136 @@ int main() {
+         r.aa.reset(r.now_us);
+         check(r.aa.on(), "reset (Auto chosen again) starts with FXAA on");
+     }
++    // ---- the resolution rung (scale_rung): FXAA off first, then the 3D picture at a smaller scale, and back one rung at a time ----
++    {
++        AutoAaConfig config;
++        config.scale_rung = true;
++        {
++            Run r(config);
++            r.healthy_seconds(2);
++            r.gpu_late();
++            check(r.gpu_late() == AutoAa::Event::TurnedOff && !r.aa.on() && !r.aa.scaled(), "rung: FXAA goes off first, the scale is untouched");
++            check(r.gpu_late() == AutoAa::Event::None && r.gpu_late() == AutoAa::Event::None && !r.aa.scaled(),
++                  "rung: the two frames after the change are grace (the dip FXAA's absence has not yet cured)");
++            check(r.gpu_late() == AutoAa::Event::None && !r.aa.scaled(), "rung: one late frame after grace is not enough");
++            check(r.gpu_late() == AutoAa::Event::ScaledDown && r.aa.scaled() && !r.aa.on(), "rung: two in a row after grace drop the scale, FXAA stays off");
++            check(r.aa.scale_downs() == 1u, "rung: counted");
++        }
++        {
++            // A dip that FXAA's absence cures stops at the first rung.
++            Run r(config);
++            r.healthy_seconds(2);
++            r.gpu_late();
++            r.gpu_late();
++            r.healthy_seconds(8);
++            r.frame(); r.gpu_late(); r.frame(); r.gpu_late();   // late frames that are not consecutive
++            check(!r.aa.scaled(), "rung: late frames that are not consecutive do not drop the scale");
++            check(r.aa.offs() == 1u && r.aa.scale_downs() == 0u, "rung: one change only");
++        }
++        {
++            // Without the rung enabled nothing changes (the 1.0 behaviour).
++            Run r;
++            r.healthy_seconds(2);
++            r.gpu_late();
++            r.gpu_late();
++            for (int i = 0; i < 60; ++i) r.gpu_late();
++            check(!r.aa.scaled() && r.aa.scale_downs() == 0u && r.aa.changes() == 1u, "rung off: never scaled, however late the frames");
++        }
++        {
++            // Recovery: ten quiet seconds with room bring the full size back; FXAA waits its own ten seconds after that.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 2 + 2 + 2; ++i) r.gpu_late();
++            check(r.aa.scaled(), "rung: scaled down (setup)");
++            r.healthy_seconds(9, 6'000);
++            check(r.aa.scaled(), "recovery: not before ten seconds");
++            r.healthy_seconds(2, 6'000);
++            check(!r.aa.scaled() && r.aa.scale_ups() == 1u && !r.aa.on(), "recovery: ten quiet seconds with room bring the full size back, FXAA still off");
++            r.healthy_seconds(9, 6'000);
++            check(!r.aa.on(), "recovery: FXAA waits its own ten seconds after the scale-up");
++            r.healthy_seconds(3, 6'000);
++            check(r.aa.on() && !r.aa.scaled(), "recovery: and then comes back");
++        }
++        {
++            // Not enough room at the smaller size: the full size is not tried.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            r.healthy_seconds(25, 2'000);
++            check(r.aa.scaled(), "recovery: the GL thread asleep 2 ms a frame is not room for the full size (4 ms asked)");
++            r.healthy_seconds(11, 6'000);
++            check(!r.aa.scaled(), "recovery: with 6 ms it is");
++        }
++        {
++            // Late frames while scaled start the quiet time over, and change nothing else.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            r.healthy_seconds(8, 6'000);
++            for (int i = 0; i < 10; ++i) r.gpu_late();
++            check(r.aa.scaled() && r.aa.scale_downs() == 1u, "scaled: more late frames change nothing (nothing left to give)");
++            r.healthy_seconds(9, 6'000);
++            check(r.aa.scaled(), "scaled: the quiet time began again at the last late frame");
++            r.healthy_seconds(2, 6'000);
++            check(!r.aa.scaled(), "scaled: and ten quiet seconds later the full size is back");
++        }
++        {
++            // A try of the full size that fails doubles the wait and asks for more room; one that holds is forgiven.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            const std::uint64_t first = r.aa.res_retry_us();
++            r.healthy_seconds(11, 6'000);
++            check(!r.aa.scaled(), "retry: the full size is tried (setup)");
++            for (int i = 0; i < 2 + 4 + 2; ++i) r.gpu_late();   // FXAA is off already; grace, then two late frames
++            check(r.aa.scaled() && r.aa.scale_downs() == 2u, "retry: late again within seconds: scaled down again");
++            check(r.aa.res_retry_us() == first * 2u && r.aa.res_need_idle_us() > r.aa.config().res_need_idle_us, "retry: a failed try doubles the wait and asks for more room");
++            r.healthy_seconds(15, 9'000);
++            check(r.aa.scaled(), "retry: the longer wait is respected (20 s, not 10)");
++            r.healthy_seconds(6, 9'000);
++            check(!r.aa.scaled(), "retry: tried after 20 seconds");
++            r.healthy_seconds(70, 9'000);   // holds for a minute (FXAA may come back meanwhile)
++            if (!r.aa.on()) {
++                for (int i = 0; i < 2 + 2; ++i) r.gpu_late();
++            }
++            check(r.aa.res_retry_us() == r.aa.config().res_retry_us || r.aa.on(), "retry: a try that held for a minute is forgiven");
++        }
++        {
++            // Menus and loads change nothing; a pause restarts the quiet time.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            for (int i = 0; i < 600; ++i) r.frame(50'000u, false, 12'000u, 20'000, 0);   // 20 s of menu frames the renderer was late on
++            check(r.aa.scaled(), "menus: frames without a 3D scene change nothing");
++            r.frame(900'000u, true, 1'700u, 8'000, 6'000);   // a load
++            r.healthy_seconds(9, 6'000);
++            check(r.aa.scaled(), "pause: the quiet time restarted after the load");
++        }
++        {
++            // A scene the GPU cannot carry even scaled: the full size is tried a handful of times in ten minutes, not a hundred.
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            std::uint32_t tries = 0;
++            for (int second = 0; second < 600; ++second) {
++                for (int i = 0; i < 30; ++i) {
++                    const AutoAa::Event e = r.aa.scaled() || !r.aa.on() ? r.frame(33'333u, true, 1'700u, 8'000, 9'000) : r.gpu_late();
++                    if (e == AutoAa::Event::ScaledUp) {
++                        ++tries;
++                        for (int k = 0; k < 8; ++k) r.gpu_late();   // and it fails at once
++                    }
++                }
++            }
++            check(tries >= 3 && tries <= 12, "a scene that never fits: the full size is tried a handful of times in ten minutes");
++        }
++        {
++            Run r(config);
++            r.healthy_seconds(2);
++            for (int i = 0; i < 6; ++i) r.gpu_late();
++            r.aa.reset(r.now_us);
++            check(r.aa.on() && !r.aa.scaled(), "reset (Auto chosen again) starts at full size with FXAA on");
++        }
++    }
+     std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILURES");
+     return g_failures == 0 ? 0 : 1;
+ }
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index fdd3fc2..cf7b24c 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -113,6 +113,7 @@ struct Options {
+     bool prepare{};  // Renderer::prepare_draw before submit, as the split renderer does
+     bool analyze{};
+     bool zstats{};
++    bool cull_stats{};
+     bool regs{};
+     std::set<std::uint64_t> detail;
+     bool null_draw{};
+@@ -185,6 +186,74 @@ class AnalyzeRenderer final : public gpu::Renderer {
+ public:
+     std::set<std::uint64_t> detail;
+     bool zstats{};
++    // --cull-stats: what the PSP's own rule (the sign of the screen-space area against the CULL register) does to each draw.
++    bool cull_stats{};
++    struct CullTotals {
++        std::uint64_t draws_tri{}, draws_cull_on{}, draws_cull_on_through{}, draws_cull_off{};
++        std::uint64_t tris_on{}, tris_on_culled{}, tris_on_degenerate{}, tris_on_clipped{};
++        std::uint64_t tris_off{}, tris_off_cw{}, tris_off_ccw{}, tris_off_degenerate{}, tris_off_clipped{};
++        std::uint64_t draws_off_all_one_side{}, draws_off_with_back{};
++        std::uint64_t draws_on_expect_gl_cull{}, draws_on_gl_cull_missing{};
++        std::uint64_t tris_on_through{};
++    } cull;
++    void count_cull(const gpu::DrawCall &call) {
++        const bool tri = call.primitive == gpu::PrimitiveType::Triangles || call.primitive == gpu::PrimitiveType::TriangleStrip ||
++                         call.primitive == gpu::PrimitiveType::TriangleFan;
++        if (!tri || call.clear_mode || call.vertices.empty()) return;
++        ++cull.draws_tri;
++        const std::size_t count = call.indices.empty() ? call.vertices.size() : call.indices.size();
++        struct S { float x, y; bool ok; };
++        std::vector<S> v(count);
++        for (std::size_t i = 0; i < count; ++i) {
++            const std::size_t index = call.indices.empty() ? i : std::min<std::size_t>(call.indices[i], call.vertices.size() - 1u);
++            const gpu::Vertex &vx = call.vertices[index];
++            if (call.through) { v[i] = {vx.position[0], vx.position[1], true}; continue; }
++            float p[4] = {vx.position[0], vx.position[1], vx.position[2], 1.0f}, q[4], r[4], c[4];
++            for (int col = 0; col < 4; ++col) q[col] = p[0] * call.world[col] + p[1] * call.world[4 + col] + p[2] * call.world[8 + col] + p[3] * call.world[12 + col];
++            for (int col = 0; col < 4; ++col) r[col] = q[0] * call.view[col] + q[1] * call.view[4 + col] + q[2] * call.view[8 + col] + q[3] * call.view[12 + col];
++            for (int col = 0; col < 4; ++col) c[col] = r[0] * call.projection[col] + r[1] * call.projection[4 + col] + r[2] * call.projection[8 + col] + r[3] * call.projection[12 + col];
++            if (c[3] <= 1e-6f) { v[i] = {0, 0, false}; continue; }
++            const float inv = 1.0f / c[3];
++            v[i] = {c[0] * inv * call.viewport.x_scale + call.viewport.x_offset - call.viewport.offset_x,
++                    c[1] * inv * call.viewport.y_scale + call.viewport.y_offset - call.viewport.offset_y, true};
++        }
++        std::uint64_t n_tris = 0, n_cw = 0, n_ccw = 0, n_degenerate = 0, n_clipped = 0;
++        const auto one = [&](const S &a, const S &b, const S &c2) {
++            ++n_tris;
++            if (!a.ok || !b.ok || !c2.ok) { ++n_clipped; return; }
++            const float area = (b.x - a.x) * (c2.y - a.y) - (c2.x - a.x) * (b.y - a.y);
++            if (area == 0.0f || !std::isfinite(area)) { ++n_degenerate; return; }
++            if (area < 0.0f) ++n_cw; else ++n_ccw;
++        };
++        if (call.primitive == gpu::PrimitiveType::Triangles) {
++            for (std::size_t i = 0; i + 2u < count; i += 3u) one(v[i], v[i + 1], v[i + 2]);
++        } else if (call.primitive == gpu::PrimitiveType::TriangleStrip) {
++            for (std::size_t i = 0; i + 2u < count; ++i) {
++                if (i & 1u) one(v[i + 1], v[i], v[i + 2]); else one(v[i], v[i + 1], v[i + 2]);
++            }
++        } else {
++            for (std::size_t i = 1; i + 1u < count; ++i) one(v[0], v[i], v[i + 1]);
++        }
++        // What the renderer decides (gl_renderer.cpp): the test is on when the draw has it enabled and is not through-mode.
++        const bool gl_cull = call.culling_enabled && !call.through;
++        if (call.culling_enabled) {
++            if (call.through) { ++cull.draws_cull_on_through; cull.tris_on_through += n_tris; return; }
++            ++cull.draws_cull_on;
++            cull.tris_on += n_tris;
++            cull.tris_on_degenerate += n_degenerate;
++            cull.tris_on_clipped += n_clipped;
++            cull.tris_on_culled += call.cull_clockwise ? n_cw : n_ccw;
++            if (gl_cull) ++cull.draws_on_expect_gl_cull; else ++cull.draws_on_gl_cull_missing;
++        } else {
++            ++cull.draws_cull_off;
++            cull.tris_off += n_tris;
++            cull.tris_off_cw += n_cw;
++            cull.tris_off_ccw += n_ccw;
++            cull.tris_off_degenerate += n_degenerate;
++            cull.tris_off_clipped += n_clipped;
++            if (n_cw == 0u || n_ccw == 0u) ++cull.draws_off_all_one_side; else ++cull.draws_off_with_back;
++        }
++    }
+     static void print_matrix(const char *name, const std::array<float, 16> &m) {
+         std::printf("    %s:", name);
+         for (int row = 0; row < 4; ++row) {
+@@ -292,6 +361,7 @@ public:
+                     call.viewport.scissor_x1, call.viewport.scissor_y1, call.viewport.scissor_x2,
+                     call.viewport.scissor_y2, call.lighting_enabled ? 1 : 0, call.fog.enabled ? 1 : 0,
+                     call.clear_mode ? 1 : 0, call.clear_flags, call.material_color);
++        if (cull_stats) count_cull(call);
+         if (detail.count(draws) != 0u) print_detail(call, memory);
+         if (zstats && !call.through && !call.vertices.empty()) {
+             // View-space z (world * view, row vectors) over every decoded vertex: how far from the camera this draw reaches.
+@@ -536,6 +606,7 @@ int main(int argc, char **argv) {
+         else if (arg == "--shader-lint") options.shader_lint = true;
+         else if (arg == "--analyze") options.analyze = true;
+         else if (arg == "--zstats") options.zstats = true;
++        else if (arg == "--cull-stats") options.cull_stats = true;
+         else if (arg == "--regs") options.regs = true;
+         else if (arg == "--detail") {
+             std::vector<std::uint64_t> list;
+@@ -669,6 +740,7 @@ int main(int argc, char **argv) {
+         analyze = made.get();
+         made->detail = options.detail;
+         made->zstats = options.zstats;
++        made->cull_stats = options.cull_stats;
+         renderer = std::move(made);
+     } else {
+ #if defined(GE_REPLAY_HAS_GL)
+@@ -992,6 +1064,20 @@ int main(int argc, char **argv) {
+     } else if (const int result = replay(); result != 0) {
+         return result;
+     }
++    if (analyze != nullptr && options.cull_stats) {
++        const auto &c = analyze->cull;
++        const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
++        std::printf("CULL STATS (screen-space winding against the CULL register, the GE's rule)\n");
++        std::printf("  triangle/strip/fan draws (not clears): %llu\n", n(c.draws_tri));
++        std::printf("  CULLFACEENABLE on, transform mode: %llu draws, %llu triangles; the GE culls %llu of them (%.1f%%), %llu degenerate, %llu partly behind the eye\n",
++                    n(c.draws_cull_on), n(c.tris_on), n(c.tris_on_culled), c.tris_on ? 100.0 * c.tris_on_culled / c.tris_on : 0.0,
++                    n(c.tris_on_degenerate), n(c.tris_on_clipped));
++        std::printf("  ... of those draws the GL renderer submits with the test OFF: %llu\n", n(c.draws_on_gl_cull_missing));
++        std::printf("  CULLFACEENABLE on, through mode (the GE does not cull): %llu draws, %llu triangles\n", n(c.draws_cull_on_through), n(c.tris_on_through));
++        std::printf("  CULLFACEENABLE off: %llu draws, %llu triangles; of them %llu clockwise, %llu counter-clockwise on screen, %llu degenerate, %llu clipped; %llu draws one-sided, %llu with both\n",
++                    n(c.draws_cull_off), n(c.tris_off), n(c.tris_off_cw), n(c.tris_off_ccw), n(c.tris_off_degenerate), n(c.tris_off_clipped),
++                    n(c.draws_off_all_one_side), n(c.draws_off_with_back));
++    }
+     if (options.regs) {
+         for (const auto &[key, count] : register_values)
+             std::printf("reg 0x%02X = 0x%06X : %llu draws\n", static_cast<unsigned>(key >> 32u),
+@@ -1042,6 +1128,11 @@ int main(int argc, char **argv) {
+         line("blend state changes", t.blend_changes);
+         line("depth state changes", t.depth_changes);
+         line("cull state changes", t.cull_changes);
++        line("scene scale: frames drawn smaller", t.scene_scaled_frames);
++        line("scene scale: frames that went back at once", t.scene_scale_aborts);
++        line("scene scale: 3D draws after the enlargement that test depth", t.scene_scale_late_3d);
++        line("GL draws with the cull test on", t.cull_draws);
++        line("triangles in them", t.cull_triangles);
+         line("scissor changes", t.scissor_changes);
+         line("viewport changes", t.viewport_changes);
+         line("colour mask changes", t.mask_changes);
+-- 
+2.43.0
+
