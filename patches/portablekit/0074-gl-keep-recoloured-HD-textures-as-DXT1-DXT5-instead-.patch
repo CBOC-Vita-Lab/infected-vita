@@ -1,0 +1,873 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:10:41 -0500
+Subject: [PATCH 74/76] gl: keep recoloured HD textures as DXT1/DXT5 instead of
+ RGBA8
+
+Recoloured pack textures were rebuilt on the loader thread and uploaded as
+RGBA8. They are now encoded with a small built-in DXT encoder and uploaded
+compressed (8x less memory and bandwidth). HD_RECOLOUR_DXT=0 restores RGBA8;
+HD_RECOLOUR_CHECK=1 reports PSNR per texture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |   9 ++
+ host/gpu/dxt_encode.hpp        | 272 +++++++++++++++++++++++++++++++++
+ host/gpu/gl/gl_hd_textures.cpp | 217 +++++++++++++++++++++++++-
+ host/gpu/gl/gl_hd_textures.hpp |   4 +
+ host/gpu/hd_texture_pack.cpp   |   2 +
+ host/gpu/hd_texture_pack.hpp   |  13 ++
+ tests/dxt_encode_tests.cpp     | 134 ++++++++++++++++
+ 7 files changed, 644 insertions(+), 7 deletions(-)
+ create mode 100644 host/gpu/dxt_encode.hpp
+ create mode 100644 tests/dxt_encode_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5a3233c..9a58572 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -435,6 +435,15 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_auto_aa_tests COMMAND portablekit_auto_aa_tests)
+ endif()
+ 
++# host/gpu/dxt_encode.hpp: the run-time DXT1/DXT5 encoder for rebuilt HD textures, checked against a reference decoder. Header only.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_dxt_encode_tests "${PORTABLEKIT_ROOT}/tests/dxt_encode_tests.cpp")
++    target_compile_features(portablekit_dxt_encode_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_dxt_encode_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_dxt_encode_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_dxt_encode_tests COMMAND portablekit_dxt_encode_tests)
++endif()
++
+ # The settings overlay (host/overlay): chord, navigation, saving, script and drawing on a software canvas.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_overlay_tests
+diff --git a/host/gpu/dxt_encode.hpp b/host/gpu/dxt_encode.hpp
+new file mode 100644
+index 0000000..840b81c
+--- /dev/null
++++ b/host/gpu/dxt_encode.hpp
+@@ -0,0 +1,272 @@
++#pragma once
++
++// A small DXT1 / DXT5 (BC1 / BC3) encoder for pictures the renderer builds at run time (a character texture rebuilt for the
++// palette the game uses now, gl_hd_textures.cpp), where an offline compressor cannot be used. Written for speed on the Vita's
++// ARM core, not for the last decibel: per 4x4 block one principal-axis estimate from the covariance, 565 endpoints, exact
++// nearest-index selection against the decoded palette and one least-squares refit of the endpoints. Own code, no external
++// source. Pixels are RGBA bytes with red in the low byte (the renderer's order), rows top to bottom.
++//
++// The output is the layout the pack blobs and the GL compressed formats use: DXT1 8 bytes a block (c0 u16, c1 u16, 32 bits of
++// 2-bit indices, texel 0 in the low bits) with c0 > c1 always (four-colour mode, so no black or transparent index appears),
++// DXT5 16 bytes (alpha: a0, a1, 48 bits of 3-bit indices, then the colour block), blocks left to right, rows top to bottom.
++// A level whose width or height is not a multiple of 4 is padded by repeating its edge texels.
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace portablekit::gpu::dxt {
++
++// Bytes of an encoded level.
++[[nodiscard]] inline std::size_t encoded_bytes(bool alpha, std::uint32_t width, std::uint32_t height) {
++    return static_cast<std::size_t>((width + 3u) / 4u) * ((height + 3u) / 4u) * (alpha ? 16u : 8u);
++}
++
++namespace detail {
++
++inline std::uint32_t expand5(std::uint32_t v) { return (v << 3u) | (v >> 2u); }
++inline std::uint32_t expand6(std::uint32_t v) { return (v << 2u) | (v >> 4u); }
++
++inline std::uint16_t pack565(int r, int g, int b) {   // r, g, b 0..255 -> nearest 565
++    // round(v * 31 / 255) and round(v * 63 / 255) without a division (exact for 0..255)
++    r = std::clamp(r, 0, 255), g = std::clamp(g, 0, 255), b = std::clamp(b, 0, 255);
++    const int r5 = (r * 249 + 1024) >> 11;
++    const int g6 = (g * 253 + 512) >> 10;
++    const int b5 = (b * 249 + 1024) >> 11;
++    return static_cast<std::uint16_t>((r5 << 11) | (g6 << 5) | b5);
++}
++
++inline void unpack565(std::uint16_t c, int &r, int &g, int &b) {
++    r = static_cast<int>(expand5((c >> 11u) & 31u));
++    g = static_cast<int>(expand6((c >> 5u) & 63u));
++    b = static_cast<int>(expand5(c & 31u));
++}
++
++// The colour part of a block: `px` are 16 texels (RGBA, red low). Writes 8 bytes.
++inline void encode_colour(const std::uint32_t *px, std::uint8_t *out, int effort) {
++    int rgb[16][3];
++    int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
++    int sum[3] = {0, 0, 0};
++    for (int i = 0; i < 16; ++i) {
++        rgb[i][0] = static_cast<int>(px[i] & 255u);
++        rgb[i][1] = static_cast<int>((px[i] >> 8u) & 255u);
++        rgb[i][2] = static_cast<int>((px[i] >> 16u) & 255u);
++        for (int c = 0; c < 3; ++c) {
++            lo[c] = std::min(lo[c], rgb[i][c]);
++            hi[c] = std::max(hi[c], rgb[i][c]);
++            sum[c] += rgb[i][c];
++        }
++    }
++    std::uint16_t c0, c1;
++    std::uint32_t indices = 0u;
++    if (lo[0] == hi[0] && lo[1] == hi[1] && lo[2] == hi[2]) {
++        // A flat block: the 565 value nearest to it, and index 0.
++        c0 = pack565(lo[0], lo[1], lo[2]);
++        c1 = c0 > 0u ? static_cast<std::uint16_t>(c0 - 1u) : static_cast<std::uint16_t>(0u);
++        std::uint8_t fill = 0u;   // index 0 = c0
++        if (c0 == 0u) {           // black: c0 = 1 (almost black) and c1 = 0, every texel index 1 = c1
++            c0 = 1u;
++            fill = 0x55u;
++        }
++        std::uint8_t *p = out;
++        p[0] = static_cast<std::uint8_t>(c0), p[1] = static_cast<std::uint8_t>(c0 >> 8u);
++        p[2] = static_cast<std::uint8_t>(c1), p[3] = static_cast<std::uint8_t>(c1 >> 8u);
++        p[4] = p[5] = p[6] = p[7] = fill;
++        return;
++    }
++    // The axis through the block's colours: the covariance's dominant direction, three power-iteration steps from the
++    // bounding box diagonal (the cheap guess when the colours lie along it).
++    const float mean[3] = {sum[0] / 16.0f, sum[1] / 16.0f, sum[2] / 16.0f};
++    float cov[6] = {0, 0, 0, 0, 0, 0};   // rr rg rb gg gb bb
++    for (int i = 0; i < 16; ++i) {
++        const float r = rgb[i][0] - mean[0], g = rgb[i][1] - mean[1], b = rgb[i][2] - mean[2];
++        cov[0] += r * r, cov[1] += r * g, cov[2] += r * b, cov[3] += g * g, cov[4] += g * b, cov[5] += b * b;
++    }
++    float axis[3] = {static_cast<float>(hi[0] - lo[0]), static_cast<float>(hi[1] - lo[1]), static_cast<float>(hi[2] - lo[2])};
++    // The box diagonal runs from the minimum to the maximum corner; the signs of the red-green and red-blue covariances say whether
++    // green and blue rise or fall with red.
++    if (cov[1] < 0.0f) axis[1] = -axis[1];
++    if (cov[2] < 0.0f) axis[2] = -axis[2];
++    for (int it = 0; it < (effort >= 2 ? 3 : 0); ++it) {
++        const float x = cov[0] * axis[0] + cov[1] * axis[1] + cov[2] * axis[2];
++        const float y = cov[1] * axis[0] + cov[3] * axis[1] + cov[4] * axis[2];
++        const float z = cov[2] * axis[0] + cov[4] * axis[1] + cov[5] * axis[2];
++        const float m = std::max({x < 0 ? -x : x, y < 0 ? -y : y, z < 0 ? -z : z});
++        if (m < 1e-6f) break;
++        axis[0] = x / m, axis[1] = y / m, axis[2] = z / m;
++    }
++    // Endpoints: the extremes of the projections onto the axis.
++    float tmin = 1e30f, tmax = -1e30f;
++    for (int i = 0; i < 16; ++i) {
++        const float t = (rgb[i][0] - mean[0]) * axis[0] + (rgb[i][1] - mean[1]) * axis[1] + (rgb[i][2] - mean[2]) * axis[2];
++        tmin = std::min(tmin, t);
++        tmax = std::max(tmax, t);
++    }
++    const float norm = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
++    float end[2][3];
++    for (int c = 0; c < 3; ++c) {
++        end[0][c] = mean[c] + axis[c] * tmax / (norm > 0 ? norm : 1.0f);
++        end[1][c] = mean[c] + axis[c] * tmin / (norm > 0 ? norm : 1.0f);
++    }
++    const auto quant = [&](const float (&e)[3]) {
++        return pack565(static_cast<int>(e[0] + 0.5f), static_cast<int>(e[1] + 0.5f), static_cast<int>(e[2] + 0.5f));
++    };
++    c0 = quant(end[0]);
++    c1 = quant(end[1]);
++    int palette[4][3];
++    const auto build = [&]() {
++        if (c0 < c1) std::swap(c0, c1);
++        if (c0 == c1) {   // keep the four-colour mode: c0 > c1
++            if (c0 != 0xFFFFu) ++c0; else --c1;
++        }
++        unpack565(c0, palette[0][0], palette[0][1], palette[0][2]);
++        unpack565(c1, palette[1][0], palette[1][1], palette[1][2]);
++        for (int c = 0; c < 3; ++c) {
++            palette[2][c] = (2 * palette[0][c] + palette[1][c]) / 3;
++            palette[3][c] = (palette[0][c] + 2 * palette[1][c]) / 3;
++        }
++    };
++    // The four palette colours lie on one line, so the nearest one is the one nearest by projection onto it: three comparisons
++    // against the midpoints instead of four distances.
++    const auto assign = [&]() {
++        const int dr = palette[0][0] - palette[1][0], dg = palette[0][1] - palette[1][1], db = palette[0][2] - palette[1][2];
++        int dot[4];
++        for (int k = 0; k < 4; ++k) dot[k] = palette[k][0] * dr + palette[k][1] * dg + palette[k][2] * db;
++        // dot[0] >= dot[2] >= dot[3] >= dot[1]
++        const int t1 = (dot[0] + dot[2]) / 2, t2 = (dot[2] + dot[3]) / 2, t3 = (dot[3] + dot[1]) / 2;
++        std::uint32_t result = 0u;
++        for (int i = 0; i < 16; ++i) {
++            const int d = rgb[i][0] * dr + rgb[i][1] * dg + rgb[i][2] * db;
++            const std::uint32_t code = d >= t1 ? 0u : (d >= t2 ? 2u : (d >= t3 ? 3u : 1u));
++            result |= code << (2 * i);
++        }
++        return result;
++    };
++    build();
++    indices = assign();
++    // One least-squares refit of the endpoints for the indices found (weights 1, 2/3, 1/3, 0 of c0), then the indices again.
++    if (effort >= 1) {
++        static const float w0[4] = {1.0f, 0.0f, 2.0f / 3.0f, 1.0f / 3.0f};   // index 0 = c0, 1 = c1, 2 = 2/3 c0 + 1/3 c1, 3 = 1/3 c0 + 2/3 c1
++        float aa = 0, bb = 0, ab = 0, ax[3] = {0, 0, 0}, bx[3] = {0, 0, 0};
++        for (int i = 0; i < 16; ++i) {
++            const float a = w0[(indices >> (2 * i)) & 3u], b = 1.0f - a;
++            aa += a * a, bb += b * b, ab += a * b;
++            for (int c = 0; c < 3; ++c) ax[c] += a * rgb[i][c], bx[c] += b * rgb[i][c];
++        }
++        const float det = aa * bb - ab * ab;
++        if (det > 1e-4f || det < -1e-4f) {
++            float e0[3], e1[3];
++            for (int c = 0; c < 3; ++c) {
++                e0[c] = (ax[c] * bb - bx[c] * ab) / det;
++                e1[c] = (bx[c] * aa - ax[c] * ab) / det;
++                e0[c] = std::clamp(e0[c], 0.0f, 255.0f);
++                e1[c] = std::clamp(e1[c], 0.0f, 255.0f);
++            }
++            const std::uint16_t n0 = quant(e0), n1 = quant(e1);
++            const std::uint16_t o0 = c0, o1 = c1;
++            const std::uint32_t old_indices = indices;
++            c0 = n0, c1 = n1;
++            build();
++            const std::uint32_t refit = assign();
++            // Keep the refit only when it is no worse than the first fit.
++            int err_new = 0;
++            for (int i = 0; i < 16; ++i) {
++                const int k = static_cast<int>((refit >> (2 * i)) & 3u);
++                for (int c = 0; c < 3; ++c) {
++                    const int d = rgb[i][c] - palette[k][c];
++                    err_new += d * d;
++                }
++            }
++            int p_old[4][3];
++            {
++                const std::uint16_t s0 = c0, s1 = c1;
++                c0 = o0, c1 = o1;
++                build();
++                for (int k = 0; k < 4; ++k)
++                    for (int c = 0; c < 3; ++c) p_old[k][c] = palette[k][c];
++                c0 = s0, c1 = s1;
++            }
++            int err_old = 0;
++            for (int i = 0; i < 16; ++i) {
++                const int k = static_cast<int>((old_indices >> (2 * i)) & 3u);
++                for (int c = 0; c < 3; ++c) {
++                    const int d = rgb[i][c] - p_old[k][c];
++                    err_old += d * d;
++                }
++            }
++            if (err_new <= err_old) {
++                indices = refit;
++            } else {
++                c0 = o0, c1 = o1;
++                build();
++                indices = old_indices;
++            }
++        }
++    }
++    // build() may have swapped the endpoints (c0 < c1 after the refit's quantisation): the indices were chosen against
++    // the palette it built, so they match what is written.
++    out[0] = static_cast<std::uint8_t>(c0), out[1] = static_cast<std::uint8_t>(c0 >> 8u);
++    out[2] = static_cast<std::uint8_t>(c1), out[3] = static_cast<std::uint8_t>(c1 >> 8u);
++    out[4] = static_cast<std::uint8_t>(indices), out[5] = static_cast<std::uint8_t>(indices >> 8u);
++    out[6] = static_cast<std::uint8_t>(indices >> 16u), out[7] = static_cast<std::uint8_t>(indices >> 24u);
++}
++
++// The alpha part of a DXT5 block (8 bytes): eight-level mode, a0 > a1.
++inline void encode_alpha(const std::uint32_t *px, std::uint8_t *out) {
++    int lo = 255, hi = 0;
++    int a[16];
++    for (int i = 0; i < 16; ++i) {
++        a[i] = static_cast<int>(px[i] >> 24u);
++        lo = std::min(lo, a[i]);
++        hi = std::max(hi, a[i]);
++    }
++    if (lo == hi) {
++        out[0] = static_cast<std::uint8_t>(hi);
++        out[1] = static_cast<std::uint8_t>(hi > 0 ? hi - 1 : 0);
++        if (hi == 0) out[0] = 1;   // keep a0 > a1; index 0 would then be 1, not 0: use a1 = 0 and index 1 instead
++        std::uint64_t bits = 0u;
++        if (hi == 0)
++            for (int i = 0; i < 16; ++i) bits |= static_cast<std::uint64_t>(1u) << (3 * i);   // index 1 = a1 = 0
++        for (int i = 0; i < 6; ++i) out[2 + i] = static_cast<std::uint8_t>(bits >> (8 * i));
++        return;
++    }
++    const int a0 = hi, a1 = lo;
++    std::uint64_t bits = 0u;
++    const int range = a0 - a1;
++    for (int i = 0; i < 16; ++i) {
++        // Step s in 0..7 along a0 -> a1; the code of step s is 0 for s = 0, 1 for s = 7, s + 1 between.
++        const int s = std::clamp(((a0 - a[i]) * 7 + range / 2) / range, 0, 7);
++        const int code = s == 0 ? 0 : (s == 7 ? 1 : s + 1);
++        bits |= static_cast<std::uint64_t>(code) << (3 * i);
++    }
++    out[0] = static_cast<std::uint8_t>(a0);
++    out[1] = static_cast<std::uint8_t>(a1);
++    for (int i = 0; i < 6; ++i) out[2 + i] = static_cast<std::uint8_t>(bits >> (8 * i));
++}
++
++} // namespace detail
++
++// Encodes a width x height level (RGBA, red low) into `out`, resized to encoded_bytes(); `alpha` selects DXT5 over DXT1.
++inline void encode_level(bool alpha, const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height, std::vector<std::uint8_t> &out, int effort = 2) {
++    const std::uint32_t bw = (width + 3u) / 4u, bh = (height + 3u) / 4u;
++    out.resize(encoded_bytes(alpha, width, height));
++    std::uint8_t *o = out.data();
++    std::uint32_t px[16];
++    for (std::uint32_t by = 0; by < bh; ++by)
++        for (std::uint32_t bx = 0; bx < bw; ++bx) {
++            for (std::uint32_t y = 0; y < 4u; ++y) {
++                const std::uint32_t sy = std::min(by * 4u + y, height - 1u);
++                for (std::uint32_t x = 0; x < 4u; ++x) px[y * 4u + x] = rgba[static_cast<std::size_t>(sy) * width + std::min(bx * 4u + x, width - 1u)];
++            }
++            if (alpha) {
++                detail::encode_alpha(px, o);
++                detail::encode_colour(px, o + 8, effort);
++                o += 16;
++            } else {
++                detail::encode_colour(px, o, effort);
++                o += 8;
++            }
++        }
++}
++
++} // namespace portablekit::gpu::dxt
+diff --git a/host/gpu/gl/gl_hd_textures.cpp b/host/gpu/gl/gl_hd_textures.cpp
+index 9f95285..6bd4928 100644
+--- a/host/gpu/gl/gl_hd_textures.cpp
++++ b/host/gpu/gl/gl_hd_textures.cpp
+@@ -1,11 +1,14 @@
+ #include "gl_hd_textures.hpp"
+ 
+ #include "../../settings/port_settings.hpp"
++#include "../dxt_encode.hpp"
+ #include "../texture_decode.hpp"
+ #include "gl_platform.h"
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstring>
+@@ -122,13 +125,20 @@ struct GlHdTextures::Loader {
+         bool recolour{};
+         TextureState state;                // a recolour: the palette's format, shift, mask and offset
+         std::vector<std::uint8_t> clut;    // a recolour: the palette's bytes
++        bool compress{};                   // a recolour: keep it as DXT (HdConfig::recolour_dxt)
++        bool check{};                      // ... and measure the PSNR
+     };
+     struct Read {
+         std::vector<std::uint8_t> blob;        // a record's blob
+         std::vector<std::uint32_t> levels;     // a recolour: every mip level, level 0 first
++        std::vector<std::uint8_t> dxt;         // a recolour kept as DXT: its levels, in place of `levels`
++        std::uint32_t dxt_levels{};
++        bool dxt_alpha{};
++        double psnr{-1.0};
++        std::uint64_t encode_ns{}, rgba_bytes{};
+         std::uint32_t width{}, height{};
+         bool ok{};
+-        [[nodiscard]] std::size_t bytes() const noexcept { return blob.size() + levels.size() * 4u; }
++        [[nodiscard]] std::size_t bytes() const noexcept { return blob.size() + levels.size() * 4u + dxt.size(); }
+     };
+     // Results not claimed yet are dropped past this (a texture that left the screen before its replacement came).
+     static constexpr std::size_t kKeptBytes = 8u * 1024u * 1024u;
+@@ -410,6 +420,71 @@ void halve(const std::vector<std::uint32_t> &in, std::uint32_t w, std::uint32_t
+         }
+ }
+ 
++// A rebuilt picture kept as DXT: every level down to 1x1 (to the last whole 4x4 block on the Vita, as the pack's own DXT
++// records), encoded one after the other. DXT5 when any texel of level 0 is not opaque, DXT1 otherwise. `level` is consumed.
++struct DxtChain {
++    std::vector<std::uint8_t> bytes;
++    std::uint32_t levels{};
++    bool alpha{};
++    double psnr{-1.0};          // level 0 against its source, when asked
++    std::uint64_t ns{};
++    std::uint64_t rgba_bytes{}; // the same chain as RGBA8
++};
++
++void build_dxt_chain(std::vector<std::uint32_t> &level, std::uint32_t width, std::uint32_t height, bool check, DxtChain &out) {
++    const auto start = std::chrono::steady_clock::now();
++    out.bytes.clear();
++    out.levels = 0u;
++    out.rgba_bytes = 0u;
++    out.alpha = false;
++    for (const std::uint32_t texel : level)
++        if ((texel >> 24u) != 0xFFu) {
++            out.alpha = true;
++            break;
++        }
++    std::vector<std::uint8_t> encoded;
++    std::vector<std::uint32_t> next, decoded;
++    std::uint32_t w = width, h = height;
++    for (;;) {
++#if defined(__vita__)
++        if (out.levels != 0u && (w < 4u || h < 4u)) break;   // vitaGL swizzles compressed levels in whole 4x4 blocks
++#endif
++        dxt::encode_level(out.alpha, level.data(), w, h, encoded, out.levels == 0u ? 1 : 0);
++        out.bytes.insert(out.bytes.end(), encoded.begin(), encoded.end());
++        out.rgba_bytes += static_cast<std::uint64_t>(w) * h * 4u;
++        if (out.levels == 0u && check) {
++            decode_dxt_level(out.alpha ? HdFormat::Dxt5 : HdFormat::Dxt1, encoded.data(), w, h, decoded);
++            double squared = 0.0;
++            for (std::size_t i = 0; i < decoded.size(); ++i)
++                for (std::uint32_t c = 0; c < 4u; ++c) {
++                    const double d = static_cast<double>((decoded[i] >> (8u * c)) & 255u) - static_cast<double>((level[i] >> (8u * c)) & 255u);
++                    squared += d * d;
++                }
++            const double mse = squared / (static_cast<double>(decoded.size()) * 4.0);
++            out.psnr = mse <= 0.0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
++        }
++        ++out.levels;
++        if (w == 1u && h == 1u) break;
++        halve(level, w, h, next);
++        level.swap(next);
++        w = std::max(w / 2u, 1u);
++        h = std::max(h / 2u, 1u);
++    }
++    out.ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++}
++
++void note_recolour_dxt(HdStats &stats, std::uint64_t bytes, std::uint64_t rgba_bytes, std::uint64_t ns, double psnr) {
++    ++stats.recolour_dxt_textures;
++    stats.recolour_dxt_bytes += bytes;
++    stats.recolour_rgba_bytes += rgba_bytes;
++    stats.recolour_encode_ns += ns;
++    if (psnr >= 0.0) {
++        stats.recolour_psnr_sum += psnr;
++        stats.recolour_psnr_min = std::min(stats.recolour_psnr_min, psnr);
++        ++stats.recolour_psnr_n;
++    }
++}
++
+ // A recolourable texture whose palette the game rewrites again and again (the minimap) would be rebuilt at every change: 4-6 ms at 2x
+ // and 19-43 ms at 4x on a desktop core, far more on a Vita, and every rebuild leaves a new GPU texture (the renderer's cache key
+ // includes the palette) that holds replacement budget until it is evicted. A palette slot may change kRecolourFree times in a row,
+@@ -448,6 +523,22 @@ void GlHdTextures::Loader::build_recolour(const Job &job, Read &read) {
+     }
+     std::vector<std::uint32_t> level(static_cast<std::size_t>(width) * height), next;
+     hd_apply_recolour(recolour, base.data(), palette, level.data());
++    if (job.compress) {
++        DxtChain chain;
++        build_dxt_chain(level, width, height, job.check, chain);
++        read.dxt = std::move(chain.bytes);
++        read.dxt_levels = chain.levels;
++        read.dxt_alpha = chain.alpha;
++        read.psnr = chain.psnr;
++        read.encode_ns = chain.ns;
++        read.rgba_bytes = chain.rgba_bytes;
++        read.levels.clear();
++        read.width = width;
++        read.height = height;
++        read.blob.clear();
++        read.ok = true;
++        return;
++    }
+     // The chain the GL thread's recolour builds (GlHdTextures::try_recolour), level by level down to 1x1.
+     read.levels.clear();
+     std::uint32_t w = width, h = height;
+@@ -530,6 +621,72 @@ bool GlHdTextures::upload_recoloured(std::uint32_t texture, const std::vector<st
+     info.mips = static_cast<std::uint8_t>(levels);
+     ++stats_.resident_textures;
+     stats_.resident_bytes += gpu_bytes;
++    info.storage = 2u;
++    stats_.resident_by_storage[2] += gpu_bytes;
++    stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
++    return true;
++}
++
++bool GlHdTextures::upload_recoloured_dxt(std::uint32_t texture, const std::vector<std::uint8_t> &bytes, std::uint32_t levels, bool alpha,
++                                         std::uint32_t width, std::uint32_t height, HdTextureInfo &info) {
++    if (!s3tc_known_) {   // the first upload decides, as upload_blob does
++        s3tc_known_ = true;
++        levels_in_place_ = glp::reserve_compressed_mips();
++#if defined(__vita__)
++        s3tc_ = true;
++#else
++        const char *extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
++        s3tc_ = extensions != nullptr && (std::strstr(extensions, "GL_EXT_texture_compression_s3tc") != nullptr ||
++                                          std::strstr(extensions, "GL_EXT_texture_compression_dxt1") != nullptr);
++#endif
++    }
++    if (bind_) bind_(texture);
++    else glBindTexture(GL_TEXTURE_2D, texture);
++    std::uint64_t gpu_bytes = 0u;
++    std::uint32_t w = width, h = height, uploaded = 0u;
++    std::size_t offset = 0u;
++    std::vector<std::uint32_t> expanded;
++    for (std::uint32_t level = 0; level < levels; ++level) {
++        const std::size_t level_bytes = dxt::encoded_bytes(alpha, w, h);
++        if (offset + level_bytes > bytes.size()) return false;
++        const std::uint8_t *data = bytes.data() + offset;
++        if (s3tc_) {
++            glCompressedTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), alpha ? GL_COMPRESSED_RGBA_S3TC_DXT5_EXT : GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
++                                   static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, static_cast<GLsizei>(level_bytes), data);
++            gpu_bytes += level_bytes;
++        } else {
++            decode_dxt_level(alpha ? HdFormat::Dxt5 : HdFormat::Dxt1, data, w, h, expanded);
++            glTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), GL_RGBA, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
++                         GL_UNSIGNED_BYTE, expanded.data());
++            gpu_bytes += static_cast<std::uint64_t>(w) * h * 4u;
++        }
++#if defined(__vita__)
++        if (!levels_in_place_) {
++            const Clock::time_point wait_start = Clock::now();
++            (void)sceGxmTransferFinish();
++            const std::uint64_t waited = nanoseconds_since(wait_start);
++            stats_.gpu_wait_ns += waited;
++            stats_.last_gpu_wait_ns += waited;
++        }
++#endif
++        offset += level_bytes;
++        ++uploaded;
++        w = std::max(w / 2u, 1u);
++        h = std::max(h / 2u, 1u);
++    }
++    if (uploaded == 0u) return false;
++    ++stats_.recolour_hits;
++    ++stats_.hits;
++    info.replaced = true;
++    info.recoloured = true;
++    info.gpu_bytes = gpu_bytes;
++    info.width = static_cast<std::uint16_t>(width);
++    info.height = static_cast<std::uint16_t>(height);
++    info.mips = static_cast<std::uint8_t>(uploaded);
++    ++stats_.resident_textures;
++    stats_.resident_bytes += gpu_bytes;
++    info.storage = 3u;
++    stats_.resident_by_storage[3] += gpu_bytes;
+     stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
+     return true;
+ }
+@@ -542,7 +699,13 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+         Loader::Read read;
+         if (loader_->take(info.key, read)) {
+             const Clock::time_point start = Clock::now();
+-            const bool uploaded = read.ok && upload_recoloured(texture, read.levels, read.width, read.height, info);
++            bool uploaded = false;
++            if (read.ok && read.dxt_levels != 0u) {
++                uploaded = upload_recoloured_dxt(texture, read.dxt, read.dxt_levels, read.dxt_alpha, read.width, read.height, info);
++                if (uploaded) note_recolour_dxt(stats_, read.dxt.size(), read.rgba_bytes, read.encode_ns, read.psnr);
++            } else {
++                uploaded = read.ok && upload_recoloured(texture, read.levels, read.width, read.height, info);
++            }
+             if (!uploaded) ++stats_.upload_failed;
+             stats_.recolour_ns += nanoseconds_since(start);
+             return uploaded;
+@@ -575,7 +738,7 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+     if (image_key == 0u) return false;
+     HdRecord record;
+     if (!pack_.find(image_key, record) || (record.flags & kHdFlagRecolour) == 0u) return false;
+-    const std::uint64_t needed = static_cast<std::uint64_t>(record.width) * record.height * 4u * 4u / 3u;
++    const std::uint64_t needed = static_cast<std::uint64_t>(record.width) * record.height * (config_.recolour_dxt ? (record.format == HdFormat::Dxt1 ? 1u : 2u) : 4u) * 4u / 3u / (config_.recolour_dxt ? 2u : 1u);
+     if (!admit(needed)) return false;
+ 
+     const std::uint32_t clut_size = texture_clut_bytes_needed(state);
+@@ -591,6 +754,8 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+         job.recolour = true;
+         job.state = state;
+         job.clut.assign(clut, clut + clut_size);
++        job.compress = config_.recolour_dxt;
++        job.check = config_.recolour_check;
+         loader_->request(std::move(job));
+         info.pending = true;
+         ++stats_.async_reads;
+@@ -626,6 +791,23 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+     level.resize(static_cast<std::size_t>(width) * height);
+     hd_apply_recolour(recolour, base->data(), palette, level.data());
+ 
++#if defined(__vita__)
++    // Without the loader thread the encode (some 40 ms for a character on the Vita's core) would be a hitch on the GL thread.
++    const bool compress_here = config_.recolour_dxt && loader_ != nullptr;
++#else
++    const bool compress_here = config_.recolour_dxt;
++#endif
++    if (compress_here) {
++        DxtChain chain;
++        build_dxt_chain(level, width, height, config_.recolour_check, chain);
++        if (upload_recoloured_dxt(texture, chain.bytes, chain.levels, chain.alpha, width, height, info)) {
++            note_recolour_dxt(stats_, chain.bytes.size(), chain.rgba_bytes, chain.ns, chain.psnr);
++            stats_.blob_bytes += record.size;
++            stats_.recolour_ns += nanoseconds_since(start);
++            return true;
++        }
++        return false;
++    }
+     if (bind_) bind_(texture);
+     else glBindTexture(GL_TEXTURE_2D, texture);
+     std::uint64_t gpu_bytes = 0u;
+@@ -652,6 +834,8 @@ bool GlHdTextures::try_recolour(std::uint32_t texture, const GuestMemory &memory
+     info.mips = static_cast<std::uint8_t>(levels);
+     ++stats_.resident_textures;
+     stats_.resident_bytes += gpu_bytes;
++    info.storage = 2u;
++    stats_.resident_by_storage[2] += gpu_bytes;
+     stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
+     const std::uint64_t spent = nanoseconds_since(start);
+     stats_.recolour_ns += spent;
+@@ -670,6 +854,7 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+     const bool completing = info.pending;   // the loader thread was working on this texture's replacement
+     if (was_replaced) {
+         stats_.resident_bytes -= std::min(stats_.resident_bytes, info.gpu_bytes);
++        stats_.resident_by_storage[info.storage] -= std::min(stats_.resident_by_storage[info.storage], info.gpu_bytes);
+         if (stats_.resident_textures != 0u) --stats_.resident_textures;
+         info.replaced = false;
+         info.gpu_bytes = 0u;
+@@ -767,6 +952,8 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+                     info.mips = levels;
+                     ++stats_.resident_textures;
+                     stats_.resident_bytes += gpu_bytes;
++                    info.storage = record.format == HdFormat::Rgba8 ? 1u : 0u;
++                    stats_.resident_by_storage[info.storage] += gpu_bytes;
+                     stats_.peak_bytes = std::max(stats_.peak_bytes, stats_.resident_bytes);
+                 } else {
+                     ++stats_.upload_failed;
+@@ -783,6 +970,7 @@ bool GlHdTextures::upload(std::uint32_t texture, const GuestMemory &memory, cons
+ void GlHdTextures::released(HdTextureInfo &info) {
+     if (info.replaced) {
+         stats_.resident_bytes -= std::min(stats_.resident_bytes, info.gpu_bytes);
++        stats_.resident_by_storage[info.storage] -= std::min(stats_.resident_by_storage[info.storage], info.gpu_bytes);
+         if (stats_.resident_textures != 0u) --stats_.resident_textures;
+     }
+     info = HdTextureInfo{};
+@@ -807,20 +995,35 @@ std::string GlHdTextures::summary() const {
+     std::ostringstream out;
+     const HdStats &s = stats_;
+     const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+-    char text[768];
++    char text[1024];
+     std::snprintf(text, sizeof text,
+                   "hd textures %s: keyed %llu (%.2f us each), hits %llu (recoloured %llu, %.2f ms), misses %llu, no key %llu, "
+                   "render-target copies skipped %llu, budget refusals %llu, recolour refusals %llu, failed %llu; "
+                   "resident %llu textures %.2f MB (peak %.2f MB), read %.2f MB, lookup %.2f ms, upload %.2f ms (reading %.2f ms, "
+-                  "waiting for the GPU %.2f ms), read by the loader %llu, flushes %llu",
++                  "waiting for the GPU %.2f ms), read by the loader %llu, flushes %llu; resident by storage: DXT %.2f MB, RGBA8 records %.2f MB, "
++                  "palette rebuilds (RGBA8) %.2f MB, compressed rebuilds %.2f MB (peak %.2f MB all)",
+                   hd_mode_name(config_.mode), n(s.keyed), s.keyed != 0u ? static_cast<double>(s.key_ns) / 1000.0 / static_cast<double>(s.keyed) : 0.0,
+                   n(s.hits), n(s.recolour_hits), static_cast<double>(s.recolour_ns) / 1.0e6, n(s.misses), n(s.key_failed),
+                   n(s.not_replaceable), n(s.skipped_budget), n(s.recolour_refused), n(s.upload_failed), n(s.resident_textures),
+                   static_cast<double>(s.resident_bytes) / 1048576.0, static_cast<double>(s.peak_bytes) / 1048576.0,
+                   static_cast<double>(s.blob_bytes) / 1048576.0, static_cast<double>(s.lookup_ns) / 1.0e6,
+                   static_cast<double>(s.upload_ns) / 1.0e6, static_cast<double>(s.read_ns) / 1.0e6,
+-                  static_cast<double>(s.gpu_wait_ns) / 1.0e6, n(s.async_reads), n(s.flushes));
+-    return text;
++                  static_cast<double>(s.gpu_wait_ns) / 1.0e6, n(s.async_reads), n(s.flushes), static_cast<double>(s.resident_by_storage[0]) / 1048576.0,
++                  static_cast<double>(s.resident_by_storage[1]) / 1048576.0, static_cast<double>(s.resident_by_storage[2]) / 1048576.0, static_cast<double>(s.resident_by_storage[3]) / 1048576.0,
++                  static_cast<double>(s.peak_bytes) / 1048576.0);
++    std::string result = text;
++    if (s.recolour_dxt_textures != 0u) {
++        char more[400];
++        std::snprintf(more, sizeof more, "; recolours kept as DXT: %llu, %.2f MB instead of %.2f MB RGBA8, encode %.2f ms (%.2f ms each)",
++                      n(s.recolour_dxt_textures), static_cast<double>(s.recolour_dxt_bytes) / 1048576.0, static_cast<double>(s.recolour_rgba_bytes) / 1048576.0,
++                      static_cast<double>(s.recolour_encode_ns) / 1.0e6, static_cast<double>(s.recolour_encode_ns) / 1.0e6 / static_cast<double>(s.recolour_dxt_textures));
++        result += more;
++        if (s.recolour_psnr_n != 0u) {
++            std::snprintf(more, sizeof more, "; level-0 PSNR vs RGBA8: mean %.2f dB, min %.2f dB over %llu", s.recolour_psnr_sum / static_cast<double>(s.recolour_psnr_n), s.recolour_psnr_min, n(s.recolour_psnr_n));
++            result += more;
++        }
++    }
++    return result;
+ }
+ 
+ } // namespace portablekit::gpu
+diff --git a/host/gpu/gl/gl_hd_textures.hpp b/host/gpu/gl/gl_hd_textures.hpp
+index 0519c61..e14b29c 100644
+--- a/host/gpu/gl/gl_hd_textures.hpp
++++ b/host/gpu/gl/gl_hd_textures.hpp
+@@ -25,6 +25,7 @@ struct HdTextureInfo {
+     bool opaque{};              // the replacement has no alpha (a DXT1 record, uploaded as RGB): every texel's alpha is 1
+     bool recoloured{};          // the replacement was rebuilt for the palette in use (a recolour record)
+     bool respecify{};           // the texture was a replacement and is the original again: specify it anew
++    std::uint8_t storage{};     // 0 DXT record, 1 RGBA8 record, 2 rebuilt for the palette in use (RGBA8): see HdStats::resident_by_storage
+     bool pending{};             // its replacement is being read from the pack (async): the original is on the GPU meanwhile
+ };
+ 
+@@ -90,6 +91,9 @@ private:
+     // Uploads a recoloured chain the loader built (`levels`: every level, level 0 first, RGBA).
+     bool upload_recoloured(std::uint32_t texture, const std::vector<std::uint32_t> &levels, std::uint32_t width,
+                            std::uint32_t height, HdTextureInfo &info);
++    // The same for a chain kept as DXT (`bytes`: `levels` levels, level 0 first; DXT5 when `alpha`).
++    bool upload_recoloured_dxt(std::uint32_t texture, const std::vector<std::uint8_t> &bytes, std::uint32_t levels, bool alpha,
++                               std::uint32_t width, std::uint32_t height, HdTextureInfo &info);
+     bool admit(std::uint64_t needed_bytes);   // budget check with hysteresis; logs the first refusal
+ 
+     HdConfig config_;
+diff --git a/host/gpu/hd_texture_pack.cpp b/host/gpu/hd_texture_pack.cpp
+index 12b5e09..b52bf35 100644
+--- a/host/gpu/hd_texture_pack.cpp
++++ b/host/gpu/hd_texture_pack.cpp
+@@ -354,6 +354,8 @@ HdConfig hd_config_from_environment() {
+     config.follow_settings = true;
+     config.trace = env_any("HD_TRACE") != nullptr;
+     if (const char *text = env_any("HD_RECOLOUR_GUARD")) config.recolour_guard = !(std::strcmp(text, "off") == 0 || std::strcmp(text, "0") == 0);
++    if (const char *text = env_any("HD_RECOLOUR_DXT")) config.recolour_dxt = !(std::strcmp(text, "off") == 0 || std::strcmp(text, "0") == 0);
++    config.recolour_check = env_any("HD_RECOLOUR_CHECK") != nullptr;
+     // Budgets in MB: one for every mode (it wins), or one per mode. Without any, 2x gets 32 MB and 4x 48 MB.
+     const auto megabytes = [](const char *text) { return std::strtoull(text, nullptr, 10) * 1024ull * 1024ull; };
+     if (const char *text = env_any("HD_BUDGET_MB")) config.budget_bytes = megabytes(text);
+diff --git a/host/gpu/hd_texture_pack.hpp b/host/gpu/hd_texture_pack.hpp
+index f000dfb..da6c095 100644
+--- a/host/gpu/hd_texture_pack.hpp
++++ b/host/gpu/hd_texture_pack.hpp
+@@ -139,6 +139,11 @@ struct HdConfig {
+     // The palette animation guard of the recolour records (gl_hd_textures.cpp). <PREFIX>_HD_RECOLOUR_GUARD=off turns it off, to measure
+     // what a texture whose palette changes every frame costs without it.
+     bool recolour_guard{true};
++    // Rebuilt (recoloured) pictures are compressed to DXT1 (opaque) or DXT5 (any alpha) after the palette is applied, instead of
++    // being kept as RGBA8 with a full chain: a quarter to an eighth of the memory and of the sampling bandwidth. <PREFIX>_HD_RECOLOUR_DXT=0 keeps RGBA8.
++    bool recolour_dxt{true};
++    // <PREFIX>_HD_RECOLOUR_CHECK=1: decode each compressed rebuild again and count its PSNR against the RGBA8 one (HdStats).
++    bool recolour_check{false};
+     // Replacements nobody has drawn for this many frames can be released when the budget runs short (GlRenderer::release_stale_hd);
+     // <PREFIX>_HD_STALE_FRAMES (config.txt hd_stale_frames). 600 = 10 s at 60 fps.
+     std::uint64_t stale_frames{600};
+@@ -192,11 +197,19 @@ struct HdStats {
+     std::uint64_t resident_textures{}; // replaced textures on the GPU now
+     std::uint64_t resident_bytes{};    // their GPU bytes
+     std::uint64_t peak_bytes{};
++    // resident_bytes by how the texture is stored on the GPU: [0] DXT1/DXT5 records, [1] RGBA8 records, [2] rebuilt for a palette (RGBA8), [3] rebuilt and compressed (DXT).
++    std::uint64_t resident_by_storage[4]{};
+     std::uint64_t flushes{};           // times the mode changed and everything was reloaded
+     std::uint64_t not_replaceable{};   // render-target copies (8888): skipped without a key
+     std::uint64_t recolour_hits{};     // textures rebuilt from a recolour record (image key found, palette differs)
+     std::uint64_t recolour_refused{};  // recolours not done because the texture's palette kept changing
+     std::uint64_t recolour_ns{};       // time rebuilding recoloured pictures (decode, palette transfer, mips)
++    std::uint64_t recolour_dxt_textures{};  // rebuilds kept as DXT
++    std::uint64_t recolour_dxt_bytes{};     // their GPU bytes
++    std::uint64_t recolour_rgba_bytes{};    // what the same chains would have taken as RGBA8
++    std::uint64_t recolour_encode_ns{};     // time encoding (on the loader thread when async_load)
++    double recolour_psnr_sum{}, recolour_psnr_min{1000.0};  // level 0, RGBA channels (HD_RECOLOUR_CHECK)
++    std::uint64_t recolour_psnr_n{};
+     std::uint64_t read_ns{};           // of upload_ns: reading blobs from the pack (on the GL thread: without async_load)
+     std::uint64_t async_reads{};       // replacements read by the loader thread, the original drawn meanwhile
+     std::uint64_t gpu_wait_ns{};       // of upload_ns: waiting for the GPU's transfers between mip levels (the Vita)
+diff --git a/tests/dxt_encode_tests.cpp b/tests/dxt_encode_tests.cpp
+new file mode 100644
+index 0000000..a6c2bfb
+--- /dev/null
++++ b/tests/dxt_encode_tests.cpp
+@@ -0,0 +1,134 @@
++// host/gpu/dxt_encode.hpp: the encoder's output checked with a decoder written here, from the format's definition
++// (not shared with the renderer's): flat blocks, gradients, noise, alpha, odd sizes, the c0 > c1 rule.
++#include "gpu/dxt_encode.hpp"
++
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++namespace {
++using namespace portablekit::gpu;
++
++int g_failures = 0;
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++std::uint32_t e5(std::uint32_t v) { return (v << 3u) | (v >> 2u); }
++std::uint32_t e6(std::uint32_t v) { return (v << 2u) | (v >> 4u); }
++
++// Decodes with the reference formulas; sets `bad_order` when a colour block is not in four-colour mode (c0 <= c1).
++std::vector<std::uint32_t> decode(bool alpha, const std::vector<std::uint8_t> &data, std::uint32_t w, std::uint32_t h, bool &bad_order) {
++    std::vector<std::uint32_t> out(static_cast<std::size_t>(w) * h);
++    const std::uint32_t bw = (w + 3u) / 4u, bh = (h + 3u) / 4u;
++    for (std::uint32_t by = 0; by < bh; ++by)
++        for (std::uint32_t bx = 0; bx < bw; ++bx) {
++            const std::uint8_t *b = data.data() + (static_cast<std::size_t>(by) * bw + bx) * (alpha ? 16u : 8u);
++            std::uint32_t a[16];
++            for (auto &v : a) v = 255u;
++            if (alpha) {
++                const std::uint32_t a0 = b[0], a1 = b[1];
++                std::uint32_t t[8] = {a0, a1};
++                if (a0 > a1) for (std::uint32_t i = 1; i < 7u; ++i) t[i + 1u] = ((7u - i) * a0 + i * a1) / 7u;
++                else { for (std::uint32_t i = 1; i < 5u; ++i) t[i + 1u] = ((5u - i) * a0 + i * a1) / 5u; t[6] = 0u; t[7] = 255u; }
++                std::uint64_t bits = 0u;
++                for (int i = 0; i < 6; ++i) bits |= static_cast<std::uint64_t>(b[2 + i]) << (8 * i);
++                for (std::uint32_t i = 0; i < 16u; ++i) a[i] = t[(bits >> (3u * i)) & 7u];
++                b += 8;
++            }
++            const std::uint32_t c0 = b[0] | b[1] << 8u, c1 = b[2] | b[3] << 8u;
++            if (c0 <= c1) bad_order = true;
++            std::uint32_t p[4][3] = {{e5(c0 >> 11u), e6((c0 >> 5u) & 63u), e5(c0 & 31u)}, {e5(c1 >> 11u), e6((c1 >> 5u) & 63u), e5(c1 & 31u)}};
++            for (int c = 0; c < 3; ++c) { p[2][c] = (2u * p[0][c] + p[1][c]) / 3u; p[3][c] = (p[0][c] + 2u * p[1][c]) / 3u; }
++            const std::uint32_t idx = b[4] | b[5] << 8u | b[6] << 16u | static_cast<std::uint32_t>(b[7]) << 24u;
++            for (std::uint32_t i = 0; i < 16u; ++i) {
++                const std::uint32_t x = bx * 4u + (i & 3u), y = by * 4u + (i >> 2u);
++                if (x >= w || y >= h) continue;
++                const std::uint32_t k = (idx >> (2u * i)) & 3u;
++                out[static_cast<std::size_t>(y) * w + x] = p[k][0] | p[k][1] << 8u | p[k][2] << 16u | a[i] << 24u;
++            }
++        }
++    return out;
++}
++
++double psnr(const std::vector<std::uint32_t> &a, const std::vector<std::uint32_t> &b, bool with_alpha) {
++    double se = 0.0;
++    const std::uint32_t channels = with_alpha ? 4u : 3u;
++    for (std::size_t i = 0; i < a.size(); ++i)
++        for (std::uint32_t c = 0; c < channels; ++c) {
++            const double d = static_cast<double>((a[i] >> (8u * c)) & 255u) - static_cast<double>((b[i] >> (8u * c)) & 255u);
++            se += d * d;
++        }
++    const double mse = se / (static_cast<double>(a.size()) * channels);
++    return mse == 0.0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
++}
++
++} // namespace
++
++int main() {
++    std::vector<std::uint8_t> out;
++    bool bad = false;
++    for (int effort = 0; effort <= 2; ++effort) {
++        std::printf("-- effort %d\n", effort);
++        // A flat picture of every kind of colour, including black and white (the c0 > c1 corner cases).
++        for (const std::uint32_t colour : {0xFF000000u, 0xFFFFFFFFu, 0xFF804020u, 0xFF0000FFu, 0xFF010101u}) {
++            std::vector<std::uint32_t> img(8 * 8, colour);
++            dxt::encode_level(false, img.data(), 8, 8, out, effort);
++            bad = false;
++            const auto d = decode(false, out, 8, 8, bad);
++            check(!bad, "flat: four-colour mode");
++            check(psnr(img, d, false) > 36.0, "flat: close to the colour");
++        }
++        // A smooth ramp.
++        std::vector<std::uint32_t> ramp(64 * 32);
++        for (std::uint32_t y = 0; y < 32u; ++y)
++            for (std::uint32_t x = 0; x < 64u; ++x) ramp[y * 64u + x] = 0xFF000000u | (x * 4u) | ((y * 8u) << 8u) | ((255u - x * 4u) << 16u);
++        dxt::encode_level(false, ramp.data(), 64, 32, out, effort);
++        check(out.size() == dxt::encoded_bytes(false, 64, 32), "ramp: size");
++        bad = false;
++        check(psnr(ramp, decode(false, out, 64, 32, bad), false) > 34.0 && !bad, "ramp: PSNR above 34 dB (three independent ramps in a block), four-colour mode");
++        // Two flat colours with a hard edge inside blocks.
++        std::vector<std::uint32_t> edge(32 * 32);
++        for (std::uint32_t y = 0; y < 32u; ++y)
++            for (std::uint32_t x = 0; x < 32u; ++x) edge[y * 32u + x] = x < 13u ? 0xFF2040C0u : 0xFFE0A030u;
++        dxt::encode_level(false, edge.data(), 32, 32, out, effort);
++        bad = false;
++        check(psnr(edge, decode(false, out, 32, 32, bad), false) > 38.0, "edge: PSNR above 38 dB");
++        // Alpha: a ramp in alpha over a flat colour; a fully transparent and a fully opaque block.
++        std::vector<std::uint32_t> alpha(32 * 16);
++        for (std::uint32_t y = 0; y < 16u; ++y)
++            for (std::uint32_t x = 0; x < 32u; ++x) alpha[y * 32u + x] = (x < 4u ? 0u : (x >= 28u ? 255u : x * 8u)) << 24u | 0x00406080u;
++        dxt::encode_level(true, alpha.data(), 32, 16, out, effort);
++        check(out.size() == dxt::encoded_bytes(true, 32, 16), "alpha: size");
++        bad = false;
++        const auto da = decode(true, out, 32, 16, bad);
++        check(!bad, "alpha: four-colour mode");
++        bool exact_ends = true;
++        for (std::uint32_t y = 0; y < 16u; ++y) { if ((da[y * 32u] >> 24u) != 0u || (da[y * 32u + 31u] >> 24u) != 255u) exact_ends = false; }
++        check(exact_ends, "alpha: transparent and opaque blocks stay so");
++        double worst = 0.0;
++        for (std::size_t i = 0; i < alpha.size(); ++i) worst = std::max(worst, std::fabs(static_cast<double>(alpha[i] >> 24u) - static_cast<double>(da[i] >> 24u)));
++        check(worst <= 20.0, "alpha: ramp error at most 20 levels");
++        // Odd size: padding by edge repeat, no crash, size of the padded block grid.
++        std::vector<std::uint32_t> odd(7 * 5, 0xFF336699u);
++        dxt::encode_level(false, odd.data(), 7, 5, out, effort);
++        check(out.size() == 2u * 2u * 8u, "odd 7x5: 2x2 blocks");
++        bad = false;
++        check(psnr(odd, decode(false, out, 7, 5, bad), false) > 36.0, "odd 7x5: colour kept");
++        // 1x1 (the last level of a chain).
++        std::vector<std::uint32_t> one(1, 0xFF336699u);
++        dxt::encode_level(false, one.data(), 1, 1, out, effort);
++        check(out.size() == 8u, "1x1: one block");
++        // Noise: worst case for a two-colour block; only that it is valid and not absurd.
++        std::vector<std::uint32_t> noise(32 * 32);
++        std::uint32_t seed = 12345u;
++        for (auto &v : noise) { seed = seed * 1664525u + 1013904223u; v = 0xFF000000u | (seed >> 8u & 0xFFFFFFu); }
++        dxt::encode_level(false, noise.data(), 32, 32, out, effort);
++        bad = false;
++        const double q = psnr(noise, decode(false, out, 32, 32, bad), false);
++        check(!bad && q > 12.0, "noise: valid blocks, PSNR above 12 dB (uniform RGB noise)");
++    }
++    std::printf("%s\n", g_failures == 0 ? "all ok" : "FAILED");
++    return g_failures == 0 ? 0 : 1;
++}

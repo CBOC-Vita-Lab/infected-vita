@@ -1,8 +1,8 @@
-From e39825e1941e05f1898b872b230f36b07223cddb Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:38:34 -0500
-Subject: [PATCH] settings: the CPU clock row shows the measured clock ("444
- MHz (kept)") and a note when the system kept a lower one than chosen
+Subject: [PATCH 76/76] settings: the CPU clock row shows the measured clock
+ ("444 MHz (kept)") and a note when the system kept a lower one than chosen
 
 set_measured_cpu_clock() takes what the platform measured after applying perf.cpu_clock. With 500 chosen and under 475 MHz measured the
 row's value reads "<N> MHz (kept)" and the description line (Settings::note()) says the system kept that clock.
@@ -129,6 +129,3 @@ index af36133..39a465a 100644
      }
  
      // Settings from 1.0: it wrote every row, so a file whose rows are all at their defaults has no choice in it.
--- 
-2.43.0
-

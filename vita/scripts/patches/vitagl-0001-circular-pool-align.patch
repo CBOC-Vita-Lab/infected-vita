@@ -1,8 +1,10 @@
+Rebased onto upstream e119b3e (2 Nov 2026), which adds fbb190f (the depth/stencil leak fix), f10e8e6 (warnings for dummy functions) and e119b3e (HAVE_ACCURATE_MSAA, left off): hunks moved, no change of behaviour.
+
 diff --git a/source/vgl.c b/source/vgl.c
-index bf5e4d4..9667236 100644
+index 7d3f9b0..9aefb2b 100644
 --- a/source/vgl.c
 +++ b/source/vgl.c
-@@ -147,6 +147,10 @@ static uint8_t *circular_data_pool_limit;
+@@ -161,6 +161,10 @@ static uint8_t *circular_data_pool_limit;
  #endif
  uint32_t circular_data_pool_size = CIRCULAR_POOL_SIZE_DEF;
  uint8_t *vgl_reserve_data_pool(uint32_t size) {

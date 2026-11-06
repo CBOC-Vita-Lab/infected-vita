@@ -203,7 +203,7 @@ void gl_swap() {
 }
 void gl_set_vsync(bool on) { vglWaitVblankStart(on ? GL_TRUE : GL_FALSE); }
 void gl_shutdown() {
-    // vitaGL (9bf3e3f) has no vglEnd(); resources are reclaimed when the process exits.
+    // vitaGL (e119b3e) has no vglEnd(); resources are reclaimed when the process exits.
     logf("GL: shutdown requested (vitaGL cannot be torn down; freed at process exit)");
     g_gl_ready = false;
 }
