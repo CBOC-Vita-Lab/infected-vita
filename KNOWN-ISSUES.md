@@ -55,7 +55,9 @@ Everything wrong or unchecked in version 1.0.
 * The gain of each speed feature on its own (four scenes per frame, compact vertices, the HUD upscale, shader pre-linking, the music
   decoded ahead, link-time optimisation, the fourth core). Each has a switch to turn it off (`SETTINGS.md`, `vita/README-VITA.md`); none has
   been compared on its own in a mission.
-* The 500 MHz profile has been measured to run (494 MHz) but not its effect on a whole mission.
+* The 500 MHz profile has been measured to run (494 MHz) but not its effect on a whole mission. The game's own 500 MHz module (`vita/clock500/`) is new in
+  this version: it has not run on a console yet (test plan in `vita/clock500/TEST.md`). A run that crashes with the clock raised is put back by the module's
+  process-exit handler; if that ever fails, `clock500.pending` stays in `ux0:data/infected/` and the next start tells the module to take the leftover over.
 * Other firmware for the fourth core. The module (`vita/core3/`) has run on a 3.74 console: it loads, a thread runs on core 3 and the
   helper threads and the music decoder move there. Other firmware versions in 3.60-3.74 are not tried. A start that loaded it and crashed
   leaves `core3_unlock.pending` in `ux0:data/infected/`, and later starts leave the module out; `config.txt core3_unlock=0` turns it off.

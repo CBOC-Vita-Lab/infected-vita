@@ -20,7 +20,7 @@ movies have not.
 | Fourth core | The module in the package loads, a thread runs on core 3, the helper threads and the music decoder run there; unloaded at exit. |
 | Defaults + FXAA | 21 to 30 fps |
 | 4x pack + FXAA + pixel lighting + double-resolution effects | 10 to 14 fps: the GPU cannot keep up |
-| 500 MHz | Needs a PSVshellPlus profile (`vita/psvshell`). With it the CPU measures about 494-497 MHz. |
+| 500 MHz | The package's clock module (`vita/clock500`, firmware 3.60-3.74, not yet run on a console) or a PSVshellPlus profile (`vita/psvshell`; measured about 494-497 MHz). |
 | Ceiling | With no draw calls at all (`gl_null_draw=1`) the game and the display-list walk alone reach 36 fps, so 60 fps is out of reach; the game itself runs at 30. |
 | Not measured yet | the worst frames (1 % lows), the gain of each speed feature on its own, 500 MHz over a whole mission, the cheaper FXAA pass (`gl_fxaa_quality=fast`), anti-aliasing Auto (version 1.1: how often it has FXAA on in a mission, whether its thresholds are right), the other settings rows on the console except the ones above |
 

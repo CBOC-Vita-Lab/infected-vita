@@ -174,6 +174,7 @@ int main(int, char**) {
     // watchdog) go there and leave core 2 to the display-list walker. config.txt core3=0 keeps them where they were.
     plat::core3_allow(app::cfg_bool("core3", true));
     plat::core3_unlock_allow(app::cfg_bool("core3_unlock", true));
+    plat::clock_module_allow(app::cfg_bool("clock_module", true));   // the 500 MHz kernel module (vita/clock500)
     plat::logf("cores: helper threads on core %d (core 3 %s)", plat::helper_core(), plat::core3_usable() ? "usable" : "not available");
 
     if (app::cfg_bool("clocks", true)) plat::clocks_set_max();
@@ -201,9 +202,20 @@ int main(int, char**) {
     app::ui::boot_title("Infected  (PS Vita port)");
     app::ui::boot_line("Starting...");
     app::install_retroflow_art();
-    if (!plat::gl_shader_compiler_available())
-        app::ui::boot_line("libshacccg.suprx not found in ur0:data/ - shaders can only come from the shader cache");
+    if (!plat::gl_shader_compiler_available()) {
+        // Not an error: the shipped shader cache serves the game's shaders. Say it in the player's words, on screen and in the log.
+        static const char kNoCompiler[] = "No shader compiler. Optional: install it with ShaRKBR33D for the rarely used effects.";
+        plat::logf("boot: %s", kNoCompiler);
+        app::ui::boot_line("%s", kNoCompiler);
+    }
     app::ui::boot_line("%s", app::memory_line().c_str() + 5);
+    {
+        const std::string low = app::memory_warning();
+        if (!low.empty()) {
+            plat::logf("boot: %s", low.c_str());
+            app::ui::boot_line("%s", low.c_str());
+        }
+    }
 
     const std::string mode = app::bench_mode();
     if (mode == "ge_replay") {

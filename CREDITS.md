@@ -25,7 +25,7 @@ logs of those runs.
 
 [HENkaku](https://henkaku.xyz/) and Ensō (custom firmware), [VitaShell](https://github.com/TheOfficialFloW/VitaShell),
 [vitacompanion](https://github.com/devnoname120/vitacompanion) (used to install and drive test runs over the network),
-PSVshell and PSVshellPlus (the 500 MHz profile), [RetroFlow](https://github.com/jimbob4000/RetroFlow-Launcher) (the launcher the cover art is for),
+PSVshell and PSVshellPlus (the 500 MHz profile; the package's own clock module follows the idea of kernel overclockers such as PSVshell and LOLIcon, with its own code, and the register table of the Vita development wiki), [RetroFlow](https://github.com/jimbob4000/RetroFlow-Launcher) (the launcher the cover art is for),
 and [Vita3K](https://vita3k.org/) (the emulator used for the first runs).
 
 ## The game
