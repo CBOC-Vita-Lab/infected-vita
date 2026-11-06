@@ -45,7 +45,7 @@
 #perf.threaded_renderer=off
 # perf.frame_skip: auto or off. Auto: when the graphics side falls behind, some frames are not drawn so the game and its sound keep their pace.
 #perf.frame_skip=off
-# perf.cpu_clock: 444 or 500 (500 is the default on the Vita; the system must allow it, otherwise the game stays at 444)
+# perf.cpu_clock: 444 or 500 (500 is the default on the Vita; it needs PSVshellPlus and acts from the next start, otherwise the game stays at 444)
 #perf.cpu_clock=444
 # perf.enemy_density: 100, 125, 150 or 200 (percent)
 #perf.enemy_density=200
@@ -61,10 +61,9 @@
 # again until it is deleted.
 #core3=0
 #core3_unlock=0
-# The 500 MHz clock (perf.cpu_clock in the menu) comes from a second small kernel module in the package (infected_clock.skprx, firmware 3.60 to
-# 3.74 only), loaded when 500 is chosen and unloaded for 444 and at quit; it also puts the clock back if the game crashes.
-# clock_module=0: never load it (the clock stays at 444 unless a PSVshellPlus profile raises it).
-#clock_module=0
+# The 500 MHz clock (perf.cpu_clock in the menu) needs PSVshellPlus: the game keeps its 500 MHz profile (ur0:data/PSVshell/profiles/INFC00001) in place and
+# PSVshellPlus applies it at the next start. clocks=0: the game doesn't touch the clocks or the profile.
+#clocks=0
 # The sound output follows the speed the game produces sound at, so a slightly fast or slow game never makes a gap. 0 = fixed rate.
 #audio_follow=0
 # The HUD's small pixel-art pictures (button glyphs, icons) are drawn from a copy made twice as large by the MMPX filter, so they

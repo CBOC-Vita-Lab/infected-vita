@@ -799,135 +799,74 @@ bool touch_corner_tap() {
     return tap;
 }
 
-// ---- 500 MHz: the package's own kernel module (vita/clock500/clock500.c), loaded from ux0:app/<title id>/module/ through taiHEN.
-// The system's user-mode call stops at 444 MHz; the module writes the next step of the ARM clock register from kernel mode and puts the
-// old value back when it is stopped (clock_set_arm(444) and shutdown()) and, from inside the kernel, when this process exits or is
-// killed. It starts only on firmware 3.60 to 3.74 (and checks that itself). The application talks to it through the start arguments
-// ("arm=500 pid=N stale=0|1") and stop; it answers in ux0:data/infected/clock_module.txt, which is copied into the log.
-// clock500.pending marks "the module has the clock at 500 MHz": removed by a clean release. A start that finds it knows the last run
-// did not release the clock; it tells the module (stale=1), which then treats a 500 MHz register as its own leftover.
-static const char kClockPending[] = "clock500.pending";
-static const char kClockModuleLog[] = "clock_module.txt";
-static SceUID g_clock_module = -1;
-static bool g_clock_refused = false;
-static bool g_clock_allowed = true;     // the module cannot work here (firmware, load error): stop trying this run
-static bool g_clock_want = false;        // the game wants 500 MHz
-static int g_clock_lowcount = 0;
-static int g_clock_reengaged = 0;
+// ---- 500 MHz through PSVshellPlus: a profile for this title that the game keeps in place (vita/psvshell/INFC00001 is the 500 variant).
+// PSVSv0300 layout: "PSVS0300", lock flags 0x0b, then CPU, GPU, GPU-crossbar and bus clocks as little-endian words.
+static const unsigned char kProfile500[28] = {'P', 'S', 'V', 'S', '0', '3', '0', '0', 0x0b, 0, 0, 0, 0xf4, 0x01, 0, 0, 0xde, 0, 0, 0, 0xde, 0, 0, 0, 0xa6, 0, 0, 0};
+static const char kProfileDir[] = "ur0:data/PSVshell/profiles";
+static const char kProfilePath[] = "ur0:data/PSVshell/profiles/INFC00001";
+static const char kProfileTmp[] = "ur0:data/PSVshell/profiles/INFC00001.tmp";
 
-static void clock_copy_module_log(const char* what) {
-    void* data = nullptr;
-    size_t size = 0;
-    if (!file_read_all(Root::Data, kClockModuleLog, &data, &size)) return;
-    const char* text = (const char*)data;
-    size_t at = 0;
-    while (at < size) {
-        size_t end = at;
-        while (end < size && text[end] != '\n') ++end;
-        if (end > at) logf("clock module (%s): %.*s", what, (int)(end - at), text + at);
-        at = end + 1;
-    }
-    free(data);
-}
-
-static bool clock_engage() {
-    if (g_clock_module >= 0) return true;
-    if (g_clock_refused) return false;
-    if (!g_clock_allowed) {
-        logf("clock: config.txt clock_module=0: the 500 MHz module is not loaded");
-        g_clock_refused = true;
-        return false;
-    }
-    SceKernelSystemSwVersion version;
-    memset(&version, 0, sizeof(version));
-    version.size = sizeof(version);
-    const int vrc = sceKernelGetSystemSwVersion(&version);
-    if (vrc < 0 || version.version < 0x03600000u || version.version >= 0x03750000u) {
-        logf("clock: system software 0x%08X (rc 0x%08X) is not one the 500 MHz module is made for: not loading it", (unsigned)version.version,
-             (unsigned)vrc);
-        g_clock_refused = true;
-        return false;
-    }
-    const bool stale = file_exists(Root::Data, kClockPending);
-    if (stale) {
-        logf("clock: %s is there (an earlier start left the clock raised): the last module log follows", kClockPending);
-        clock_copy_module_log("earlier start");
-    }
-    char title[16] = {0};
-    char path[96];
+bool psvshell_installed() {
     SceIoStat st;
-    if (sceAppMgrAppParamGetString(0, 12, title, sizeof(title)) >= 0 && title[0] != '\0') {
-        snprintf(path, sizeof(path), "ux0:app/%s/module/infected_clock.skprx", title);
-        if (sceIoGetstat(path, &st) < 0) snprintf(path, sizeof(path), "app0:module/infected_clock.skprx");
-    } else {
-        snprintf(path, sizeof(path), "app0:module/infected_clock.skprx");
-    }
-    char args[48];
-    snprintf(args, sizeof(args), "arm=500 pid=%d stale=%d", (int)sceKernelGetProcessId(), stale ? 1 : 0);
-    sceIoRemove("ux0:data/infected/clock_module.txt");
-    // The marker goes down before the module can touch the clock.
-    (void)file_write_all(Root::Data, kClockPending, "1\n", 2);
-    logf("clock: loading %s (%s)", path, args);
-    const SceUID id = taiLoadStartKernelModule(path, strlen(args) + 1, args, 0);
-    clock_copy_module_log("start");
-    if (id < 0) {
-        logf("clock: the 500 MHz module did not start (0x%08X): the clock stays where the system keeps it", (unsigned)id);
-        (void)file_remove(Root::Data, kClockPending);   // a module that did not start wrote nothing
-        g_clock_refused = true;
-        return false;
-    }
-    g_clock_module = id;
-    logf("clock: the 500 MHz module is loaded (id 0x%08X)", (unsigned)id);
-    return true;
+    return sceIoGetstat("ur0:tai/PSVshellPlus_Kernel.skprx", &st) >= 0 || sceIoGetstat(kProfileDir, &st) >= 0;
 }
 
-static void clock_release(const char* why) {
-    if (g_clock_module < 0) return;
-    int status = 0;
-    const int rc = taiStopUnloadKernelModule(g_clock_module, 0, nullptr, 0, nullptr, &status);
-    logf("clock: the 500 MHz module is unloaded (%s, rc 0x%08X): the system's clock is back", why, (unsigned)rc);
-    clock_copy_module_log("stop");
-    if (rc >= 0) (void)file_remove(Root::Data, kClockPending);
-    g_clock_module = -1;
-}
-
-void clock_module_allow(bool allowed) { g_clock_allowed = allowed; }
-bool clock_boost_loaded() { return g_clock_module >= 0; }
-
-// The system rewrites the clock when the game comes back from the home screen or suspend, which takes the 500 MHz away. A short timing
-// loop (about a millisecond) every few seconds notices it; two low readings in a row load the module again.
-void clock_keepalive() {
-    if (!g_clock_want || g_clock_module < 0 || g_clock_reengaged >= 20) return;
-    int best = 0;
-    for (int run = 0; run < 2; ++run) {
-        uint32_t n = 400000;
-        const uint64_t t0 = now_us();
-        asm volatile("1: subs %0, %0, #1\n\tbne 1b" : "+r"(n) : : "cc");
-        const uint64_t dt = now_us() - t0;
-        if (dt == 0) continue;
-        const int mhz = (int)((400000ull + dt / 2) / dt);
-        if (mhz > best) best = mhz;
+int psvshell_profile_set(int mhz) {
+    unsigned char want[28], v444[28];
+    memcpy(want, kProfile500, sizeof(want));
+    memcpy(v444, kProfile500, sizeof(v444));
+    v444[12] = 0xbc; v444[13] = 0x01;                 // 444 = 0x1bc
+    if (mhz <= 444) memcpy(want, v444, sizeof(want));
+    unsigned char have[40];
+    int have_len = -1;
+    const SceUID in = sceIoOpen(kProfilePath, SCE_O_RDONLY, 0);
+    if (in >= 0) {
+        have_len = sceIoRead(in, have, sizeof(have));
+        sceIoClose(in);
     }
-    if (best >= 470) { g_clock_lowcount = 0; return; }
-    if (++g_clock_lowcount < 2) return;
-    g_clock_lowcount = 0;
-    ++g_clock_reengaged;
-    logf("clock: the ARM core measures %d MHz, 500 was set: the system took it back; loading the module again (%d)", best, g_clock_reengaged);
-    clock_release("again");
-    clock_engage();
-    logf("clock: the ARM core now measures %d MHz", clock_measure_mhz());
+    if (in >= 0) {
+        if (have_len == 28 && memcmp(have, want, 28) == 0) return 0;
+        if (have_len != 28 || (memcmp(have, kProfile500, 28) != 0 && memcmp(have, v444, 28) != 0)) {
+            logf("clock: %s is a profile of your own (not one of the game's two): left as it is", kProfilePath);
+            return -1;
+        }
+    } else if (mhz <= 444) {
+        return 0;                                       // 444 never creates a profile
+    }
+    SceIoStat st;
+    if (sceIoGetstat("ur0:data/PSVshell", &st) < 0) sceIoMkdir("ur0:data/PSVshell", 0777);
+    if (sceIoGetstat(kProfileDir, &st) < 0) sceIoMkdir(kProfileDir, 0777);
+    const SceUID out = sceIoOpen(kProfileTmp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (out < 0) {
+        logf("clock: cannot write %s (0x%08X)", kProfileTmp, (unsigned)out);
+        return -2;
+    }
+    const int wrote = sceIoWrite(out, want, sizeof(want));
+    sceIoClose(out);
+    if (wrote != (int)sizeof(want)) {
+        logf("clock: short write to %s (%d)", kProfileTmp, wrote);
+        sceIoRemove(kProfileTmp);
+        return -2;
+    }
+    int rc = sceIoRename(kProfileTmp, kProfilePath);
+    if (rc < 0 && in >= 0) {                            // a firmware whose rename will not replace a file: remove the old one first
+        sceIoRemove(kProfilePath);
+        rc = sceIoRename(kProfileTmp, kProfilePath);
+    }
+    if (rc < 0) {
+        logf("clock: cannot rename the profile into place (0x%08X)", (unsigned)rc);
+        sceIoRemove(kProfileTmp);
+        return -2;
+    }
+    logf("clock: PSVshellPlus profile %s written (%d MHz)", kProfilePath, mhz <= 444 ? 444 : 500);
+    return 1;
 }
 
 int clock_set_arm(int mhz, int* applied_mhz) {
-    g_clock_want = mhz > 444;
-    g_clock_lowcount = 0;
-    if (!g_clock_want) clock_release("444 MHz chosen");
     const int rc = scePowerSetArmClockFrequency(mhz);
     const int now = scePowerGetArmClockFrequency();
     if (applied_mhz) *applied_mhz = now;
     logf("clock: ARM %d MHz requested, rc=0x%08X, reads back %d MHz", mhz, (unsigned)rc, now);
-    // After the system's own call (it would write the clock back to the value it knows): above 444 the module takes over.
-    if (g_clock_want) clock_engage();
     return rc;
 }
 
@@ -954,7 +893,6 @@ bool init(const InitParams& p) {
 
 void shutdown() {
     audio_close();
-    clock_release("shutdown");
     core3_release();
     logf("platform shutdown");
     log_lock();
@@ -964,7 +902,6 @@ void shutdown() {
 
 void exit_process(int code) {
     (void)code;
-    clock_release("exit");
     sceKernelExitProcess(0);
     for (;;) {}
 }

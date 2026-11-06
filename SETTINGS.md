@@ -81,7 +81,7 @@ are estimates.
 | **Show FPS** | **Off**, On | A counter in the top-left corner: pictures per second, milliseconds per picture and the number of draws. | Low |
 | **Resolution** | **960x544**, 720x408 | The size the 3D picture and the HUD are drawn at. 720x408 draws 56 % of the pixels and is enlarged to the screen: a softer picture, less work for the graphics chip. **Restart needed.** | 960x544: Low |
 | **Renderer thread** | **Split**, On, Off | **Split** (the Vita's default and the fastest): the game runs on one CPU core, reading the game's drawing commands on a second, and the drawing itself on a third. **On**: the drawing has one core of its own. **Off**: everything on one core, only for hunting a problem. Mission 1: 29-31 fps with Split against 25 with On. **Restart needed.** | None |
-| **CPU clock** | 444 MHz, **500 MHz** | The Vita's processor speed. 444 MHz is the normal maximum; 500 MHz gives every core about 12 % more time. The system itself refuses more than 444, so the game raises the clock with a small module inside the package (`module/infected_clock.skprx`, firmware 3.60-3.74, loaded when 500 is chosen, unloaded for 444 and when the game quits or crashes; nothing to install), or a PSVshellPlus profile does it. The row shows the clock that was **measured**: `500 MHz`, or `444 MHz (kept)` when the system kept 444. `log.txt` says which. Runs warmer and uses more battery. | None (faster) |
+| **CPU clock** | 444 MHz, **500 MHz** | The Vita's processor speed. 444 MHz is the normal maximum; 500 MHz gives every core about 12 % more time and needs PSVshellPlus (`INSTALL.md`): the game keeps a 500 MHz profile for itself in its folder, and PSVshellPlus applies a profile when the game starts, so a change here acts from the next start (the row says `500 MHz from the next start`). Choosing 444 changes the profile back to 444. A profile of your own is never touched. Without PSVshellPlus the row reads `444 MHz (500 needs PSVshellPlus)`. The row shows the clock that was **measured**. Runs warmer and uses more battery. | None (faster) |
 | **Enemy density** | **100%**, 125%, 150%, 200% | How many enemies can be alive at once in an area: 4 in mission 1 at 100 %, 8 at 200 %. **It applies at the next mission** (or a retry after you die). The mission's total enemies, goals and medals stay the game's own. | 125 %: Medium. 150 % and 200 %: High |
 | **View distance** | **100%**, 150%, 200% | How far the world is drawn before the fog hides it. Changes at once. In mission 1 (a closed street) you mostly see less haze; in open levels more of the skyline stays visible. | 150 % and 200 %: Medium (estimate) |
 
@@ -118,7 +118,7 @@ A text file `ux0:data/infected/config.txt` with `name=value` lines changes thing
 | Line | What it does |
 | --- | --- |
 | `gfx.anything=value`, `perf.anything=value`, `controls.anything=value` | Fixes a menu setting for the run (for example `gfx.antialiasing=off`, which also stops Auto). The menu shows that value and can't change it, and it isn't saved. |
-| `clock_module=0` | Doesn't load the 500 MHz module (the clock stays at 444 unless a PSVshellPlus profile raises it). |
+| `clocks=0` | The game doesn't touch the clocks, and doesn't write the PSVshellPlus profile. |
 | `core3_unlock=0` / `core3=0` | Doesn't load the fourth-core module (core 3 is then used only if another plugin already allows it) / never uses core 3. |
 | `atrac_ahead=0` | Decodes the music on the game's own core (for comparisons). |
 | `gl_skip_invisible=0` | Draws the fully transparent sprites anyway. |

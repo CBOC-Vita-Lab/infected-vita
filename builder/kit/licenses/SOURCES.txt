@@ -75,7 +75,6 @@ The licence texts are in the licenses/ folder next to this file.
                                            (SHA-256 7be0cb378a8438dadecfbd0b1dca1e5d5a3281307be2c72068826de14db4ce4d);
                                            configure options: vita/LOG.md of this repository
    infected_core3.skprx (game/vpk/module)  vita/core3 of this repository                                               MIT
-   infected_clock.skprx (game/vpk/module)  vita/clock500 of this repository                                            MIT
 
    How to rebuild any of this from source: docs/BUILDING.md of this repository (sections 2 and 4), or builder/kit/make-kit.sh.
    Link-time note: the application is linked statically with vitaGL (GPL-3.0), vitaShaRK (LGPL-3.0), SceShaccCgExt (GPL-3.0) and

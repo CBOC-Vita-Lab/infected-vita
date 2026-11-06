@@ -111,7 +111,7 @@ Everything has a default; the file is only needed to change something.
 | `log_sync` | `0` | flush `log.txt` after every line (slower; use it to find a crash) |
 | `fatal_wait` | `1` | the error screen waits for START; `0` shows it for three seconds then exits |
 | `watchdog` | `8` | seconds without a flip before `[watchdog]` lines are logged (0 = off) |
-| `clocks` | `1` | set CPU/GPU/bus to the maximum clocks |
+| `clocks` | `1` | set CPU/GPU/bus to the maximum clocks, and keep the PSVshellPlus 500 MHz profile (`ur0:data/PSVshell/profiles/INFC00001`) in place for `perf.cpu_clock` (a change acts from the next start; `log.txt`: `500 MHz from the next start`, `PSVshellPlus profile ... written`; a profile of your own is left alone) |
 | `hud` / `overlay` | `0` / | on-screen status text; `overlay=cpu` or `composite` |
 | `trace_hle=N` / `hle_top=N` / `dump_threads=N` / `stats_hle=1` | off | diagnostics (first N system calls, the N most called ones each second, a thread table every N seconds, timing of system calls) |
 | `verify_iso=1`, `iso_sha256=<hex>` | off | hash the whole ISO at start and compare |

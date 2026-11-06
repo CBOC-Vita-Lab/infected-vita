@@ -41,34 +41,37 @@ void log_non_default() {
 
 void apply() {
     port::Settings& s = port::settings();
-    // perf.cpu_clock: 444 (the retail maximum) or 500 (the package's own kernel module raises it from kernel mode, vita/clock500; a
-    // PSVshellPlus profile does the same from outside). The system's user-mode setter refuses anything above 444 and keeps saying 444
-    // either way, so the MEASURED clock decides, and the menu's row shows it (port::set_measured_cpu_clock).
-    // config.txt's clocks=0 keeps the application away from the clocks altogether.
+    // perf.cpu_clock: 444 (the retail maximum) or 500. 500 MHz comes from a PSVshellPlus profile for this title (ur0:data/PSVshell/profiles/INFC00001)
+    // that the game keeps in place: PSVshellPlus applies a profile when the app becomes active, so a profile written now acts from the next start.
+    // The system's user-mode setter stays at 444 either way, so the MEASURED clock decides, and the menu's row shows it (port::set_measured_cpu_clock).
+    // config.txt's clocks=0 keeps the application away from the clocks (and the profile) altogether.
     if (app::cfg_bool("clocks", true)) {
         const int want = (int)port::cpu_clock_mhz();
         if (want != g_applied_cpu_mhz) {
             g_applied_cpu_mhz = want;
-            if (want != 444) {
-                int applied = 0;
-                const int rc = plat::clock_set_arm(want, &applied);
-                const int measured = plat::clock_measure_mhz();
-                port::set_measured_cpu_clock(measured);
-                if (measured >= want - want / 20) {
-                    plat::logf("settings: the ARM clock runs at %d MHz (measured; the system reports %d; %s)", measured, applied,
-                               plat::clock_boost_loaded() ? "raised by the package's clock module" : "set from outside, e.g. a PSVshellPlus profile");
-                } else {
-                    plat::logf("settings: the ARM clock stays at %d MHz measured (the system reports %d; %d MHz was refused%s)", measured, applied, want,
-                               rc < 0 && !plat::clock_boost_loaded() ? ", no clock module" : "");
-                    (void)plat::clock_set_arm(444, &applied);   // the module (if it was loaded) is unloaded and the system's own clock is back
-                    port::set_measured_cpu_clock(plat::clock_measure_mhz());
-                }
-            } else if (g_applied_generation != 0) {
-                int applied = 0;
-                (void)plat::clock_set_arm(444, &applied);   // back from 500: the clock module restores the old register value
-                const int measured = plat::clock_measure_mhz();
-                port::set_measured_cpu_clock(measured);
-                plat::logf("settings: the ARM clock is back at %d MHz (measured; the system reports %d)", measured, applied);
+            const bool installed = plat::psvshell_installed();
+            int written = 0;
+            if (installed) written = plat::psvshell_profile_set(want);
+            const int measured = plat::clock_measure_mhz();
+            port::set_measured_cpu_clock(measured);
+            port::set_cpu_clock_reason(nullptr, nullptr);
+            if (want != 444 && measured >= want - want / 20) {
+                plat::logf("settings: the ARM clock runs at %d MHz (measured; PSVshellPlus profile)", measured);
+            } else if (want != 444 && !installed) {
+                port::set_cpu_clock_reason("500 needs PSVshellPlus", "500 MHz needs PSVshellPlus (see INSTALL.md). The game stays at 444 MHz.");
+                plat::logf("settings: the ARM clock stays at %d MHz measured: 500 MHz needs PSVshellPlus, which is not installed", measured);
+            } else if (want != 444 && written == 1) {
+                port::set_cpu_clock_reason("500 from the next start", "500 MHz from the next start (PSVshellPlus applies its profile when the game starts).");
+                plat::logf("settings: 500 MHz from the next start (the PSVshellPlus profile was written; the clock measures %d MHz now)", measured);
+            } else if (want != 444 && written == -1) {
+                port::set_cpu_clock_reason("your PSVshell profile", "The game found a PSVshellPlus profile of your own for it and left it alone.");
+                plat::logf("settings: the ARM clock stays at %d MHz measured: the PSVshellPlus profile for this game is the player's own", measured);
+            } else if (want != 444) {
+                plat::logf("settings: the ARM clock stays at %d MHz measured (PSVshellPlus profile: %s)", measured, written < 0 ? "could not be written" : "in place, applied at the next start");
+            } else if (written == 1) {
+                plat::logf("settings: 444 MHz from the next start (the PSVshellPlus profile was changed to 444; the clock measures %d MHz now)", measured);
+            } else {
+                plat::logf("settings: the ARM clock is %d MHz (measured)", measured);
             }
         }
     }
@@ -141,12 +144,6 @@ void install_appliers() {
     apply();   // the first start: the clock the player chose
     portablekit::kernel().add_vblank_hook([] {
         if (port::settings().generation() != g_applied_generation) apply();
-        // The system takes the 500 MHz back after a suspend or a visit to the home screen: look now and then (about every 5 s).
-        static unsigned frames = 0;
-        if (g_applied_cpu_mhz > 444 && ++frames >= 300) {
-            frames = 0;
-            plat::clock_keepalive();
-        }
     });
 }
 

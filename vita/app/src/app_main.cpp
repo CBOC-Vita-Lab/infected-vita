@@ -174,7 +174,6 @@ int main(int, char**) {
     // watchdog) go there and leave core 2 to the display-list walker. config.txt core3=0 keeps them where they were.
     plat::core3_allow(app::cfg_bool("core3", true));
     plat::core3_unlock_allow(app::cfg_bool("core3_unlock", true));
-    plat::clock_module_allow(app::cfg_bool("clock_module", true));   // the 500 MHz kernel module (vita/clock500)
     plat::logf("cores: helper threads on core %d (core 3 %s)", plat::helper_core(), plat::core3_usable() ? "usable" : "not available");
 
     if (app::cfg_bool("clocks", true)) plat::clocks_set_max();

@@ -184,7 +184,7 @@ new tree.
 ## 6 Nov 2026 - polish-1.1: the two polish branches merged, loose ends
 
 * PortableKit patches re-exported as 0074 (HD recolours as DXT), 0075 (scene-scale rung in Auto, cull statistics) and 0076 (CPU clock row shows
-  the measured clock); 76 patches. PC: all 49 PortableKit ctests pass; `settings_matrix.sh` on mission-1 dumps: all rows as the menu says;
+  the measured clock and why it is not 500); 76 patches. PC: all 49 PortableKit ctests pass; `settings_matrix.sh` on mission-1 dumps: all rows as the menu says;
   replays of 100 mission-1 flips with `gl_scene_scale=0` are byte-identical to the default, with `=2` 98 of 100 frames are drawn smaller,
   none went back at once, no 3D draw tested depth after the enlargement. `hd_recolour_dxt` from config.txt (INFECTED_HD_RECOLOUR_DXT)
   reaches the HD loader: 7.81 MB resident with `0`, 3.29 MB with `1` on the same flips.
@@ -193,3 +193,6 @@ new tree.
   done**: FXAA runs where the HUD starts and the HUD is drawn into the same target after it (0 of 100 replayed mission-1 frames ran FXAA at
   present), the guest owns that target (copies, glow chain, read-backs, next frame), and the blit is the only place the counter and menu are
   added. A switch that only helps frames without a HUD would not change what players see; nothing was changed.
+* 500 MHz: the kernel module (`vita/clock500`) was dropped before it was ever run. The game keeps the PSVshellPlus profile for itself in place
+  (`platform_vita.cpp`: `psvshell_installed`, `psvshell_profile_set`; temporary file, then rename; a profile that is neither of the two exact variants is left alone);
+  a new one acts from the next start; the row reads `444 MHz (500 from the next start)` or `444 MHz (500 needs PSVshellPlus)`.

@@ -2,7 +2,7 @@
 
 `INFC00001` is the 28-byte profile that runs the CPU at 500 MHz and the GPU at 222 MHz for this game. It is byte for byte the profile
 that was measured on the test Vita for another title (496 MHz measured, about 10 % less CPU time per frame than at 444); with this profile the game itself
-measured 494 MHz. `gen_profile.py` writes it; `gen_profile.py --check FILE` reads one back. The game does not install it: you copy it.
+measured 494 MHz. `gen_profile.py` writes it; `gen_profile.py --check FILE` reads one back. The game writes it itself when PSVshellPlus is installed and `perf.cpu_clock` is 500 (and rewrites it with the CPU word 444 = `bc 01 00 00` when you pick 444); it never overwrites a profile that is neither of those two. PSVshellPlus applies a profile when the game starts, so a new one acts from the next start. Copying it by hand still works.
 
 ```
 50 53 56 53 30 33 30 30   "PSVS0300"
@@ -26,7 +26,7 @@ The game's own 500 MHz request (`perf.cpu_clock`, default 500) is therefore not 
    A second line `settings: the ARM clock runs at NNN MHz (measured ...)` comes from the settings applier.
 
 Remove: delete the file; the clock is back at 444 the next time the game starts. Heat and battery: 500 MHz is outside
-Sony's specification, so it is the owner's choice. In-game, the menu's "CPU clock" row sets only the game's own request, which the lock ignores.
+Sony's specification, so it is the owner's choice. In-game, the menu's "CPU clock" row chooses which of the two profiles the game keeps in place; the change acts from the next start.
 
 ## Not verified
 Nothing here has run on a console: the file's bytes are checked against the known-good profile, the measuring loop and the log lines build

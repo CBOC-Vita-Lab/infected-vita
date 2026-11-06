@@ -68,7 +68,7 @@ toolchain/                trimmed VitaSDK: the host programs (bin/arm-vita-eabi-
 game/include/             headers the generated C++ includes (psprecomp/*, lean_abi.h, lean_vfpu*.h)
 game/profile.json         recomp/infected_profile.json
 game/link/                disc-independent objects of the application (obj/), static libraries (lib/), link.args (the link command)
-game/vpk/                 every file of the package except eboot.bin (sce_sys, module/infected_core3.skprx, module/infected_clock.skprx, shader_cache/, retroflow/ ...)
+game/vpk/                 every file of the package except eboot.bin (sce_sys, module/infected_core3.skprx, shader_cache/, retroflow/ ...)
 licenses/                 GPL/LGPL/MIT texts and SOURCES.txt: where every part comes from
 ```
 

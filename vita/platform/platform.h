@@ -79,17 +79,16 @@ ClockReport clocks_set_max();
 // Sets the ARM clock alone (perf.cpu_clock: 444 or 500 MHz). Vita: scePowerSetArmClockFrequency(mhz) and a read back; the
 // retail firmware accepts up to 444, anything above needs a plugin that lifts the limit (the call then returns an error, which
 // is logged and returned). Returns the setter's return code (0 = ok), `applied_mhz` (may be null) the clock read back.
-// Above 444 the package's own kernel module (vita/clock500) is loaded after that call and raises the clock from kernel mode (firmware
-// 3.60-3.74); mhz <= 444 unloads it, which puts the clock back. The caller decides by clock_measure_mhz(), not by the return code.
 // Desktop: returns -1 and applied_mhz 0.
 int clock_set_arm(int mhz, int* applied_mhz);
-// config.txt clock_module=0: never load the 500 MHz module (default: allowed). Call before the first clock_set_arm().
-void clock_module_allow(bool allowed);
-// Whether the 500 MHz module is loaded (it can be loaded and still not have raised the clock: measure).
-bool clock_boost_loaded();
-// Call now and then (every few seconds) while 500 MHz is wanted: loads the module again if the system took the clock back
-// (suspend, home screen). Costs about a millisecond. Does nothing at 444 or without the module.
-void clock_keepalive();
+// 500 MHz comes from a PSVshellPlus profile for this title (ur0:data/PSVshell/profiles/INFC00001, 28 bytes), which PSVshellPlus applies when the
+// application becomes active: a profile written now acts from the next start.
+// psvshell_installed(): ur0:tai/PSVshellPlus_Kernel.skprx exists or the folder ur0:data/PSVshell/profiles/ does (always false on the desktop).
+bool psvshell_installed();
+// Makes the profile say `mhz` (500 or 444): 500 writes ours when there is none or ours at 444; 444 changes ours at 500 and never creates one. The write
+// goes to a temporary file that is then renamed. Returns 1 written (acts from the next start), 0 already as wanted (or 444 and no profile of ours),
+// -1 the profile is not one of our two (the player's own: left alone), -2 an error (logged).
+int psvshell_profile_set(int mhz);
 ClockReport clocks_read();                     // read only
 // The ARM clock as it really runs, in MHz, measured with a loop of dependent decrements (one cycle an iteration on the Cortex-A9;
 // the best of three runs, about 12 ms in all). A PSVshellPlus profile runs the CPU at 500 MHz while scePowerGetArmClockFrequency
@@ -342,7 +341,7 @@ bool gl_init(const GlParams& p);
 bool gl_is_ready();
 void gl_swap();                                // vglSwapBuffers(GL_FALSE); returns after the frame is queued (see VITAGL_NOTES.md section 4)
 void gl_set_vsync(bool on);
-void gl_shutdown();                            // vitaGL (e119b3e) has NO vglEnd(): this only marks GL as down; memory returns at process exit
+void gl_shutdown();                            // vitaGL (9bf3e3f) has NO vglEnd(): this only marks GL as down; memory returns at process exit
 void* gl_get_proc(const char* name);           // vglGetProcAddress; nullptr when the function is not implemented
 // Vita: true if libshacccg.suprx exists at ur0:/data/libshacccg.suprx (vitaShaRK's default, vitashark.c DEFAULT_SHACCCG_PATH)
 // or ur0:data/external/libshacccg.suprx (the path vitaGL's gxm.c passes to shark_init). File existence only.
