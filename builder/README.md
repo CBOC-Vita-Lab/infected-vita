@@ -84,7 +84,7 @@ release. VitaSDK's macOS programs are built for macOS 14, so the two macOS kits 
 (`kits.yml`, job `host`, steps "macOS toolchain"), from the same sources and with the same options as that release:
 `builder/hosttool/pins.sh` has the versions, hashes and the commit of vitasdk/buildscripts whose recipe is followed (GCC 15.2.0, binutils 2.46.1,
 vita-toolchain `e8bc8f7`, GMP, MPFR, MPC, ISL, zlib, libelf, libyaml, libzip), and `build-mac-host.sh` is the build:
-natively on `macos-15-intel` (deployment target 10.13) and on `macos-15` (Apple silicon, 11.0; `macos-14` is no longer offered), everything linked statically, with
+natively on `macos-15-intel` (deployment target 10.13) and on `macos-26` (Apple silicon, 11.0; `macos-14` is no longer offered and `macos-15` arm64 had no capacity), everything linked statically, with
 `MACOSX_DEPLOYMENT_TARGET` and `-mmacosx-version-min` set. The kit makes no change otherwise: same names, same layout, `kit.json` `requires.macos` set from the target.
 The result is cached (`actions/cache`, key: the files of `builder/hosttool`, the file list and the target), so only a change to those files rebuilds GCC.
 

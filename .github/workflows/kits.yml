@@ -158,7 +158,7 @@ jobs:
           - { name: windows,   runner: windows-2022,   triple: x86_64-w64-mingw32,  os: windows, arch: amd64, gokey: windows-amd64, exe: '.exe' }
           # deploy: MACOSX_DEPLOYMENT_TARGET of the host programs (what the build script is given); minmac: kit.json requires.macos
           - { name: mac-intel, runner: macos-15-intel, triple: x86_64-apple-darwin, os: mac,     arch: amd64, gokey: darwin-amd64,  exe: '', deploy: '10.13', minmac: '10.13' }
-          - { name: mac-arm,   runner: macos-15,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '', deploy: '11.0',  minmac: '11' }
+          - { name: mac-arm,   runner: macos-26,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '', deploy: '11.0',  minmac: '11' }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     defaults:
