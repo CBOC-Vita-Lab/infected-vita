@@ -13,7 +13,7 @@ You need no SDK, no compiler and no terminal.
 - **`infected-build`**, from the release page: download `Infected-Vita-builder-<your system>.tar.gz`, unpack it, and run
   `infected-build Infected.iso` (on Windows you can also double-click `infected-build.exe` and drag the .iso onto the window).
   It writes `infected.vpk` next to the .iso; copy that to your Vita and install it with VitaShell. It needs about 700 MB of free disk
-  space and 1.5 GB of memory for each compiler process it runs (it chooses how many from the free memory); macOS needs version 14 or newer.
+  space and 1.5 GB of memory for each compiler process it runs (it chooses how many from the free memory); macOS needs version 10.13 or newer on an Intel Mac and 11 or newer on an Apple silicon Mac.
   How it works and how the kit is made: [`builder/README.md`](../builder/README.md).
 
 Both build the same package as the manual way below, from the same source, with the same compiler. The rest of this page is the manual

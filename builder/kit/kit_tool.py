@@ -263,6 +263,8 @@ def cmd_finalize(a):
     recipe = json.load(open(os.path.join(kit, 'target.json')))
     os.remove(os.path.join(kit, 'target.json'))
     recipe['os'], recipe['arch'] = a.os, a.arch
+    if a.requires_macos:       # "10.13" stays a string (10.13 as a number would read as 10.1); 11 and 14 are numbers
+        recipe['requires'] = {'macos': int(a.requires_macos) if a.requires_macos.isdigit() else a.requires_macos}
     if a.os == 'windows':
         recipe['tools'] = {k: v + '.exe' for k, v in recipe['tools'].items()}
     files = {}
@@ -478,6 +480,7 @@ def main():
     p.add_argument('--lean-flags', required=True); p.add_argument('--extra', default='{}')
     p.add_argument('--boot-sha256', required=True); p.add_argument('--sdk-note', default='')
     p = sub.add_parser('finalize'); p.add_argument('--kit', required=True); p.add_argument('--os', required=True); p.add_argument('--arch', required=True)
+    p.add_argument('--requires-macos', default=None)
     p = sub.add_parser('host-copy'); p.add_argument('--list', required=True); p.add_argument('--host-sdk', required=True)
     p.add_argument('--kit', required=True); p.add_argument('--os', required=True); p.add_argument('--strip', default=None)
     p = sub.add_parser('trace'); p.add_argument('--sdk', required=True); p.add_argument('--out', required=True)

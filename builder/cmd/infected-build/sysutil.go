@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,14 +28,48 @@ func parseVMStat(out string) int64 {
 	return pages * page
 }
 
-// parseMajor is the major version number of a version string ("14.2.1" gives 14).
-func parseMajor(v string) int {
-	v = strings.TrimSpace(v)
-	if i := strings.IndexByte(v, '.'); i >= 0 {
-		v = v[:i]
+// macVersion is a macOS version as far as the builder cares: "14" (14.x) or "10.13". Up to macOS 10.15 the second number is the
+// release ("10.13" is High Sierra), from macOS 11 on it is not and is left out.
+type macVersion struct{ Major, Minor int }
+
+func (v macVersion) String() string {
+	if v.Major == 10 {
+		return fmt.Sprintf("10.%d", v.Minor)
 	}
-	n, _ := strconv.Atoi(v)
-	return n
+	return strconv.Itoa(v.Major)
+}
+
+// less: v is an older macOS than o. 14 (no minor) is the same as 14.0.
+func (v macVersion) less(o macVersion) bool {
+	if v.Major != o.Major {
+		return v.Major < o.Major
+	}
+	return v.Major == 10 && v.Minor < o.Minor
+}
+
+// UnmarshalJSON reads kit.json "requires.macos": a number (14) or a string ("10.13").
+func (v *macVersion) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	m := parseMacVersion(s)
+	if m.Major == 0 {
+		return fmt.Errorf("requires.macos %q is not a macOS version", s)
+	}
+	*v = m
+	return nil
+}
+
+// parseMacVersion reads "14.2.1" as {14, 0} and "10.15.7" as {10, 15}; {0, 0} when it is not a version.
+func parseMacVersion(v string) macVersion {
+	parts := strings.Split(strings.TrimSpace(v), ".")
+	major, err := strconv.Atoi(parts[0])
+	if err != nil || major < 0 {
+		return macVersion{}
+	}
+	m := macVersion{Major: major}
+	if major == 10 && len(parts) > 1 {
+		m.Minor, _ = strconv.Atoi(parts[1])
+	}
+	return m
 }
 
 // defaultJobs is the number of parallel compiles: one per CPU, but no more than the free memory allows at about 1.5 GB each

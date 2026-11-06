@@ -11,7 +11,7 @@
 #       the programs and data files in lists/host-files.txt, with the OS's file names (see below)
 #
 #   make-kit.sh target --sdk SDK --sysroot DIR --repo DIR --out DIR [--build-dir DIR] [--shader-cache DIR] [--text-pad N] [--work DIR]
-#   make-kit.sh host   --target-dir DIR --out DIR [--host-sdk DIR] [--host-os linux|windows|mac] [--host-arch amd64|arm64] [--strip PROG]
+#   make-kit.sh host   --target-dir DIR --out DIR [--host-sdk DIR] [--host-os linux|windows|mac] [--host-arch amd64|arm64] [--strip PROG] [--min-macos VER]
 #   make-kit.sh pack   --kit DIR --out FILE.tar.gz [--exe infected-build]                      (the archive that is published; `zip` is the old name)
 #   make-kit.sh all    --sdk SDK --sysroot DIR --repo DIR --out FILE.tar.gz [--work DIR] [--exe FILE] [--shader-cache DIR]
 #                                                                                              (target + host for this Linux + pack)
@@ -38,13 +38,13 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOOL="python3 -I $HERE/kit_tool.py"
 cmd=${1:-}; shift || true
-SDK=""; HOST_SDK=""; SYSROOT=""; REPO=""; OUT=""; BUILD=""; TEXTPAD=""; WORK=""; TARGET_DIR=""; HOST_OS=""; HOST_ARCH=""; KIT=""; GEN=""; STRIP=""; SHADER_CACHE=""; EXE=""
+SDK=""; HOST_SDK=""; SYSROOT=""; REPO=""; OUT=""; BUILD=""; TEXTPAD=""; WORK=""; TARGET_DIR=""; HOST_OS=""; HOST_ARCH=""; KIT=""; GEN=""; STRIP=""; SHADER_CACHE=""; EXE=""; MIN_MACOS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --sdk) SDK=$2; shift 2;; --host-sdk) HOST_SDK=$2; shift 2;; --sysroot) SYSROOT=$2; shift 2;; --repo) REPO=$2; shift 2;;
     --out) OUT=$2; shift 2;; --build-dir) BUILD=$2; shift 2;; --text-pad) TEXTPAD=$2; shift 2;; --work) WORK=$2; shift 2;;
     --target-dir) TARGET_DIR=$2; shift 2;; --host-os) HOST_OS=$2; shift 2;; --host-arch) HOST_ARCH=$2; shift 2;;
-    --kit) KIT=$2; shift 2;; --gen) GEN=$2; shift 2;; --strip) STRIP=$2; shift 2;; --shader-cache) SHADER_CACHE=$2; shift 2;; --exe) EXE=$2; shift 2;;
+    --kit) KIT=$2; shift 2;; --gen) GEN=$2; shift 2;; --strip) STRIP=$2; shift 2;; --shader-cache) SHADER_CACHE=$2; shift 2;; --exe) EXE=$2; shift 2;; --min-macos) MIN_MACOS=$2; shift 2;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
@@ -144,14 +144,16 @@ do_host() {
   # provenance of the exact SDK copy the host programs came from (the fixed part of SOURCES.txt says where the sources are)
   {
     echo
-    echo "4. Generated section: the VitaSDK tree the programs of this kit ($HOST_OS, $HOST_ARCH) were copied from"
+    echo "5. Generated section: the tree the host programs of this kit ($HOST_OS, $HOST_ARCH) were copied from"
     echo "   ----------------------------------------------------------------------------------------------"
     sed 's/^/   /' "$HOST_SDK/version_info.txt" 2>/dev/null || true
     [ -f "$HOST_SDK/share/vdpm/release-info.txt" ] && sed 's/^/   /' "$HOST_SDK/share/vdpm/release-info.txt"
     echo
     echo "   SHA-256 of every shipped file: kit.json \"files\"."
   } >> "$OUT/licenses/SOURCES.txt"
-  $TOOL finalize --kit "$OUT" --os "$HOST_OS" --arch "$HOST_ARCH"
+  # a host SDK that was built by builder/hosttool (macOS) brings the licence texts of the libraries linked into its programs
+  if [ -d "$HOST_SDK/licenses" ]; then cp "$HOST_SDK"/licenses/* "$OUT/licenses/"; fi
+  $TOOL finalize --kit "$OUT" --os "$HOST_OS" --arch "$HOST_ARCH" ${MIN_MACOS:+--requires-macos "$MIN_MACOS"}
   du -sh "$OUT" "$OUT/toolchain" "$OUT/game" | cat
 }
 

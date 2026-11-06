@@ -140,7 +140,7 @@ func withLogHint(err error, logPath string) error {
 
 func (b *Builder) prepare() error {
 	if runtime.GOOS == "darwin" {
-		if err := checkMacOS(macOSMajor(), 14); err != nil { // before anything else; the kit may ask for more below
+		if err := checkMacOS(macOSVersion(), macVersion{10, 13}); err != nil { // before anything else (what Go 1.20 runs on); the kit may ask for more below
 			return err
 		}
 	}
@@ -159,7 +159,7 @@ func (b *Builder) prepare() error {
 		return userErrorf("The builder kit is in a folder whose name has letters that the compiler cannot open (%s): Windows has no usable short name for it. Move the kit to a folder with a plain English name, for example C:\\InfectedBuilder, and run it from there.", kit.Dir)
 	}
 	if runtime.GOOS == "darwin" {
-		if err := checkMacOS(macOSMajor(), kit.requiredMacOS()); err != nil {
+		if err := checkMacOS(macOSVersion(), kit.requiredMacOS()); err != nil {
 			return err
 		}
 	}
@@ -280,10 +280,10 @@ func (b *Builder) prepare() error {
 	return nil
 }
 
-// checkMacOS fails on a macOS older than the kit's compilers can run on. major 0 means unknown: no objection.
-func checkMacOS(major, need int) error {
-	if major > 0 && major < need {
-		return userErrorf("Building Infected needs macOS %d or newer on this Mac (this one has macOS %d). Update macOS, or run the builder on a newer Mac or a Windows or Linux computer and copy the .vpk to your Vita.", need, major)
+// checkMacOS fails on a macOS older than the kit's compilers can run on. have.Major 0 means unknown: no objection.
+func checkMacOS(have, need macVersion) error {
+	if have.Major > 0 && have.less(need) {
+		return userErrorf("Building Infected needs macOS %s or newer on this Mac (this one has macOS %s). Update macOS, or run the builder on a newer Mac or a Windows or Linux computer and copy the .vpk to your Vita.", need, have)
 	}
 	return nil
 }

@@ -29,5 +29,5 @@ func freeRAMBytes() int64 {
 	return 0
 }
 
-// macOSMajor is 0 off macOS.
-func macOSMajor() int { return 0 }
+// macOSVersion is zero (unknown) off macOS.
+func macOSVersion() macVersion { return macVersion{} }

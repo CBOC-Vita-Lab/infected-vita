@@ -30,7 +30,7 @@ type Kit struct {
 		BootSha256 string `json:"bootSha256"`
 	} `json:"game"`
 	Requires struct {
-		MacOS int `json:"macos"` // lowest macOS major version the kit's compilers run on
+		MacOS macVersion `json:"macos"` // lowest macOS the kit's compilers run on: 14, or "10.13"
 	} `json:"requires"`
 	Tools   map[string]string `json:"tools"`
 	Profile string            `json:"profile"`
@@ -302,11 +302,11 @@ func (v Vars) ExpandArgs(args []string, lists map[string][]string) ([]string, er
 
 // requiredMacOS is the lowest macOS the kit runs on (kit.json "requires.macos", else 14: the compilers of the VitaSDK
 // release are built for macOS 14).
-func (k *Kit) requiredMacOS() int {
-	if k.Requires.MacOS > 0 {
+func (k *Kit) requiredMacOS() macVersion {
+	if k.Requires.MacOS.Major > 0 {
 		return k.Requires.MacOS
 	}
-	return 14
+	return macVersion{14, 0}
 }
 
 // thisHost is "<goos>/<goarch>", compared with the kit's own os/arch only for a warning in the log.
