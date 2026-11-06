@@ -871,3 +871,6 @@ index 0000000..a6c2bfb
 +    std::printf("%s\n", g_failures == 0 ? "all ok" : "FAILED");
 +    return g_failures == 0 ? 0 : 1;
 +}
+-- 
+2.43.0
+

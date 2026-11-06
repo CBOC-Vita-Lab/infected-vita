@@ -873,3 +873,6 @@ index fdd3fc2..cf7b24c 100644
          line("scissor changes", t.scissor_changes);
          line("viewport changes", t.viewport_changes);
          line("colour mask changes", t.mask_changes);
+-- 
+2.43.0
+

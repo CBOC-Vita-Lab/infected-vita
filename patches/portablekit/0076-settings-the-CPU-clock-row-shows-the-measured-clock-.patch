@@ -10,10 +10,10 @@ row's value reads "<N> MHz (kept)" and the description line (Settings::note()) s
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  host/overlay/overlay_menu.cpp   |  3 +++
- host/settings/port_settings.cpp | 24 ++++++++++++++++++++++++
- host/settings/port_settings.hpp |  8 ++++++++
- tests/port_settings_tests.cpp   | 12 ++++++++++++
- 4 files changed, 47 insertions(+)
+ host/settings/port_settings.cpp | 32 ++++++++++++++++++++++++++++++++
+ host/settings/port_settings.hpp | 11 +++++++++++
+ tests/port_settings_tests.cpp   | 17 +++++++++++++++++
+ 4 files changed, 63 insertions(+)
 
 diff --git a/host/overlay/overlay_menu.cpp b/host/overlay/overlay_menu.cpp
 index 6800ed1..a260104 100644
@@ -30,14 +30,16 @@ index 6800ed1..a260104 100644
              description = port::info(key).description;
          }
 diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
-index 48fef0a..ff13fe2 100644
+index 48fef0a..8de34ec 100644
 --- a/host/settings/port_settings.cpp
 +++ b/host/settings/port_settings.cpp
-@@ -250,6 +250,12 @@ Settings::Settings() {
+@@ -250,6 +250,14 @@ Settings::Settings() {
  
  const char *Settings::value(Key key) const noexcept { return info(key).values[index(key)]; }
  static std::atomic<int> g_auto_aa_state{-1};
 +static std::atomic<int> g_measured_cpu_mhz{0};
++static std::atomic<const char *> g_cpu_clock_tag{nullptr};    // the platform's own short reason, shown in brackets in the row (a string literal)
++static std::atomic<const char *> g_cpu_clock_help{nullptr};   // and the description line for it (a string literal)
 +// 500 MHz counts as reached from 475 (the timing loop reads 494-497 on a console at 500).
 +static bool cpu_clock_kept(const Settings &s) {
 +    const int measured = g_measured_cpu_mhz.load(std::memory_order_relaxed);
@@ -46,21 +48,23 @@ index 48fef0a..ff13fe2 100644
  
  const char *Settings::label(Key key) const noexcept {
      if (key == Key::GfxAntialiasing && index(key) == static_cast<std::uint8_t>(Antialiasing::Auto)) {
-@@ -257,8 +263,24 @@ const char *Settings::label(Key key) const noexcept {
+@@ -257,8 +265,26 @@ const char *Settings::label(Key key) const noexcept {
          if (state == 1) return "Auto (on)";
          if (state == 0) return "Auto (off)";
      }
 +    if (key == Key::PerfCpuClock && cpu_clock_kept(*this)) {
 +        // The clock the system kept, named in the row ("444 MHz (kept)"): the value on the left is what runs.
-+        static thread_local char text[24];
++        static thread_local char text[64];
 +        const int measured = g_measured_cpu_mhz.load(std::memory_order_relaxed);
-+        std::snprintf(text, sizeof text, "%d MHz (kept)", measured >= 400 && measured <= 460 ? 444 : measured);
++        const char *tag = g_cpu_clock_tag.load(std::memory_order_relaxed);
++        std::snprintf(text, sizeof text, "%d MHz (%s)", measured >= 400 && measured <= 460 ? 444 : measured, tag != nullptr ? tag : "kept");
 +        return text;
 +    }
      return info(key).labels[index(key)];
  }
 +const char *Settings::note(Key key) const noexcept {
 +    if (key == Key::PerfCpuClock && cpu_clock_kept(*this)) {
++        if (const char *help = g_cpu_clock_help.load(std::memory_order_relaxed)) return help;
 +        static thread_local char text[64];
 +        const int measured = g_measured_cpu_mhz.load(std::memory_order_relaxed);
 +        std::snprintf(text, sizeof text, "The system kept %d MHz; 500 was not allowed.", measured >= 400 && measured <= 460 ? 444 : measured);
@@ -71,17 +75,21 @@ index 48fef0a..ff13fe2 100644
  Cost Settings::cost(Key key) const noexcept { return info(key).costs[index(key)]; }
  bool Settings::is_default(Key key) const noexcept { return index(key) == default_[static_cast<std::size_t>(key)]; }
  
-@@ -521,6 +543,8 @@ Settings &settings() {
+@@ -521,6 +547,12 @@ Settings &settings() {
  
  void set_auto_antialiasing_state(int state) noexcept { g_auto_aa_state.store(state, std::memory_order_relaxed); }
  int auto_antialiasing_state() noexcept { return g_auto_aa_state.load(std::memory_order_relaxed); }
 +void set_measured_cpu_clock(int mhz) noexcept { g_measured_cpu_mhz.store(mhz, std::memory_order_relaxed); }
++void set_cpu_clock_reason(const char *tag, const char *help) noexcept {
++    g_cpu_clock_tag.store(tag, std::memory_order_relaxed);
++    g_cpu_clock_help.store(help, std::memory_order_relaxed);
++}
 +int measured_cpu_clock() noexcept { return g_measured_cpu_mhz.load(std::memory_order_relaxed); }
  
  bool Settings::adopt_auto_antialiasing() {
      const auto aa = static_cast<std::size_t>(Key::GfxAntialiasing);
 diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
-index 6a04967..4bf1f94 100644
+index 6a04967..f2c5df6 100644
 --- a/host/settings/port_settings.hpp
 +++ b/host/settings/port_settings.hpp
 @@ -130,6 +130,9 @@ public:
@@ -94,7 +102,7 @@ index 6a04967..4bf1f94 100644
      [[nodiscard]] Cost cost(Key key) const noexcept;               // of the effective value
      [[nodiscard]] bool is_default(Key key) const noexcept;
      // The player's own choice (what settings.txt keeps), whatever an override or a greyed row makes of the effective value.
-@@ -239,6 +242,11 @@ void apply_vita_defaults(Settings &settings);
+@@ -239,6 +242,14 @@ void apply_vita_defaults(Settings &settings);
  // What Auto is doing now, for the menu's value ("Auto (on)", "Auto (off)"): the renderer reports it (-1: nothing yet, 0 off, 1 on).
  void set_auto_antialiasing_state(int state) noexcept;
  [[nodiscard]] int auto_antialiasing_state() noexcept;
@@ -103,14 +111,17 @@ index 6a04967..4bf1f94 100644
 +// description line says so (Settings::note()); a measured 500 reads as before.
 +void set_measured_cpu_clock(int mhz) noexcept;
 +[[nodiscard]] int measured_cpu_clock() noexcept;
++// Why a lower clock than the chosen one runs, in the platform's words (string literals, kept as pointers): `tag` goes in brackets after
++// the value ("444 MHz (500 from the next start)"), `help` replaces the description line. nullptr for both: "(kept)" and the default text.
++void set_cpu_clock_reason(const char *tag, const char *help) noexcept;
  // The multisampling the program started with: 0, 2 or 4 samples. It comes from the value at mark_started(), because
  // vitaGL fixes it when it is initialised; a change in the overlay shows as "restart needed" and is applied by the next
  // start. A platform that creates the GL context early (the Vita's start-up screen) calls this after Settings::init().
 diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
-index af36133..39a465a 100644
+index af36133..b2d354c 100644
 --- a/tests/port_settings_tests.cpp
 +++ b/tests/port_settings_tests.cpp
-@@ -256,6 +256,18 @@ int main() {
+@@ -256,6 +256,23 @@ int main() {
          check(std::strcmp(v.label(Key::GfxAntialiasing), "FXAA") == 0, "another choice shows its own name");
          set_auto_antialiasing_state(-1);
          check(std::strlen("Auto (off)") <= 10u, "the longest value of the row fits its column");
@@ -123,9 +134,17 @@ index af36133..39a465a 100644
 +        set_measured_cpu_clock(443);
 +        check(std::strcmp(v.label(Key::PerfCpuClock), "444 MHz (kept)") == 0 && v.note(Key::PerfCpuClock) != nullptr,
 +              "500 chosen and 444 measured: the row says the system kept 444");
++        set_cpu_clock_reason("500 from the next start", "500 MHz from the next start.");
++        check(std::strcmp(v.label(Key::PerfCpuClock), "444 MHz (500 from the next start)") == 0 &&
++                  std::strcmp(v.note(Key::PerfCpuClock), "500 MHz from the next start.") == 0,
++              "the platform's reason replaces 'kept'");
++        set_cpu_clock_reason(nullptr, nullptr);
 +        v.set(Key::PerfCpuClock, "444");
 +        check(std::strcmp(v.label(Key::PerfCpuClock), "444 MHz") == 0 && v.note(Key::PerfCpuClock) == nullptr, "444 chosen: plain");
 +        set_measured_cpu_clock(0);
      }
  
      // Settings from 1.0: it wrote every row, so a file whose rows are all at their defaults has no choice in it.
+-- 
+2.43.0
+
