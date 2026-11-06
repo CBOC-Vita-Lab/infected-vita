@@ -342,6 +342,12 @@ void report(const char* why) {
         const portablekit::gpu::GlRenderer::AutoAaInfo aa = static_cast<portablekit::gpu::GlRenderer*>(portablekit::gpu::innermost(r))->auto_aa_info();
         const size_t used = strlen(line);
         if (aa.state >= 0) snprintf(line + used, sizeof(line) - used, " | aa=auto:%s(off %u, on %u)", aa.state ? "on" : "off", aa.offs, aa.ons);
+        // The last rung of Auto: the 3D picture at the smaller scale now (ss=85) or at full size (ss=100); absent when the rung is not in use.
+        if (aa.scaled >= 0) {
+            const size_t more = strlen(line);
+            snprintf(line + more, sizeof(line) - more, " | ss=%s(down %u, up %u, %llu frames)", aa.scaled ? "scaled" : "full", aa.scale_downs, aa.scale_ups,
+                     (unsigned long long)aa.scaled_frames);
+        }
     }
 #endif
     // with the HLE timer on, replace the on/off marker by the number

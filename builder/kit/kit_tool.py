@@ -134,6 +134,10 @@ def cmd_game_vpk(a):
             entries.append(dest); j += 2
         else:
             j += 1
+    # the package's two kernel modules must be in the kit: the VPK without them runs, but without core 3 or the 500 MHz clock
+    for need in ('module/infected_core3.skprx', 'module/infected_clock.skprx'):
+        if need not in entries:
+            die('%s is not among the files of the VPK rule (vita/app/CMakeLists.txt); the kit would ship a package without it' % need)
     # param.sfo: made by the CMake rule (vita-mksfoex with the flags below); the program is not needed at build time
     sfo_src = ptoks[ptoks.index('-s') + 1]
     copy_file(sfo_src, os.path.join(root, 'sce_sys', 'param.sfo'))

@@ -180,3 +180,16 @@ shader-cache hash or layout, so the v3 cache stays valid. Patches 0001-0004 were
 `shared.h` the fragment-program setup exists in two variants (`#ifdef HAVE_ACCURATE_MSAA` and the plain one), and 0003 now routes both
 through `rs_set_fragment_program`. Built and checked on the PC only for the patch application; the console run is the first test of the
 new tree.
+
+## 6 Nov 2026 - polish-1.1: the two polish branches merged, loose ends
+
+* PortableKit patches re-exported as 0074 (HD recolours as DXT), 0075 (scene-scale rung in Auto, cull statistics) and 0076 (CPU clock row shows
+  the measured clock); 76 patches. PC: all 49 PortableKit ctests pass; `settings_matrix.sh` on mission-1 dumps: all rows as the menu says;
+  replays of 100 mission-1 flips with `gl_scene_scale=0` are byte-identical to the default, with `=2` 98 of 100 frames are drawn smaller,
+  none went back at once, no 3D draw tested depth after the enlargement. `hd_recolour_dxt` from config.txt (INFECTED_HD_RECOLOUR_DXT)
+  reaches the HD loader: 7.81 MB resident with `0`, 3.29 MB with `1` on the same flips.
+* The status line has `ss=scaled|full(down N, up N, F frames)` next to `aa=` while the scene-scale rung is in use.
+* Direct present (drawing the last pass straight into the display framebuffer instead of the full-screen blit) was looked at and **not
+  done**: FXAA runs where the HUD starts and the HUD is drawn into the same target after it (0 of 100 replayed mission-1 frames ran FXAA at
+  present), the guest owns that target (copies, glow chain, read-backs, next frame), and the blit is the only place the counter and menu are
+  added. A switch that only helps frames without a HUD would not change what players see; nothing was changed.
