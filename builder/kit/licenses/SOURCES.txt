@@ -84,3 +84,26 @@ The licence texts are in the licenses/ folder next to this file.
 3. Other artwork in game/vpk/: the LiveArea and RetroFlow pictures are drawn by vita/vita/assets/gen_bubble.py of this repository
    (original artwork, MIT). param.sfo is made by vita-mksfoex from vita-toolchain (see kit.json "vpk").
 
+4. macOS kits only (replaces the VitaSDK host programs of item 1): the host programs of item 1 (g++, cc1plus, lto1, collect2, lto-wrapper, liblto_plugin, gcc-ar, as, ld, ar, nm, readelf,
+   libdep, vita-elf-create, vita-make-fself) are not the ones from the VitaSDK release: the VitaSDK release programs for macOS need
+   macOS 14, so the CBOC team builds these from the same sources with the same configure options, for macOS 10.13 (Intel) and macOS 11
+   (Apple silicon) or newer. The recipe is the one of https://github.com/vitasdk/buildscripts at revision
+   3c0b9c7b2c8ecb7bf68a674451a295f724b7fafb (the revision that built the release), the build script and the exact pins are in
+   builder/hosttool/ of this repository (build-mac-host.sh, pins.sh); the patches that VitaSDK applies to GCC and binutils are downloaded
+   from that revision when the programs are built (GPL-3.0, like the programs they change). Everything the programs need is linked into
+   them statically; the sources, with the licences (texts in licenses/host-*.txt), are:
+
+   Library                                       Source                                                         Licence
+   --------------------------------------------  -------------------------------------------------------------  ---------------------------
+   GMP 6.3.0                                     https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.bz2                  LGPL-3.0 or GPL-2.0+ (host-gmp-*)
+   MPFR 4.2.2                                    https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.bz2                LGPL-3.0+ (host-mpfr-*)
+   MPC 1.3.1                                     https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz                   LGPL-3.0+ (host-mpc-*)
+   ISL 0.24                                      https://libisl.sourceforge.io/isl-0.24.tar.bz2                 MIT (host-isl-*)
+   zlib 1.3.1                                    https://zlib.net/zlib-1.3.1.tar.gz                             zlib licence (host-zlib-*)
+   libelf 0.8.13 (VitaSDK copy, patched)         https://github.com/vitasdk/artifacts/releases/download/        LGPL-2.0+ (host-libelf-*)
+                                                 libelf-0.8.13/libelf-0.8.13.tar.gz
+   libyaml 0.2.2                                 https://pyyaml.org/download/libyaml/yaml-0.2.2.tar.gz          MIT (host-libyaml-*)
+   libzip 1.11.4                                 https://libzip.org/download/libzip-1.11.4.tar.xz               BSD-3-Clause (host-libzip-*)
+
+   The programs load only the system libraries of macOS (libSystem, libc++, libiconv). GMP, MPFR, MPC and libelf are LGPL: the
+   sources above, and the build script, are all that is needed to build the programs again with other versions of those libraries.

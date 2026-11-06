@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,14 +82,38 @@ func TestCleanDroppedPath(t *testing.T) {
 }
 
 func TestMacOSCheck(t *testing.T) {
-	if err := checkMacOS(12, 14); err == nil || !strings.HasPrefix(err.Error(), "Building Infected needs macOS 14 or newer on this Mac") || strings.Contains(err.Error(), "\n") {
+	v := func(maj, min int) macVersion { return macVersion{maj, min} }
+	if err := checkMacOS(v(12, 0), v(14, 0)); err == nil || !strings.HasPrefix(err.Error(), "Building Infected needs macOS 14 or newer on this Mac (this one has macOS 12)") || strings.Contains(err.Error(), "\n") {
 		t.Fatalf("%v", err)
 	}
-	if checkMacOS(14, 14) != nil || checkMacOS(15, 14) != nil || checkMacOS(0, 14) != nil {
+	if checkMacOS(v(14, 0), v(14, 0)) != nil || checkMacOS(v(15, 0), v(14, 0)) != nil || checkMacOS(v(0, 0), v(14, 0)) != nil {
 		t.Fatal("14 and newer, or unknown, must pass")
 	}
-	if parseMajor("14.2.1\n") != 14 || parseMajor("10.15.7") != 10 || parseMajor("") != 0 || parseMajor("26.0") != 26 {
-		t.Fatal("parseMajor")
+	if err := checkMacOS(v(10, 12), v(10, 13)); err == nil || !strings.HasPrefix(err.Error(), "Building Infected needs macOS 10.13 or newer on this Mac (this one has macOS 10.12)") {
+		t.Fatalf("%v", err)
+	}
+	if checkMacOS(v(10, 13), v(10, 13)) != nil || checkMacOS(v(10, 15), v(10, 13)) != nil || checkMacOS(v(11, 0), v(10, 13)) != nil || checkMacOS(v(26, 0), v(14, 0)) != nil {
+		t.Fatal("10.13 and newer must pass")
+	}
+	if checkMacOS(v(10, 15), v(11, 0)) == nil || checkMacOS(v(10, 15), v(14, 0)) == nil {
+		t.Fatal("10.15 is older than 11")
+	}
+	if parseMacVersion("14.2.1\n") != v(14, 0) || parseMacVersion("10.15.7") != v(10, 15) || parseMacVersion("") != v(0, 0) || parseMacVersion("26.0") != v(26, 0) || parseMacVersion("11.7.10") != v(11, 0) {
+		t.Fatal("parseMacVersion")
+	}
+	var k struct {
+		Requires struct {
+			MacOS macVersion `json:"macos"`
+		} `json:"requires"`
+	}
+	for in, want := range map[string]macVersion{`{"requires":{"macos":14}}`: v(14, 0), `{"requires":{"macos":"10.13"}}`: v(10, 13), `{"requires":{"macos":11}}`: v(11, 0)} {
+		k.Requires.MacOS = macVersion{}
+		if err := json.Unmarshal([]byte(in), &k); err != nil || k.Requires.MacOS != want {
+			t.Fatalf("%s: %v %v", in, k.Requires.MacOS, err)
+		}
+	}
+	if json.Unmarshal([]byte(`{"requires":{"macos":"x"}}`), &k) == nil {
+		t.Fatal("a bad version must be an error")
 	}
 }
 

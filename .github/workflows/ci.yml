@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shell scripts parse and are free of errors
         run: |
-          for f in builder/kit/*.sh .github/scripts/*.sh scripts/*.sh vita/scripts/*.sh vita/app/build.sh; do bash -n "$f"; done
-          shellcheck --severity=error builder/kit/*.sh .github/scripts/*.sh
+          for f in builder/kit/*.sh builder/hosttool/*.sh .github/scripts/*.sh scripts/*.sh vita/scripts/*.sh vita/app/build.sh; do bash -n "$f"; done
+          shellcheck --severity=error builder/kit/*.sh builder/hosttool/*.sh .github/scripts/*.sh
       - name: Python scripts compile
-        run: python3 -m py_compile builder/kit/kit_tool.py .github/scripts/*.py
+        run: python3 -m py_compile builder/kit/kit_tool.py builder/hosttool/*.py .github/scripts/*.py

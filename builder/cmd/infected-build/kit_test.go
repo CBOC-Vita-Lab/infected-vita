@@ -43,7 +43,7 @@ func TestParseKit(t *testing.T) {
 	if got := k.Tool("cxx"); got != filepath.Join("/kit", "toolchain", "bin", "arm-vita-eabi-g++") {
 		t.Fatalf("tool path %q", got)
 	}
-	if k.requiredMacOS() != 14 {
+	if k.requiredMacOS() != (macVersion{14, 0}) {
 		t.Fatal("default macOS requirement should be 14")
 	}
 }

@@ -143,7 +143,7 @@ func isTerminal(f *os.File) bool {
 	return r != 0
 }
 
-func macOSMajor() int { return 0 }
+func macOSVersion() macVersion { return macVersion{} }
 
 // shortPath is the 8.3 name of a path ("C:\\Users\\JOHNSM~1"), which has no space; the path itself when there is none.
 func shortPath(p string) string {

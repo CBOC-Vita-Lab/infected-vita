@@ -55,7 +55,9 @@ installer ends it with TerminateProcess, a crash), so no compiler is left runnin
 All output of the tools goes to `<work>/build.log`. After a failure that file is kept and its path is in the message; after a success the
 work folder is deleted (unless `--keep`). Needs about 700 MB of free disk space in the work folder (`kit.json` `minDiskBytes`).
 
-macOS older than 14 is refused up front (the VitaSDK compilers of the kit need 14); `kit.json` `requires.macos` can raise that.
+macOS older than 10.13 is refused up front (what the Go program itself runs on); then `kit.json` `requires.macos` decides: the Intel Mac kit asks for 10.13 and
+the Apple silicon kit for 11 (the first macOS for that chip). The macOS kits do not carry the macOS programs of the VitaSDK release (they need macOS 14): `builder/hosttool`
+builds the same sources for the low macOS version, see "The macOS host programs" below.
 
 ## What is in a kit
 
@@ -75,6 +77,23 @@ licenses/                 GPL/LGPL/MIT texts and SOURCES.txt: where every part c
 The published archive is `Infected-Vita-builder-<os>.tar.gz` (`linux`, `windows`, `mac-intel`, `mac-arm`), flat (no top folder), `kit.json` first,
 file modes kept (executables 755), reproducible (fixed times and owner).
 
+### The macOS host programs
+
+The Linux and Windows kits take their host programs (the compiler and the tools listed in `builder/kit/lists/host-files.txt`) from the pinned VitaSDK
+release. VitaSDK's macOS programs are built for macOS 14, so the two macOS kits use programs that CI builds itself
+(`kits.yml`, job `host`, steps "macOS toolchain"), from the same sources and with the same options as that release:
+`builder/hosttool/pins.sh` has the versions, hashes and the commit of vitasdk/buildscripts whose recipe is followed (GCC 15.2.0, binutils 2.46.1,
+vita-toolchain `e8bc8f7`, GMP, MPFR, MPC, ISL, zlib, libelf, libyaml, libzip), and `build-mac-host.sh` is the build:
+natively on `macos-15-intel` (deployment target 10.13) and on `macos-26` (Apple silicon, 11.0; `macos-14` is no longer offered and `macos-15` arm64 had no capacity), everything linked statically, with
+`MACOSX_DEPLOYMENT_TARGET` and `-mmacosx-version-min` set. The kit makes no change otherwise: same names, same layout, `kit.json` `requires.macos` set from the target.
+The result is cached (`actions/cache`, key: the files of `builder/hosttool`, the file list and the target), so only a change to those files rebuilds GCC.
+
+`builder/hosttool/check-macho.py` is the evidence that the programs start on the old system, since CI has no Mac with it: for every Mach-O file of the toolchain
+(and again of the unpacked kit) the minimum macOS from the load commands (`LC_BUILD_VERSION minos`, or `LC_VERSION_MIN_MACOSX` below 10.14), that dyld fixups are the classic ones
+(chained fixups need macOS 12), that the only libraries loaded are system libraries (`otool -L`), that the code signature is valid on Apple silicon, and that no
+libc++ function is imported that macOS 10.13 lacks (aligned `new`, `std::filesystem`, verbose abort, atomic wait, ...). The smoke test and the
+byte-for-byte comparison of `eboot.bin` run with these programs like with the others.
+
 ### kit.json (format 1)
 
 The program reads these fields; unknown fields are ignored. Every command runs with the **kit folder** as the working directory except
@@ -83,7 +102,7 @@ the compiles, which run in the **work folder** (see Determinism). Tool names are
 | field | meaning |
 | --- | --- |
 | `game.bootSha256` | SHA-256 of the BOOT.BIN this kit builds (Infected ULUS-10054 1.02) |
-| `requires.macos` | lowest macOS major version (default 14) |
+| `requires.macos` | lowest macOS the kit's compilers run on: a number (`11`, `14`) or, before macOS 11, a string (`"10.13"`); default 14 |
 | `tools` | `cxx`, `ar`, `nm`, `readelf`, `elfCreate`, `fself`: path of the program (with `.exe` in a windows kit) |
 | `profile` | the generator profile (`game/profile.json`) |
 | `compile` | `args` for the C++ compiler; `sources` patterns in `work/gen` (`lean_[0-9]*.cpp`, `lean_table.cpp`) |

@@ -9,7 +9,8 @@ name: Builder kits
 #   target        the part every kit shares: libraries (cached), the application's objects, game/link, game/vpk, headers, target files
 #   host          per computer: the host programs from that OS's VitaSDK + infected-build -> .tar.gz, then a smoke test of the
 #                 UNPACKED kit on that same computer (compile, LTO link, nm, vita-elf-create, vita-make-fself, VPK on a synthetic
-#                 corpus; no disc)
+#                 corpus; no disc). The macOS kits do not use VitaSDK's macOS programs (they need macOS 14): the same sources are built
+#                 here (builder/hosttool) for macOS 10.13 (Intel) / 11 (Apple silicon), cached, and `otool` proves the result.
 #   compare       the program the four kits made must be byte for byte the same
 #   release       only on main with a new version: creates the release (draft first, published when every file is up)
 #
@@ -155,9 +156,11 @@ jobs:
         include:
           - { name: linux,     runner: ubuntu-22.04,   triple: x86_64-linux-gnu,    os: linux,   arch: amd64, gokey: linux-amd64,   exe: '' }
           - { name: windows,   runner: windows-2022,   triple: x86_64-w64-mingw32,  os: windows, arch: amd64, gokey: windows-amd64, exe: '.exe' }
-          - { name: mac-intel, runner: macos-15-intel, triple: x86_64-apple-darwin, os: mac,     arch: amd64, gokey: darwin-amd64,  exe: '' }
-          - { name: mac-arm,   runner: macos-26,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '' }
+          # deploy: MACOSX_DEPLOYMENT_TARGET of the host programs (what the build script is given); minmac: kit.json requires.macos
+          - { name: mac-intel, runner: macos-15-intel, triple: x86_64-apple-darwin, os: mac,     arch: amd64, gokey: darwin-amd64,  exe: '', deploy: '10.13', minmac: '10.13' }
+          - { name: mac-arm,   runner: macos-26,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '', deploy: '11.0',  minmac: '11' }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
     defaults:
       run:
         shell: bash
@@ -180,7 +183,86 @@ jobs:
           echo "T=$T" >> "$GITHUB_ENV"
           bash --version | head -1
       - name: VitaSDK for this computer (pinned)
+        if: matrix.os != 'mac'
         run: .github/scripts/fetch-vitasdk.sh "${{ matrix.triple }}" "$T/sdk"
+      # ---- macOS: the host programs are built here (see builder/hosttool/build-mac-host.sh); two caches, so that a failure of the
+      # GCC build does not lose the libraries and binutils: "out" (the finished host SDK) and "a" (libraries, binutils, vita-toolchain).
+      - name: macOS toolchain - folder
+        if: matrix.os == 'mac'
+        run: |
+          sudo mkdir -p /opt/vita-host && sudo chown "$(id -u):$(id -g)" /opt/vita-host
+          echo "HOSTCHAIN_KEY=${{ matrix.arch }}-${{ matrix.deploy }}-${{ hashFiles('builder/hosttool/**', 'builder/kit/lists/host-files.txt') }}" >> "$GITHUB_ENV"
+      - name: macOS toolchain - cache
+        if: matrix.os == 'mac'
+        id: hostchain
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/vita-host/out
+          key: mac-host-v1-${{ env.HOSTCHAIN_KEY }}
+      - name: macOS toolchain - libraries, binutils, vita-toolchain from cache
+        if: matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true'
+        id: hostchain-a
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /opt/vita-host/deps
+            /opt/vita-host/vitasdk
+            /opt/vita-host/licenses
+            /opt/vita-host/.deps-done
+          key: mac-host-a-v1-${{ env.HOSTCHAIN_KEY }}
+      - name: macOS toolchain - build libraries, binutils, vita-toolchain
+        if: matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true' && steps.hostchain-a.outputs.cache-hit != 'true'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          for t in autoconf automake libtool; do brew list --versions "$t" >/dev/null 2>&1 || brew install "$t"; done
+          bash builder/hosttool/build-mac-host.sh --phase deps --arch "${{ matrix.arch }}" --target "${{ matrix.deploy }}" \
+               --root /opt/vita-host --tmp "$RUNNER_TEMP/hostbuild"
+      - name: macOS toolchain - keep libraries, binutils, vita-toolchain
+        if: matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true' && steps.hostchain-a.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/vita-host/deps
+            /opt/vita-host/vitasdk
+            /opt/vita-host/licenses
+            /opt/vita-host/.deps-done
+          key: mac-host-a-v1-${{ env.HOSTCHAIN_KEY }}
+      - name: macOS toolchain - build GCC
+        if: matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true'
+        run: |
+          bash builder/hosttool/build-mac-host.sh --phase gcc --arch "${{ matrix.arch }}" --target "${{ matrix.deploy }}" \
+               --root /opt/vita-host --tmp "$RUNNER_TEMP/hostbuild"
+      - name: macOS toolchain - keep
+        if: matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/vita-host/out
+          key: mac-host-v1-${{ env.HOSTCHAIN_KEY }}
+      - name: macOS toolchain - logs
+        if: always() && matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true'
+        run: |
+          [ -d "$RUNNER_TEMP/hostbuild/logs" ] || exit 0
+          { echo "### macOS toolchain build (${{ matrix.name }}, target macOS ${{ matrix.deploy }}), seconds per step"; echo '```'; cat "$RUNNER_TEMP/hostbuild/timings.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          tar -czf "$RUNNER_TEMP/hostbuild-logs.tgz" -C "$RUNNER_TEMP/hostbuild" logs timings.txt $(cd "$RUNNER_TEMP/hostbuild" && ls build/gcc/config.log build/binutils/config.log 2>/dev/null)
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'mac' && steps.hostchain.outputs.cache-hit != 'true'
+        with:
+          name: hostbuild-logs-${{ matrix.name }}
+          path: ${{ runner.temp }}/hostbuild-logs.tgz
+          retention-days: 5
+          if-no-files-found: ignore
+      # The proof that the programs run on the oldest macOS the kit claims (a Mac with it is not available in CI): the minimum
+      # version in every load command, only system libraries, nothing newer than that macOS in the C++ runtime imports.
+      - name: macOS toolchain - minimum macOS of the programs
+        if: matrix.os == 'mac'
+        run: |
+          echo "### Host programs of the ${{ matrix.name }} kit: minimum macOS (limit ${{ matrix.deploy }})" >> "$GITHUB_STEP_SUMMARY"
+          python3 -I builder/hosttool/check-macho.py /opt/vita-host/out --max-minos "${{ matrix.deploy }}" \
+              --arch "$([ '${{ matrix.arch }}' = amd64 ] && echo x86_64 || echo arm64)" \
+              --imports "$T/libcxx-imports.txt" --summary "$GITHUB_STEP_SUMMARY" | tee "$T/minos-toolchain.txt"
+          echo "libc++ symbols the programs import:"; cut -f1 "$T/libcxx-imports.txt" | head -300
       - uses: actions/download-artifact@v4
         with:
           name: target-part
@@ -194,8 +276,12 @@ jobs:
         run: |
           extra=()
           # macOS: programs are copied as they are (a stripped Mach-O would lose its signature, which Apple silicon requires)
-          [ "${{ matrix.os }}" = mac ] && extra=(--strip /usr/bin/true)
-          bash builder/kit/make-kit.sh host --target-dir "$T/target" --out "$T/kit" --host-sdk "$T/sdk/vitasdk" \
+          hsdk="$T/sdk/vitasdk"
+          if [ "${{ matrix.os }}" = mac ]; then
+            extra=(--strip /usr/bin/true --min-macos "${{ matrix.minmac }}")
+            hsdk=/opt/vita-host/out
+          fi
+          bash builder/kit/make-kit.sh host --target-dir "$T/target" --out "$T/kit" --host-sdk "$hsdk" \
                --host-os "${{ matrix.os }}" --host-arch "${{ matrix.arch }}" ${extra[@]+"${extra[@]}"}
       - name: The infected-build program
         run: |
@@ -218,10 +304,16 @@ jobs:
           tar -xzf "$T/out/$KIT_FILE" -C "$S/the kit"
           python3 -I .github/scripts/smoke-kit.py "$S/the kit" "$S/work dir" "$S/out dir" --jobs 2 | tee "$T/smoke.log"
           mkdir -p "$T/result"
+          if [ "${{ matrix.os }}" = mac ]; then
+            echo "### Unpacked ${{ matrix.name }} kit: minimum macOS of every program" >> "$GITHUB_STEP_SUMMARY"
+            python3 -I builder/hosttool/check-macho.py "$S/the kit" --max-minos "${{ matrix.deploy }}" --summary "$GITHUB_STEP_SUMMARY" | tee "$T/minos-kit.txt"
+          fi
           {
             echo "kit ${{ matrix.name }}"
             echo "kit-sha256 $(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$T/out/$KIT_FILE")"
             echo "kit-bytes $(python3 -I -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$T/out/$KIT_FILE")"
+            python3 -I -c 'import json,sys; print("requires-macos", json.load(open(sys.argv[1]))["requires"]["macos"])' "$S/the kit/kit.json"
+            [ -f "$T/minos-kit.txt" ] && sed -nE 's/.*highest minos ([0-9.]+).*/highest-minos \1/p' "$T/minos-kit.txt"
             grep -E '^(segment [0-9]|(segments|eboot|vpk)-sha256 )' "$T/smoke.log"
           } > "$T/result/${{ matrix.name }}.txt"
           cat "$T/result/${{ matrix.name }}.txt"
@@ -283,13 +375,14 @@ jobs:
               rows[d['kit'].strip()]['segments'] = [l for l in lines if l.startswith('segment ')]
           names = ['linux', 'windows', 'mac-intel', 'mac-arm']
           missing = [n for n in names if n not in rows]
-          out = ['| kit | size | segments-sha256 | eboot.bin (direct tool calls) | eboot.bin (infected-build) |', '|---|---|---|---|---|']
+          out = ['| kit | size | requires macOS | highest minos of its programs | segments-sha256 | eboot.bin (direct tool calls) | eboot.bin (infected-build) |', '|---|---|---|---|---|---|---|']
           for n in names:
               r = rows.get(n, {})
-              out.append('| %s | %.1f MB | `%s` | `%s` | `%s` |' % (n, int(r.get('kit-bytes', 0)) / 1e6, r.get('segments-sha256', '-')[:16], r.get('eboot-sha256', '-')[:16], r.get('ib-eboot-sha256', '-')[:16]))
+              out.append('| %s | %.1f MB | %s | %s | `%s` | `%s` | `%s` |' % (n, int(r.get('kit-bytes', 0)) / 1e6, r.get('requires-macos', '-') if n.startswith('mac') else '-', r.get('highest-minos', '-'),
+                                                                 r.get('segments-sha256', '-')[:16], r.get('eboot-sha256', '-')[:16], r.get('ib-eboot-sha256', '-')[:16]))
           text = '\n'.join(out)
           print(text)
-          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('### Kits and cross-host comparison\n\n' + text + '\n\nThe program (every loadable segment of the Sony ELF, from the same synthetic input) must be identical, and so must the eboot.bin that infected-build makes from it: it is the same file on Linux, Windows and both Macs.\n')
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('### Kits and cross-host comparison\n\n' + text + '\n\nThe program (every loadable segment of the Sony ELF, from the same synthetic input) must be identical, and so must the eboot.bin that infected-build makes from it: it is the same file on Linux, Windows (both with the VitaSDK programs) and both Macs (with the compilers built for old macOS by builder/hosttool).\n')
           if missing:
               sys.exit('no result from: %s' % ', '.join(missing))
           if len({rows[n]['segments-sha256'] for n in names}) != 1:

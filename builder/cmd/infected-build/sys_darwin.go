@@ -21,11 +21,11 @@ func freeRAMBytes() int64 {
 	return 0
 }
 
-// macOSMajor is the major version of macOS (14 for macOS 14.x; "10.15" gives 10), from sw_vers; 0 when unknown.
-func macOSMajor() int {
+// macOSVersion is the version of macOS from sw_vers (14 for macOS 14.x, 10.15 for Catalina); zero when unknown.
+func macOSVersion() macVersion {
 	out, err := exec.Command("/usr/bin/sw_vers", "-productVersion").Output()
 	if err != nil {
-		return 0
+		return macVersion{}
 	}
-	return parseMajor(string(out))
+	return parseMacVersion(string(out))
 }
