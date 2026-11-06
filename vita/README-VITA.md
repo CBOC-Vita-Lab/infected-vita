@@ -155,7 +155,7 @@ Everything has a default; the file is only needed to change something.
 
 ## Reading log.txt
 
-* Start of the file: build date, config actually used, the settings list (the HD row can read `greyed: No texture pack installed.` there even when a pack is in place: it is printed before the renderer looks for the packs; the `[hdtex] mode ... pack of N textures` line and the menu are right), memory line (`mem user_free=... heap=.../...`), `shader cache: N shipped file(s) copied`,
+* Start of the file: build date, config actually used, the settings list (the HD row reads `usable` when a texture pack is in the data folder, `greyed: No texture pack installed.` when none is), memory line (`mem user_free=... heap=.../...`), `shader cache: N shipped file(s) copied`,
   the ISO check, `threaded renderer: guest executor on core 0, GE thread on core 1` (or `off`), and `[gl] program ... linked`
   lines (one per shader variant as the game first uses it, with the number of variants so far).
 * Near the start, `[gl] speed features: specialize=1 alpha_elide=1/1 skip_invisible=1 compact_vertices=1 vgl_skip_redundant=1 scratch_buffers=1 merge=1 ui_upscale=1 prewarm=1 fxaa_quality=fast aa_auto=1`: the drawing speed-ups as this run has them (the player build has all of them on; a `0` means a `config.txt` line turned it off). `[gl] warm-up: the FXAA program is ready, N ms` says the Auto/FXAA shader was made during the logos.

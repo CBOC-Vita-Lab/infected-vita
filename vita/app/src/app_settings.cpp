@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "platform.h"
 
+#include "gpu/hd_texture_pack.hpp"
 #include "kernel/kernel.hpp"
 #include "overlay/overlay_host.hpp"
 #include "settings/port_settings.hpp"
@@ -18,7 +19,16 @@ std::uint32_t g_applied_generation = 0;
 int g_applied_cpu_mhz = 0;       // the clock the settings asked for last (0 = nothing yet)
 int g_applied_vsync = -1;
 
+// The constructor greys the HD row ("No texture pack installed.") and the renderer lifts it when it first looks for the pack, which is
+// after the settings list is logged and after the first menu frame: look now, so the log and the menu are right from the start.
+void lift_hd_reason() {
+    port::Settings& s = port::settings();
+    if (s.unavailable_reason(port::Key::GfxHdTextures) != nullptr && portablekit::gpu::hd_pack_present(portablekit::gpu::hd_data_root()))
+        s.set_unavailable(port::Key::GfxHdTextures, nullptr);
+}
+
 void log_non_default() {
+    lift_hd_reason();
     port::Settings& s = port::settings();
     plat::logf("settings: %s (%s)", s.path().empty() ? "(no file)" : s.path().c_str(), s.dirty() ? "changed" : "as stored");
     for (std::size_t i = 0; i < port::kKeyCount; ++i) {
@@ -31,7 +41,9 @@ void log_non_default() {
 
 void apply() {
     port::Settings& s = port::settings();
-    // perf.cpu_clock: 444 (the retail maximum) or 500 (needs a plugin that lifts the limit; the setter's answer is logged).
+    // perf.cpu_clock: 444 (the retail maximum) or 500 (the package's own kernel module raises it from kernel mode, vita/clock500; a
+    // PSVshellPlus profile does the same from outside). The system's user-mode setter refuses anything above 444 and keeps saying 444
+    // either way, so the MEASURED clock decides, and the menu's row shows it (port::set_measured_cpu_clock).
     // config.txt's clocks=0 keeps the application away from the clocks altogether.
     if (app::cfg_bool("clocks", true)) {
         const int want = (int)port::cpu_clock_mhz();
@@ -40,18 +52,23 @@ void apply() {
             if (want != 444) {
                 int applied = 0;
                 const int rc = plat::clock_set_arm(want, &applied);
-                // With a PSVshellPlus profile for this title (INFC00001) the clock runs at 500 while the system still reports 444 and
-                // the game's own requests are ignored: the measured clock decides, not the setter's answer.
                 const int measured = plat::clock_measure_mhz();
+                port::set_measured_cpu_clock(measured);
                 if (measured >= want - want / 20) {
-                    plat::logf("settings: the ARM clock runs at %d MHz (measured; the system reports %d)", measured, applied);
-                } else if (rc < 0 || applied != want) {
-                    plat::logf("settings: the ARM clock stays at %d MHz (%d MHz was refused by the system)", applied, want);
-                    if (applied != 0 && applied < want) (void)plat::clock_set_arm(444, &applied);
+                    plat::logf("settings: the ARM clock runs at %d MHz (measured; the system reports %d; %s)", measured, applied,
+                               plat::clock_boost_loaded() ? "raised by the package's clock module" : "set from outside, e.g. a PSVshellPlus profile");
+                } else {
+                    plat::logf("settings: the ARM clock stays at %d MHz measured (the system reports %d; %d MHz was refused%s)", measured, applied, want,
+                               rc < 0 && !plat::clock_boost_loaded() ? ", no clock module" : "");
+                    (void)plat::clock_set_arm(444, &applied);   // the module (if it was loaded) is unloaded and the system's own clock is back
+                    port::set_measured_cpu_clock(plat::clock_measure_mhz());
                 }
             } else if (g_applied_generation != 0) {
                 int applied = 0;
-                (void)plat::clock_set_arm(444, &applied);   // back from 500
+                (void)plat::clock_set_arm(444, &applied);   // back from 500: the clock module restores the old register value
+                const int measured = plat::clock_measure_mhz();
+                port::set_measured_cpu_clock(measured);
+                plat::logf("settings: the ARM clock is back at %d MHz (measured; the system reports %d)", measured, applied);
             }
         }
     }
@@ -116,6 +133,7 @@ void install_appliers() {
     {
         // The list printed by init() comes before the renderer has looked for the HD packs: say what the menu will show.
         port::Settings& s = port::settings();
+        lift_hd_reason();
         const char* reason = s.unavailable_reason(port::Key::GfxHdTextures);
         plat::logf("settings: gfx.hd_textures = %s%s%s%s", s.value(port::Key::GfxHdTextures), reason ? "  [greyed: " : "  [usable]",
                    reason ? reason : "", reason ? "]" : "");
@@ -123,6 +141,12 @@ void install_appliers() {
     apply();   // the first start: the clock the player chose
     portablekit::kernel().add_vblank_hook([] {
         if (port::settings().generation() != g_applied_generation) apply();
+        // The system takes the 500 MHz back after a suspend or a visit to the home screen: look now and then (about every 5 s).
+        static unsigned frames = 0;
+        if (g_applied_cpu_mhz > 444 && ++frames >= 300) {
+            frames = 0;
+            plat::clock_keepalive();
+        }
     });
 }
 

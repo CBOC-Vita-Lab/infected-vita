@@ -68,6 +68,22 @@ void memory_sample() {
 
 size_t heap_peak() { return g_peak; }
 
+std::string memory_warning() {
+    plat::MemInfo m;
+    if (!plat::mem_info(&m)) return std::string();
+    const long user_mib = (long)(m.user_free / (1024 * 1024)), phycont_mib = (long)(m.phycont_free / (1024 * 1024));
+    char buf[160];
+    if (user_mib < 32) {
+        snprintf(buf, sizeof(buf), "Low memory: %ld MB free. Close other apps or restart the Vita.", user_mib);
+        return buf;
+    }
+    if (phycont_mib < 16) {
+        snprintf(buf, sizeof(buf), "Low video memory (%ld MB): movies may not play. Restart the Vita.", phycont_mib);
+        return buf;
+    }
+    return std::string();
+}
+
 std::string memory_line() {
     memory_sample();
     plat::MemInfo m;

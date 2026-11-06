@@ -278,6 +278,9 @@ int dir_copy_tree(const char* src_rel_app, const char* dst_rel_data, bool overwr
 // ---------------------------------------------------------------- clocks / memory
 ClockReport clocks_read() { return ClockReport(); }
 int clock_measure_mhz() { return 0; }
+void clock_module_allow(bool) {}
+bool clock_boost_loaded() { return false; }
+void clock_keepalive() {}
 int clock_set_arm(int, int* applied_mhz) {
     if (applied_mhz) *applied_mhz = 0;
     return -1;

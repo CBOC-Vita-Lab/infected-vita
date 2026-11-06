@@ -293,8 +293,16 @@ add_custom_command(OUTPUT "${CORE3_MODULE}"
   DEPENDS "${VITA_TREE}/core3/core3.c" "${VITA_TREE}/core3/exports.yml" "${VITA_TREE}/core3/build.sh"
   COMMENT "infected_core3.skprx")
 add_custom_target(core3_module DEPENDS "${CORE3_MODULE}")
+# The package's own kernel module that runs the ARM cores at 500 MHz while the game runs (vita/clock500; loaded by the application itself).
+set(CLOCK_MODULE "${CMAKE_CURRENT_BINARY_DIR}/module/infected_clock.skprx")
+add_custom_command(OUTPUT "${CLOCK_MODULE}"
+  COMMAND ${CMAKE_COMMAND} -E env "VITASDK=$ENV{VITASDK}" "${VITA_TREE}/clock500/build.sh" "${CMAKE_CURRENT_BINARY_DIR}/module"
+  DEPENDS "${VITA_TREE}/clock500/clock500.c" "${VITA_TREE}/clock500/exports.yml" "${VITA_TREE}/clock500/build.sh"
+  COMMENT "infected_clock.skprx")
+add_custom_target(clock_module DEPENDS "${CLOCK_MODULE}")
 vita_create_vpk(infected.vpk ${VITA_TITLEID} infected.self
   FILE ${CORE3_MODULE} module/infected_core3.skprx
+  FILE ${CLOCK_MODULE} module/infected_clock.skprx
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE ${LIVEAREA_DIR}/sce_sys/icon0.png sce_sys/icon0.png
@@ -305,4 +313,4 @@ vita_create_vpk(infected.vpk ${VITA_TITLEID} infected.self
   FILE ${LIVEAREA_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
   ${RETROFLOW_FILES}
   ${SHADER_CACHE_FILES})
-add_dependencies(infected.vpk-vpk core3_module)
+add_dependencies(infected.vpk-vpk core3_module clock_module)

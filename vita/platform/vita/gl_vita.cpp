@@ -110,9 +110,9 @@ bool gl_init(const GlParams& p) {
     // 1. libshacccg.suprx: not fatal (a pre-shipped shader cache can still serve the shaders) but it must be loud.
     bool have_cc = gl_shader_compiler_available();
     if (!have_cc) {
-        logf("GL: libshacccg.suprx NOT FOUND (looked at %s and %s). GLSL shaders can only be loaded from the shader cache; any shader that "
-             "is not in the cache will fail to compile (GL_INVALID_OPERATION). Install the shader compiler module "
-             "(the usual 'shader compiler installer' homebrew step) so that ur0:data/libshacccg.suprx exists.",
+        logf("GL: no shader compiler (libshacccg.suprx not found at %s or %s). Optional: install it with ShaRKBR33D for the rarely used "
+             "effects. The game's shaders come from the shipped shader cache; a shader that is not in the cache fails to compile "
+             "(GL_INVALID_OPERATION).",
              kShaccCgPaths[0], kShaccCgPaths[1]);
     } else {
         logf("GL: libshacccg.suprx present");
