@@ -156,7 +156,7 @@ jobs:
           - { name: linux,     runner: ubuntu-22.04,   triple: x86_64-linux-gnu,    os: linux,   arch: amd64, gokey: linux-amd64,   exe: '' }
           - { name: windows,   runner: windows-2022,   triple: x86_64-w64-mingw32,  os: windows, arch: amd64, gokey: windows-amd64, exe: '.exe' }
           - { name: mac-intel, runner: macos-15-intel, triple: x86_64-apple-darwin, os: mac,     arch: amd64, gokey: darwin-amd64,  exe: '' }
-          - { name: mac-arm,   runner: macos-15,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '' }
+          - { name: mac-arm,   runner: macos-26,       triple: arm64-apple-darwin,  os: mac,     arch: arm64, gokey: darwin-arm64,  exe: '' }
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
