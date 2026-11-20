@@ -75,11 +75,15 @@ void apply() {
             }
         }
     }
-    const int vs = vsync() ? 1 : 0;
+    // present_vblank_lock=1 (config.txt, default 0 until the console has shown it helps): with a 30 frames a second cap every present is
+    // held for two vblanks (vitaGL's swap interval 2), so the pictures cannot come at 1-3-2 vblank spacings. At 60 it changes nothing.
+    int vs = vsync() ? 1 : 0;
+    if (vs && app::cfg_bool("present_vblank_lock", false) && port::frame_cap() == port::FrameCap::Fps30) vs = 2;
     if (vs != g_applied_vsync) {
         g_applied_vsync = vs;
-        plat::gl_set_vsync(vs != 0);
-        plat::logf("settings: display sync %s (perf.frame_cap=%s)", vs ? "on" : "off", s.value(port::Key::PerfFrameCap));
+        plat::gl_set_present_interval(vs);
+        plat::logf("settings: display sync %s (perf.frame_cap=%s, present_vblank_lock=%s)", vs == 2 ? "on, every second vblank" : (vs ? "on" : "off"),
+                   s.value(port::Key::PerfFrameCap), app::cfg_bool("present_vblank_lock", false) ? "1" : "0");
     }
     g_applied_generation = s.generation();
 }

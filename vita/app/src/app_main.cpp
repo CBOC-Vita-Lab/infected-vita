@@ -23,6 +23,7 @@
 #include "app_fatal.h"
 #include "app_install.h"
 #include "app_iso.h"
+#include "app_boot_art.h"
 #include "app_log.h"
 #include "app_memory.h"
 #include "app_pad_script.h"
@@ -199,6 +200,7 @@ int main(int, char**) {
     if (!gl_ok) plat::logf("vitaGL did not start; nothing can be shown on screen");
     app::ui::init();
     app::ui::boot_title("Infected  (PS Vita port)");
+    app::boot_art::load_cached();   // the disc's own picture behind the messages, when the last start made it
     app::ui::boot_line("Starting...");
     app::install_retroflow_art();
     if (!plat::gl_shader_compiler_available()) {

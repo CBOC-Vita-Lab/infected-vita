@@ -1,0 +1,22 @@
+# Variants for vita/tools/ab_session.sh: one line each. The pairs are run A, B, A, B, ... (the round count is --rounds) so that the
+# run-to-run noise of about 1 fps lands on both sides alike.
+#
+#   base: <config.txt lines every run gets, separated by ;>
+#   pair: <name> | A: <lines> | B: <lines>          (A is the baseline; the lines are config.txt lines separated by ;)
+#
+# Every switch of the November round is here once, off against on (B is the new behaviour, as shipped by default). Switches that do not
+# exist in the build under test are harmless: config.txt keys nobody reads are ignored. Add your own lines freely.
+
+base: bench=play; bench_interval=10
+
+# This round's switches
+pair: gl_blend_elide        | A: gl_blend_elide=0        | B: gl_blend_elide=1
+pair: gl_scene_depth_trim   | A: gl_scene_depth_trim=0   | B: gl_scene_depth_trim=1
+pair: io_cache              | A: io_cache=0              | B: io_cache=1
+pair: present_vblank_lock   | A: present_vblank_lock=0   | B: present_vblank_lock=1
+pair: gl_scene_scale        | A: gl_scene_scale=0        | B: gl_scene_scale=1
+pair: gl_scene_scale_always | A: gl_scene_scale=0        | B: gl_scene_scale=2
+pair: hd_recolour_dxt       | A: hd_recolour_dxt=0       | B: hd_recolour_dxt=1
+
+# Anti-aliasing: FXAA always on against Auto (FXAA while the renderer has room for it)
+pair: aa_fxaa_vs_auto       | A: gfx.antialiasing=fxaa   | B: gfx.antialiasing=auto

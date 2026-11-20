@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#include <vector>
+
 namespace app::ui {
 
 // Installs the overlay. Call right after plat::gl_init succeeded (or instead of GL on a headless build: everything is then log-only).
@@ -18,6 +20,10 @@ void boot_title(const char* title);
 void boot_line(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void boot_progress(float fraction, const char* label);   // fraction < 0 hides the bar
 void boot_hide();                                         // the boot text goes away (the game's frames are on screen)
+
+// The picture behind the boot screen and the error screen (app_boot_art.h): w x h pixels, red in the low byte. `text_top` is the first row
+// free for text (below the logo). The boot screen then draws its lines on a darkened panel. boot_hide() frees the picture.
+void set_art(std::vector<uint32_t>&& pixels, int w, int h, int text_top);
 
 // The status HUD (hud=1 in config.txt): two lines at the top left, text from the status line.
 void hud_set(const char* line1, const char* line2);

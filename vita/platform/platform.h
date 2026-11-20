@@ -341,6 +341,16 @@ bool gl_init(const GlParams& p);
 bool gl_is_ready();
 void gl_swap();                                // vglSwapBuffers(GL_FALSE); returns after the frame is queued (see VITAGL_NOTES.md section 4)
 void gl_set_vsync(bool on);
+// Present pacing. Every gl_swap() is timed against the display's vblank counter: how many vblanks passed since the swap before.
+// The counts are cumulative since the start; the platform also logs one "[pace]" line with the histogram every 10 s.
+struct PaceStats {
+    uint64_t v0 = 0, v1 = 0, v2 = 0, v3 = 0, v4 = 0;   // swaps that came 0, 1, 2, 3, 4 or more vblanks after the one before
+    int interval = 1;                                   // the swap interval now: 0 not synchronised, 1 every vblank, 2 every second one
+};
+void gl_pace_stats(PaceStats* out);
+// vblanks per presented frame: 0 off, 1 each vblank, 2 every second one (vitaGL's swap interval, a wait of that many vblanks on its
+// display queue). Replaces gl_set_vsync's on/off; 2 holds every frame for two vblanks, so it is for a 30 frames a second game.
+void gl_set_present_interval(int vblanks);
 void gl_shutdown();                            // vitaGL (9bf3e3f) has NO vglEnd(): this only marks GL as down; memory returns at process exit
 void* gl_get_proc(const char* name);           // vglGetProcAddress; nullptr when the function is not implemented
 // Vita: true if libshacccg.suprx exists at ur0:/data/libshacccg.suprx (vitaShaRK's default, vitashark.c DEFAULT_SHACCCG_PATH)

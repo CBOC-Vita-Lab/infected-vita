@@ -197,11 +197,64 @@ bool gl_init(const GlParams& p) {
 }
 
 bool gl_is_ready() { return g_gl_ready; }
+namespace {
+uint64_t g_bins[5] = {};
+int g_present_interval = 1;
+uint32_t g_last_vcount = 0;
+bool g_have_vcount = false;
+// The 10 second histogram of the log.
+uint64_t g_pace_window[5] = {};
+uint64_t g_pace_window_start_us = 0;
+
+void pace_note() {
+    const uint32_t vc = (uint32_t)sceDisplayGetVcount();
+    const uint64_t t = now_us();
+    if (g_have_vcount) {
+        const uint32_t d = vc - g_last_vcount;
+        const int bin = d >= 4 ? 4 : (int)d;
+        g_bins[bin]++;
+        g_pace_window[bin]++;
+    } else {
+        g_pace_window_start_us = t;
+    }
+    g_last_vcount = vc;
+    g_have_vcount = true;
+    if (t - g_pace_window_start_us >= 10000000ull) {
+        const uint64_t n = g_pace_window[0] + g_pace_window[1] + g_pace_window[2] + g_pace_window[3] + g_pace_window[4];
+        const double vblanks = (double)(g_pace_window[1] + 2 * g_pace_window[2] + 3 * g_pace_window[3]) + 4.0 * (double)g_pace_window[4];
+        logf("[pace] %.1fs: %llu presents, vblanks between presents: 1:%llu 2:%llu 3:%llu 4+:%llu (same vblank:%llu) mean %.2f, swap interval %d",
+             (t - g_pace_window_start_us) / 1e6, (unsigned long long)n, (unsigned long long)g_pace_window[1], (unsigned long long)g_pace_window[2],
+             (unsigned long long)g_pace_window[3], (unsigned long long)g_pace_window[4], (unsigned long long)g_pace_window[0],
+             n ? vblanks / (double)n : 0.0, g_present_interval);
+        for (uint64_t& w : g_pace_window) w = 0;
+        g_pace_window_start_us = t;
+    }
+}
+}  // namespace
+
 void gl_swap() {
     if (g_comp_draw) composite_overlay();
     vglSwapBuffers(GL_FALSE);
+    pace_note();   // after the swap returned: with the display queue full that is when a buffer came free, i.e. the display's beat
 }
-void gl_set_vsync(bool on) { vglWaitVblankStart(on ? GL_TRUE : GL_FALSE); }
+void gl_set_vsync(bool on) {
+    g_present_interval = on ? 1 : 0;
+    vglWaitVblankStart(on ? GL_TRUE : GL_FALSE);
+}
+void gl_pace_stats(PaceStats* out) {
+    if (!out) return;
+    out->v0 = g_bins[0]; out->v1 = g_bins[1]; out->v2 = g_bins[2]; out->v3 = g_bins[3]; out->v4 = g_bins[4];
+    out->interval = g_present_interval;
+}
+// vitaGL keeps one swap interval for the display queue thread (vsync_interval, sceDisplayWaitVblankStartMulti(interval) after each
+// frame is put on screen); vglWaitVblankStart(true) sets 1, eglSwapInterval sets any number (the display argument is not used).
+void gl_set_present_interval(int vblanks) {
+    if (vblanks < 0) vblanks = 0;
+    if (vblanks > 2) vblanks = 2;
+    g_present_interval = vblanks;
+    if (vblanks <= 1) vglWaitVblankStart(vblanks ? GL_TRUE : GL_FALSE);
+    else eglSwapInterval((EGLDisplay)0, vblanks);
+}
 void gl_shutdown() {
     // vitaGL (e119b3e) has no vglEnd(); resources are reclaimed when the process exits.
     logf("GL: shutdown requested (vitaGL cannot be torn down; freed at process exit)");

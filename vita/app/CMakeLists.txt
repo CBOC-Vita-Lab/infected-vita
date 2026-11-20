@@ -125,6 +125,8 @@ set(APP_SOURCES
   src/app_settings.cpp
   src/app_hd_movie.cpp
   src/app_iso.cpp
+  src/app_boot_art.cpp
+  src/boot_art_core.cpp
   src/app_install.cpp
   src/app_bench.cpp
   src/sha256_stream.cpp

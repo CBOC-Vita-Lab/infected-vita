@@ -139,6 +139,9 @@ Everything has a default; the file is only needed to change something.
 | `gl_scene_scale` | `1` | the last rung of Auto: when FXAA is already off and the GPU still cannot keep up, the 3D scene is drawn at `gl_scene_scale_percent` of the display size and enlarged before the HUD (HUD and menus stay full size); back to full size after the same quiet time as FXAA. `0` never, `2` always (to compare) |
 | `gl_scene_scale_percent`, `gl_scene_scale_retry_s`, `gl_scene_scale_need_idle_us` | `85`, `10`, `3000` | the size of the scaled scene, and the back-off and headroom rules of that rung (same meaning as the `gl_aa_auto_*` pair) |
 | `hd_recolour_dxt`, `hd_recolour_check` | `1`, `0` | recoloured HD textures are kept as DXT1/DXT5 (8 times smaller than RGBA8) instead of RGBA8; `0` restores RGBA8. `hd_recolour_check=1` logs the PSNR of each encode |
+| `io_cache`, `io_cache_mb`, `io_cache_ahead`, `io_cache_worker` | `1`, `8`, `4`, `1` | disc reads go through a cache of 64 KiB blocks (`io_cache_mb` MiB, least recently used out first) that has its own file handle, and a worker thread (on core 3 when the application may use it, else core 2, at low priority) reads blocks ahead of a sequential reader (`io_cache_ahead` blocks) and where the game's own UMD read-ahead command says it will read soon. The bytes are the file's. Reads of 1 MiB or more skip the cache. `io_cache=0` reads the disc as before (one seek and read on the game thread); `io_cache_worker=0` keeps the cache and drops the read-ahead. A failed read is tried once more after the file was opened again |
+| `ui_boot_art` | `1` | the start-up and error screens are drawn on the disc's own pictures: `PSP_GAME/PIC1.PNG` (480x272, enlarged to 960x544 with a bicubic filter, dimmed) and `PSP_GAME/ICON0.PNG` (144x80, enlarged 2x, as the logo). They are read from the disc image after its `BOOT.BIN` was checked and cached in `ux0:data/infected/art/boot_art.bin`, so the next start shows them at once. Nothing of the game is in the package. No disc image yet, or a disc without those files: the text-only screen. `0` always text only |
+| `present_vblank_lock` | `0` | with a 30 frames a second cap (the menu's Frame cap) every present is held for two display vblanks (vitaGL's swap interval 2) instead of one, so pictures cannot come at 1-3-2 vblank spacings. Off until the console shows it helps (below). At the 60 cap it changes nothing |
 | `gl_ui_upscale` | `1` | small HUD textures that look like pixel art are enlarged by MMPX once, so the HUD is not blurred at 960x544; `0` leaves them alone |
 | `gl_prewarm` | `1` | the shader programs earlier runs used (and the FXAA program, when FXAA or Auto may use it) are linked while the renderer has nothing to draw (the logos); `0` links every program at its first draw |
 | `gl_skip_invisible` | `1` | draws whose every fragment has alpha 0 and that then change nothing (a sprite or effect faded out) are not sent to vitaGL. About 2 draws a frame in the mission-1 replay, pictures identical; `0` draws them |
@@ -170,6 +173,7 @@ Everything has a default; the file is only needed to change something.
   then part of the frame). `guest` is the game's own busy time: the frame less what it slept (`idle`), of which `gesync` waited in
   `sceGeDrawSync`/`sceGeListSync` for the renderer and `flipwait` at a flip for a renderer frames behind. The thread nearest 100 %
   is the bottleneck. `(vertex=N)` is the part of `gewalk` spent decoding (and skinning) the draws' vertices; it is already inside `gewalk`, not beside it.
+  After `ss=`/`aa=` the line has `| ioc=hit 31 miss 2 wait 0 pf 18 err 0` (the disc cache, this second, in 64 KiB blocks: found, read by the game thread, found being read by the worker, read ahead by the worker, failed even after a reopen; absent with `io_cache=0`; `io=` is still the game thread's milliseconds per frame in disc reads) and `| pace=0/29/1/0 lock=1`: presents of this second that came 1, 2, 3 or 4 or more display vblanks after the one before, and the swap interval in use (`lock=2` is `present_vblank_lock`). Every 10 s the log also gets `[pace] 10.0s: 299 presents, vblanks between presents: 1:0 2:290 3:9 4+:0 (same vblank:0) mean 2.03, swap interval 1`.
   With anti-aliasing Auto the line ends with `| aa=auto:on(off 1, on 1)`: FXAA on or off now, and how many times Auto has switched it off and back on since the start. While the last rung of Auto is in use (`gl_scene_scale`, not `0`) the line also has `| ss=full(down 0, up 0, 0 frames)`: whether the 3D picture is drawn at the smaller size now (`scaled`) or at full size (`full`), how often Auto went down to the smaller size and back, and how many frames were drawn small.
   `[split] walker on core 2, GL on core 1; 1024 draw slots, ...` once at start says the split is running, and
   `[split] thread_local storage is shared between threads` would mean a build whose C++ runtime is single-threaded (VITAGL_NOTES.md section 4).
@@ -181,6 +185,24 @@ Everything has a default; the file is only needed to change something.
   function with `arm-vita-eabi-addr2line -e infected.elf 0x...`.
 * `quit requested from the pad`, `runtime stopped: ...`, `clean exit` end a normal run. `FATAL:` lines come with an error screen.
 * `[savedata]` lines show save loads and writes with their paths.
+
+## Present pacing, and the A/B session
+
+`[pace]` and `pace=` measure what the display shows, whatever the game thinks it did: at every present (`vglSwapBuffers` returned) the platform reads the display's vblank counter and counts the vblanks since the present before. A 30 fps game on a 60 Hz display should show `2` every time. 3s mixed with 1s are the uneven 30 (a 33 ms picture between 50 ms ones). Measured at the time the swap returns, which with the display queue full is when a buffer came free; a swap that waits for the GPU shows as a 3 or 4+ and so does a slow frame, so read it beside `frame=`.
+
+What the console session should compare (`present_vblank_lock=0` against `1`, with the menu's frame cap at 30, in mission 1):
+* the `[pace]` lines: with `0`, how many `1` and `3` there are per 10 s; with `1` there should be none (the swap waits two vblanks), and `4+` must not grow (a frame that missed its two vblanks);
+* fps median, p5 and the 1 % low of `bench=play` (the A/B runner below), and how it feels: judder in pans of the camera;
+* the input: `lock=2` adds up to one vblank of delay to a present that missed its slot. If the fps median drops by more than the noise, leave it off.
+vitaGL at the pinned commit (`e119b3e`) keeps one swap interval for its display queue thread (`sceDisplayWaitVblankStartMulti(interval)` after each frame is shown); `eglSwapInterval(display, n)` sets it (the display argument is unused), `vglWaitVblankStart(true)` is the same as 1.
+
+`vita/tools/ab_session.sh` is the unattended A/B session for one visit to the console (the Mac's bash, curl and python3; vitacompanion running; the game, a disc image and the bot's memory-stick profile in place):
+```
+vita/tools/ab_session.sh --vita 192.168.1.50 --rounds 3 --seconds 240
+vita/tools/ab_session.sh --vita 192.168.1.50 --only io_cache,present_vblank_lock --rounds 5
+vita/tools/ab_session.sh --dry-run          # the plan, nothing touched
+```
+For each pair of `vita/tools/ab_variants.txt` (`base:` lines for every run, `pair: name | A: lines | B: lines`; add your own) it writes `config.txt`, launches the game, lets `bench=play` play mission 1 for `--seconds`, waits for `clean exit` in the log (then `destroy`), pulls `log.txt`, and alternates A, B, A, B over the rounds so the run-to-run noise (about 1 fps) lands on both sides. At the end `ab_report.py` prints fps median, p5 and 1 % low per variant, the disc cache hit rate, the pace shares and, per pair, B - A with a 95 % bootstrap interval over the rounds (three or more rounds). It reads and writes only `ux0:data/infected/config.txt`, `settings.txt` (copied, restored if it changed) and `log.txt`; never `ux0:app/*/sce_sys` and never the saves. `config.txt` is put back at the end and on Ctrl-C. The results (`manifest.tsv`, `runs/N.log`, `report.txt`) stay in `ab_session_<date>/`. `vita/tools/test/test_ab_session.sh` tests all of it against a pretend console.
 
 ## Benchmarks (what to send back)
 
