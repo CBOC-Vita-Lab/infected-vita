@@ -4,7 +4,7 @@
 //
 // The inputs are variant lists (one 0x... flags value per line) or renderer logs (lines "[gl] program ... flags 0x... linked"). A
 // variant is kept when both its vertex and its fragment source hash (vitaGL's cache key: XXH3-64 of the raw source text, printed
-// %llX) have a file under <dir>/v2/v/<XX>/ and <dir>/v2/f/<XX>/. The result is a list the renderer reads as the shipped list
+// %016llX, zero padded) have a file under <dir>/v3/v/<XX>/ and <dir>/v3/f/<XX>/. The result is a list the renderer reads as the shipped list
 // (<data>/shader_cache/variants.txt): the programs to link while the game boots, none of which needs the shader compiler.
 // Written to stdout in the list's format; counts go to stderr.
 //
@@ -27,10 +27,10 @@
 static bool cached(const std::string &root, char kind, const std::string &source) {
     const unsigned long long hash = XXH3_64bits(source.data(), source.size());
     char name[64];
-    std::snprintf(name, sizeof name, "%llX", hash);
+    std::snprintf(name, sizeof name, "%016llX", hash);
     char folder[8];
     std::snprintf(folder, sizeof folder, "%02X", static_cast<unsigned>(hash >> 56u));
-    return std::filesystem::exists(std::filesystem::path(root) / "v2" / std::string(1, kind) / folder / (std::string(name) + ".gxp"));
+    return std::filesystem::exists(std::filesystem::path(root) / "v3" / std::string(1, kind) / folder / (std::string(name) + ".gxp"));
 }
 
 int main(int argc, char **argv) {

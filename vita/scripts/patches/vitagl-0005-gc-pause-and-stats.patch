@@ -1,0 +1,196 @@
+Infected port: a bounded wait for the garbage collector after a failed GPU allocation (vglSetGcPauseMs), and counters (vglGetStats).
+When a GPU allocation failed, the unsafe allocators asked the garbage collector for a cycle and then slept sceKernelDelayThread(1000000), a full second, once per attempt and up to four attempts: a freeze of one to four seconds the first time memory ran out. With a limit in milliseconds the allocator looks at the collector's pull semaphore every millisecond and leaves as soon as the cycle has given its slot back, or when the limit is up. 0 (the default) keeps the second.
+vglGetStats returns counts of shader cache hits, shader compiles and compile failures, allocation failures and GC pauses (count, total and longest, in microseconds). NO_DEBUG builds have no log, so the port reads these.
+
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 9922f09..fbd27a1 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -818,6 +818,7 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
+ #endif
+ 	// Compiling shader source
++	vgl_stats_cur.shader_compiles++; // Infected port (patch 0005)
+ 	s->prog = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+ 	if (s->prog) {
+ 		vgl_free(s->source);
+@@ -850,6 +851,8 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 			param = sceShaccCgGetNextParameter(param);
+ 		}
+ 	}
++	if (!s->prog)
++		vgl_stats_cur.shader_compile_failures++; // Infected port (patch 0005)
+ #ifdef HAVE_SHARK_LOG
+ 	if (s->log)
+ 		vgl_free(s->log);
+@@ -2102,7 +2105,7 @@ void glCompileShader(GLuint handle) {
+ 		void *buf = vglMalloc(sz);
+ 		sceIoRead(f, buf, sz);
+ 		sceIoClose(f);
+-		unserialize_shader(buf, sz, s, GL_FALSE);
++		vgl_stats_cur.shader_cache_hits++, unserialize_shader(buf, sz, s, GL_FALSE);
+ 		vgl_free(buf);
+ 		return;
+ 	}
+@@ -2490,7 +2493,7 @@ void glLinkProgram(GLuint progr) {
+ 				void *buf = vglMalloc(sz);
+ 				sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
++				vgl_stats_cur.shader_cache_hits++, unserialize_shader(buf, sz, p->vshader, GL_TRUE);
+ 				vgl_free(buf);
+ 			}
+ 		}
+@@ -2505,7 +2508,7 @@ void glLinkProgram(GLuint progr) {
+ 				void *buf = vglMalloc(sz);
+ 				sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
++				vgl_stats_cur.shader_cache_hits++, unserialize_shader(buf, sz, p->fshader, GL_TRUE);
+ 				vgl_free(buf);
+ 			}
+ 		}
+diff --git a/source/shared.h b/source/shared.h
+index 647edfb..5486c3f 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -908,6 +908,7 @@ extern float *legacy_pool_ptr; // Current address for vertices population for GL
+ extern float *legacy_pool_end; // Address of the end of the GL1 immediate draw pipeline vertex pool
+ #endif
+ extern uint32_t vgl_framecount; // Current frame number since application started
++extern vgl_stats vgl_stats_cur; // Infected port (patch 0005): the counters vglGetStats returns
+ extern SceGxmVertexAttribute ffp_vertex_attrib_config[FFP_VERTEX_ATTRIBS_NUM];
+ extern SceGxmVertexStream ffp_vertex_stream_config[FFP_VERTEX_ATTRIBS_NUM];
+ 
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+index 4a74317..21787e4 100644
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -155,6 +155,52 @@ static inline __attribute__((always_inline)) uint32_t vgl_cache_old_textures(siz
+ #endif
+ 
+ int unsafe_allocator_counter = 0;
++
++// Infected port (patch 0005): the counters (vglGetStats) and the bound on the wait for the garbage collector.
++vgl_stats vgl_stats_cur;
++void vglGetStats(vgl_stats *out, GLboolean reset) {
++	*out = vgl_stats_cur;
++	if (reset)
++		sceClibMemset(&vgl_stats_cur, 0, sizeof(vgl_stats_cur));
++}
++
++static uint32_t vgl_gc_pause_ms = 0;
++void vglSetGcPauseMs(uint32_t ms) {
++	vgl_gc_pause_ms = ms;
++}
++
++// Waits for the cycle the caller just asked the collector for (gc_mutex[0] signalled; `idle_count` is what the pull semaphore
++// counted before the caller took its slot: the collector gives the slot back when the cycle is done). With no limit set it sleeps
++// the second vitaGL always slept; with one it looks every millisecond and leaves as soon as the slot is back or the limit is up.
++static void vgl_wait_for_gc_cycle(int idle_count) {
++	uint64_t start = sceKernelGetSystemTimeWide();
++	if (vgl_gc_pause_ms == 0) {
++		sceKernelDelayThread(1000000);
++	} else {
++		uint64_t limit = (uint64_t)vgl_gc_pause_ms * 1000;
++		for (;;) {
++			sceKernelDelayThread(1000);
++			SceKernelSemaInfo info;
++			info.size = sizeof(info);
++			if (sceKernelGetSemaInfo(gc_mutex[1], &info) == 0 && info.currentCount >= idle_count)
++				break;
++			if (sceKernelGetSystemTimeWide() - start >= limit)
++				break;
++		}
++	}
++	uint32_t waited = (uint32_t)(sceKernelGetSystemTimeWide() - start);
++	vgl_stats_cur.gc_pauses++;
++	vgl_stats_cur.gc_pause_us += waited;
++	if (waited > vgl_stats_cur.gc_pause_us_max)
++		vgl_stats_cur.gc_pause_us_max = waited;
++}
++
++static int vgl_gc_idle_count(void) {
++	SceKernelSemaInfo info;
++	info.size = sizeof(info);
++	return sceKernelGetSemaInfo(gc_mutex[1], &info) == 0 ? info.currentCount : 0;
++}
++
+ void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
+ 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
+ 	unsafe_allocator_counter++;
+@@ -164,9 +210,10 @@ void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);
+ #else
++	int idle_count = vgl_gc_idle_count();
+ 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
+ 	sceKernelSignalSema(gc_mutex[0], 1);
+-	sceKernelDelayThread(1000000);
++	vgl_wait_for_gc_cycle(idle_count);
+ #endif
+ 
+ 	// Allocating requested memblock
+@@ -190,9 +237,10 @@ void *gpu_alloc_mapped_aligned_unsafe_for_gpu(size_t alignment, size_t size) {
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);
+ #else
++	int idle_count = vgl_gc_idle_count();
+ 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
+ 	sceKernelSignalSema(gc_mutex[0], 1);
+-	sceKernelDelayThread(1000000);
++	vgl_wait_for_gc_cycle(idle_count);
+ #endif
+ 
+ 	// Allocating requested memblock
+@@ -223,6 +271,7 @@ void *gpu_alloc_mapped_aligned_for_cpu(size_t alignment, size_t size) {
+ 	vgl_log("%s:%d gpu_alloc_mapped_aligned_for_cpu failed with a requested size of %u bytes, attempting to forcefully free required memory.\n", __FILE__, __LINE__, size);
+ #endif
+ 	unsafe_allocator_counter = 0;
++	vgl_stats_cur.alloc_failures++;
+ 	res = gpu_alloc_mapped_aligned_unsafe_for_cpu(alignment, size);
+ 
+ #ifdef LOG_ERRORS
+@@ -253,6 +302,7 @@ void *gpu_alloc_mapped_aligned_for_gpu(size_t alignment, size_t size) {
+ 	vgl_log("%s:%d gpu_alloc_mapped_aligned_for_gpu failed with a requested size of %u bytes, attempting to forcefully free required memory.\n", __FILE__, __LINE__, size);
+ #endif
+ 	unsafe_allocator_counter = 0;
++	vgl_stats_cur.alloc_failures++;
+ 	res = gpu_alloc_mapped_aligned_unsafe_for_gpu(alignment, size);
+ 
+ #ifdef LOG_ERRORS
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 4df4738..5b4d2ce 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1178,6 +1178,30 @@ void vglSkipRedundantState(GLboolean enable);
+ // texture that never gets its levels. Off by default.
+ void vglReserveCompressedMips(GLboolean enable);
+ 
++// Infected port (patch 0005): what vitaGL counts, for the port's status line. Every field is a 32-bit count since the last
++// reset (the *_us ones are microseconds); the port's glp::VitaglStats mirrors this struct field for field. Not thread safe:
++// read it from the thread that draws.
++typedef struct vgl_stats {
++	uint32_t scene_begins_display, scene_begins_fbo; // scenes begun on the display, on a framebuffer object (patch 0007)
++	uint32_t scene_begin_retries, scene_begin_failures; // sceGxmBeginScene refused: tried again, given up (patch 0006)
++	uint32_t scene_begin_us, scene_begin_us_max; // time in scene_reset from after the old scene's end to the end of the begin (patch 0007)
++	uint32_t mask_quads_begin, mask_quads_scissor; // mask-update draws of the scissor test: at a scene's begin, at a scissor change (patch 0007)
++	uint32_t depth_buffers_made; // depth surfaces allocated for framebuffer objects (patch 0007)
++	uint32_t depth_loads; // scenes begun with the depth force-loaded (a STORE_DEPTH_STENCIL build only) (patch 0007)
++	uint32_t depth_loads_trimmed; // scenes the renderer's hint spared the depth load (or that never had one) (patch 0007)
++	uint32_t mask_quads_skipped; // mask-update draws left out by vglSceneOptions (patch 0007)
++	uint32_t shader_cache_hits, shader_compiles, shader_compile_failures; // shaders read from the cache, compiled, failed to compile
++	uint32_t alloc_failures; // GPU allocations that failed their first try
++	uint32_t gc_pauses, gc_pause_us, gc_pause_us_max; // waits for the garbage collector after a failed allocation
++} vgl_stats;
++void vglGetStats(vgl_stats *out, GLboolean reset);
++
++// Infected port (patch 0005): after a GPU allocation failed, vitaGL asks its garbage collector to free memory and waited a full
++// second (sceKernelDelayThread(1000000)) for it, once per attempt and up to four attempts: a freeze of one to four seconds the
++// first time memory ran out. With a limit in milliseconds it waits for the collector's cycle to finish and no longer than that
++// (the cycle frees a handful of buffers, a fraction of a millisecond when it is not behind). 0 keeps the second.
++void vglSetGcPauseMs(uint32_t ms);
++
+ // calloc implementation for vitaGL internal memory pools.
+ void *vglCalloc(uint32_t nmember, uint32_t size);
+ 
