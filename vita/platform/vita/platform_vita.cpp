@@ -503,7 +503,23 @@ struct File {
     size_t cap = 0;
     size_t buf_off = 0;     // Read: next unread byte in buf        Write: unused
     size_t buf_len = 0;     // Read: valid bytes in buf             Write: pending bytes
+    char path[256] = {0};   // Read mode: to open the file again when a read fails (stale handle after sleep)
 };
+
+static std::atomic<uint32_t> g_file_reopens{0};
+// A read that fails (sceIoRead < 0) on a file that was fine: the descriptor may have gone stale while the console slept. Open it again,
+// seek back to where it was and let the caller read once more. One try per failed read.
+static bool file_reopen_for_read(File* f) {
+    if (f->mode != FileMode::Read || !f->path[0]) return false;
+    const SceUID fd = sceIoOpen(f->path, SCE_O_RDONLY, 0);
+    if (fd < 0) return false;
+    if (sceIoLseek(fd, f->phys, SCE_SEEK_SET) < 0) { sceIoClose(fd); return false; }
+    sceIoClose(f->fd);
+    f->fd = fd;
+    g_file_reopens++;
+    logf("file: %s read failed, opened again at %lld", f->path, (long long)f->phys);
+    return true;
+}
 
 File* file_open(Root r, const char* rel, FileMode m, size_t buffer_bytes) {
     char full[256];
@@ -520,6 +536,7 @@ File* file_open(Root r, const char* rel, FileMode m, size_t buffer_bytes) {
     File* f = new File();
     f->fd = fd;
     f->mode = m;
+    if (m == FileMode::Read) snprintf(f->path, sizeof(f->path), "%s", full);
     if (m == FileMode::Read) {
         SceOff end = sceIoLseek(fd, 0, SCE_SEEK_END);
         sceIoLseek(fd, 0, SCE_SEEK_SET);
@@ -587,12 +604,14 @@ size_t file_read(File* f, void* dst, size_t n) {
         size_t want = n - done;
         if (!f->buf || want >= f->cap) {  // large request: straight into the destination
             SceSSize r = sceIoRead(f->fd, out + done, want);
+            if (r < 0 && file_reopen_for_read(f)) r = sceIoRead(f->fd, out + done, want);
             if (r <= 0) break;
             f->phys += r;
             done += (size_t)r;
             if ((size_t)r < want) break;
         } else {
             SceSSize r = sceIoRead(f->fd, f->buf, f->cap);
+            if (r < 0 && file_reopen_for_read(f)) r = sceIoRead(f->fd, f->buf, f->cap);
             if (r <= 0) break;
             f->phys += r;
             f->buf_off = 0;
