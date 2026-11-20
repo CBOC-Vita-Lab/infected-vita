@@ -1,4 +1,5 @@
 #include "app_status.h"
+#include "kernel/iso_image.hpp"
 
 #include <stdio.h>
 #include <string.h>
@@ -53,6 +54,9 @@ struct Snap {
     uint64_t submits = 0;
     uint64_t presented = 0;
     uint64_t lean_calls = 0, interp_calls = 0, hle_calls = 0;
+    portablekit::IsoCacheStats io;   // the disc read cache (all zero without it)
+    bool io_on = false;
+    plat::PaceStats pace;
 };
 
 Snap g_last;
@@ -115,6 +119,8 @@ Snap take() {
     s.interp_calls = e.interpreted_calls;
     s.hle_calls = e.hle_calls;
     s.switches = kernel().switch_count();
+    s.io_on = portablekit::iso_cache_stats(s.io);
+    plat::gl_pace_stats(&s.pace);
     // gaps of the pump (the device found nothing) and of the sink (producers behind the device while audio was playing)
     s.underruns = (plat::audio_is_open() ? plat::audio_stats().underruns : 0) + portablekit::audio::AudioSink::instance().telemetry().underruns;
     if (gpu::Renderer* r = media_renderer()) {
@@ -324,7 +330,7 @@ void report(const char* why) {
     const auto snd = portablekit::audio::AudioSink::instance().telemetry();
     // Frame skipping: frames left undrawn so far, how far behind the walker the GL thread runs, and whether the guest runs ahead of it.
     const portablekit::gpu::FrameSkipStats fs = split_on ? split->frame_skip_stats() : portablekit::gpu::FrameSkipStats{};
-    char line[1100];
+    char line[1300];
     snprintf(line, sizeof(line),
              "[stat] %s t=%.0fs flips=%llu(+%llu) presented=%llu(+%llu) frame=%.1fms ge=%s%.0f%% | ms/frame guest=%.1f hle=%s gewalk=%.1f (vertex=%.1f) glsubmit=%.1f present=%.1f "
              "decode=%.1f audio=%.1f io=%.1f idle=%.1f (gesync=%.1f flipwait=%.1f) | splitwait=%.1f walkidle=%.1f glidle=%.1f | draws/f=%u gl_draws/f=%u | switches/s=%.0f calls/f lean=%.0f interp=%.0f hle=%.0f | audio q=%u underruns=%llu(+%llu) snd fill=%llu silent=%llu lost=%llu rst=%llu over=%llu lead=%lld ppm=%d | skip=%llu catchup=%d lag=%.1fms",
@@ -339,6 +345,20 @@ void report(const char* why) {
              (unsigned long long)snd.fill, (unsigned long long)snd.silent, (unsigned long long)snd.dropped, (unsigned long long)snd.restarts,
              (unsigned long long)plat::audio_stats().overruns, (long long)snd.lead, (int)plat::audio_stats().rate_ppm,
              (unsigned long long)fs.skipped_frames, fs.catchup ? 1 : 0, fs.lag_us / 1000.0);
+    {
+        // The disc read cache, this second: blocks found (hit), read by the game thread (miss), found being read by the worker (wait), read ahead
+        // by the worker (pf); "io=" above is the time the game thread spent in disc reads. Present pacing: presents this second that came
+        // 1, 2, 3 or 4+ vblanks after the one before (pace=1/2/3/4+), and the swap interval in use (lock=2 is present_vblank_lock).
+        const size_t used = strlen(line);
+        if (now.io_on)
+            snprintf(line + used, sizeof(line) - used, " | ioc=hit %llu miss %llu wait %llu pf %llu err %llu", (unsigned long long)(now.io.hits - g_last.io.hits),
+                     (unsigned long long)(now.io.misses - g_last.io.misses), (unsigned long long)(now.io.waits - g_last.io.waits),
+                     (unsigned long long)(now.io.prefetched - g_last.io.prefetched), (unsigned long long)(now.io.errors - g_last.io.errors));
+        const size_t more = strlen(line);
+        snprintf(line + more, sizeof(line) - more, " | pace=%llu/%llu/%llu/%llu lock=%d", (unsigned long long)(now.pace.v1 - g_last.pace.v1),
+                 (unsigned long long)(now.pace.v2 - g_last.pace.v2), (unsigned long long)(now.pace.v3 - g_last.pace.v3),
+                 (unsigned long long)(now.pace.v4 - g_last.pace.v4), now.pace.interval);
+    }
 #if !defined(INFECTED_NO_GL)
     // Anti-aliasing Auto: whether FXAA is on now, and how often it has gone off and come back since the start (log lines: "[aa] auto: ...").
     if (gpu::Renderer* r = media_renderer()) {

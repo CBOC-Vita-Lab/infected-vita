@@ -10,6 +10,7 @@
 #include "gpu/ge_worker.hpp"
 #include "input/pad_provider.hpp"
 #include "kernel/iso_image.hpp"
+#include "kernel/iso_read_cache.hpp"
 #include "kernel/kernel.hpp"
 #include "kernel/kernel_platform.hpp"
 #include "movie/avc_decoder.hpp"
@@ -47,6 +48,18 @@ void* gw_thread_start(void (*fn)(void*), void* arg, const char* name, int core, 
     return plat::thread_start(d);
 }
 void gw_thread_join(void* t) { plat::thread_join(static_cast<plat::Thread*>(t)); }
+// The disc read-ahead worker (kernel/iso_read_cache.hpp): on the helper core (core 3 when the application may use it, else core 2) and
+// less urgent than the walker that may share core 2.
+void* io_thread_start(void (*fn)(void*), void* arg, const char* name, int core, int priority, size_t stack_bytes) {
+    plat::ThreadDesc d;
+    d.name = name;
+    d.fn = fn;
+    d.arg = arg;
+    d.stack_bytes = stack_bytes;
+    d.core = core;
+    d.priority = priority;
+    return plat::thread_start(d);
+}
 void gw_pin_current(int core) { (void)plat::thread_set_core(nullptr, core); }
 
 // The way out of the game: START+SELECT+L+R held for 0.7 s, or the PS button when the system lets the application see it. The pad
@@ -146,6 +159,14 @@ void install_platform_hooks() {
     dp.thread_join = &gw_thread_join;
     dp.core = plat::helper_core();   // core 3 when the system lets the application use it, else core 2 beside the walker
     portablekit::movie::set_decode_thread_platform(dp);
+
+    portablekit::IoThreadPlatform io;
+    io.thread_start = &io_thread_start;
+    io.thread_join = &gw_thread_join;
+    io.core = plat::helper_core();
+    io.priority = 8;
+    portablekit::set_io_thread_platform(io);
+    plat::logf("io: the disc read-ahead worker will run on core %d at low priority (config.txt io_cache=0 reads the disc as before)", io.core);
 
     portablekit::set_pad_provider(&pad_read);
 

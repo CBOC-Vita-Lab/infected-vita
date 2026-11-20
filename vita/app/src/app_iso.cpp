@@ -5,6 +5,7 @@
 #include <exception>
 #include <filesystem>
 
+#include "app_boot_art.h"
 #include "app_config.h"
 #include "app_ui.h"
 #include "platform.h"
@@ -71,6 +72,7 @@ IsoCheck iso_check(const char* rel_path) {
         return r;
     }
     ui::boot_line("BOOT.BIN matches ULUS-10054 1.02 (sha256 %.16s...)", r.boot_sha256.c_str());
+    boot_art::refresh_from_disc(full);   // the right disc: its own PIC1/ICON0 behind the screen from here on
 
     if (cfg_bool("verify_iso", false)) {
         plat::File* f = plat::file_open(plat::Root::Data, rel_path, plat::FileMode::Read, 0);

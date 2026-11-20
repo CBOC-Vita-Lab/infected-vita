@@ -530,6 +530,8 @@ bool gl_init(const GlParams&) { logf("GL: not available in the desktop_headless 
 bool gl_is_ready() { return false; }
 void gl_swap() {}
 void gl_set_vsync(bool) {}
+void gl_pace_stats(PaceStats* out) { if (out) *out = PaceStats{}; }
+void gl_set_present_interval(int) {}
 void gl_shutdown() {}
 void* gl_get_proc(const char*) { return nullptr; }
 bool gl_shader_compiler_available() { return false; }

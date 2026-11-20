@@ -32,6 +32,8 @@ char g_msg_body[1200] = "";
 char g_msg_footer[160] = "";
 unsigned g_version = 1;         // bumped by every change of what the overlay shows (the GPU-composed overlay re-uploads on a new value)
 bool g_composite = true;
+std::vector<uint32_t> g_art;     // the disc's own picture behind the boot screen (960x544), empty without
+int g_art_w = 0, g_art_h = 0, g_art_text_top = 0;
 
 unsigned overlay_version() { return (g_msg_on || g_boot_visible || g_hud_on) ? g_version : 0; }
 
@@ -69,6 +71,27 @@ void fill(uint32_t* fb, int pitch, int fbw, int fbh, int x0, int y0, int w, int 
     }
 }
 
+// Blends one colour over a rectangle: alpha 0..255.
+void shade(uint32_t* fb, int pitch, int fbw, int fbh, int x0, int y0, int w, int h, uint32_t col, int alpha) {
+    const int cr = col & 255, cg = (col >> 8) & 255, cb = (col >> 16) & 255;
+    for (int y = y0 < 0 ? 0 : y0; y < y0 + h && y < fbh; y++) {
+        uint32_t* row = fb + (size_t)y * pitch;
+        for (int x = x0 < 0 ? 0 : x0; x < x0 + w && x < fbw; x++) {
+            const uint32_t p = row[x];
+            const int r = (cr * alpha + (int)(p & 255) * (255 - alpha)) / 255;
+            const int g = (cg * alpha + (int)((p >> 8) & 255) * (255 - alpha)) / 255;
+            const int b = (cb * alpha + (int)((p >> 16) & 255) * (255 - alpha)) / 255;
+            row[x] = 0xFF000000u | (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16);
+        }
+    }
+}
+
+bool art_fits(int w, int h) { return !g_art.empty() && g_art_w == w && g_art_h == h; }
+
+void art_blit(uint32_t* fb, int pitch, int w, int h) {
+    for (int y = 0; y < h; y++) memcpy(fb + (size_t)y * pitch, &g_art[(size_t)y * w], (size_t)w * 4);
+}
+
 // Colours are ABGR8888 words (A in the top byte).
 constexpr uint32_t kWhite = 0xFFFFFFFF, kGrey = 0xFFB0B0B0, kYellow = 0xFF40E0FF, kRed = 0xFF5050FF, kBg = 0xFF201414, kBar = 0xFF40C040;
 
@@ -77,7 +100,12 @@ void overlay(void* fbp, int w, int h, int pitch) {
     if (!g_mtx) return;
     plat::mutex_lock(g_mtx);
     if (g_msg_on) {
-        fill(fb, pitch, w, h, 0, 0, w, h, 0xFF101060);
+        if (art_fits(w, h)) {
+            art_blit(fb, pitch, w, h);
+            shade(fb, pitch, w, h, 0, 0, w, h, 0xFF101060, 215);   // the picture shows through, the screen is still red
+        } else {
+            fill(fb, pitch, w, h, 0, 0, w, h, 0xFF101060);
+        }
         text_draw(fb, pitch, w, h, 16, 16, g_msg_title, kWhite, 3);
         // wrap the body at 58 columns
         const char* p = g_msg_body;
@@ -100,6 +128,29 @@ void overlay(void* fbp, int w, int h, int pitch) {
             if (*p == '\n') p++;
         }
         text_draw(fb, pitch, w, h, 16, h - 36, g_msg_footer, kYellow, 2);
+    } else if (g_boot_visible && art_fits(w, h)) {
+        // On the disc's own picture: the title under the logo, the last lines on a dark panel, the bar at the bottom.
+        art_blit(fb, pitch, w, h);
+        const int top = g_art_text_top > 0 ? g_art_text_top + 8 : 12;
+        text_draw(fb, pitch, w, h, 16, top, g_title, kWhite, 3);
+        const int rows = (h - 64 - (top + 40)) / 16 > kLines ? kLines : (h - 64 - (top + 40)) / 16;
+        const int shown = g_count < rows ? g_count : rows;
+        shade(fb, pitch, w, h, 8, top + 36, w - 16, rows * 16 + 8, 0xFF000000, 150);
+        int y = top + 40;
+        for (int i = g_count - shown; i < g_count; i++) {
+            int idx = ((g_head - g_count + i) % kLines + kLines) % kLines;
+            text_draw(fb, pitch, w, h, 16, y, g_lines[idx], i == g_count - 1 ? kYellow : kGrey, 2);
+            y += 16;
+        }
+        if (g_progress >= 0.0f) {
+            const int bx = 16, bw = w - 32, bh = 20, by = h - 52;
+            shade(fb, pitch, w, h, bx - 8, by - 34, bw + 16, bh + 44, 0xFF000000, 150);
+            fill(fb, pitch, w, h, bx - 2, by - 2, bw + 4, bh + 4, kWhite);
+            fill(fb, pitch, w, h, bx, by, bw, bh, 0xFF302020);
+            float f = g_progress > 1.0f ? 1.0f : g_progress;
+            fill(fb, pitch, w, h, bx, by, (int)(bw * f), bh, kBar);
+            text_draw(fb, pitch, w, h, bx, by - 22, g_progress_label, kWhite, 2);
+        }
     } else if (g_boot_visible) {
         fill(fb, pitch, w, h, 0, 0, w, h, kBg);
         text_draw(fb, pitch, w, h, 16, 12, g_title, kWhite, 3);
@@ -177,10 +228,23 @@ void boot_progress(float fraction, const char* label) {
     plat::mutex_unlock(g_mtx);
 }
 
+void set_art(std::vector<uint32_t>&& pixels, int w, int h, int text_top) {
+    if (!g_mtx) g_mtx = plat::mutex_create("ui");
+    plat::mutex_lock(g_mtx);
+    g_art = std::move(pixels);
+    g_art_w = w;
+    g_art_h = h;
+    g_art_text_top = text_top;
+    g_version++;
+    plat::mutex_unlock(g_mtx);
+    if (plat::gl_is_ready()) present();
+}
+
 void boot_hide() {
     if (!g_mtx) return;
     plat::mutex_lock(g_mtx);
     g_boot_visible = false;
+    if (!g_msg_on) std::vector<uint32_t>().swap(g_art);   // the 2 MiB of heap come back for the game
     g_progress = -1.0f;
     g_version++;
     plat::mutex_unlock(g_mtx);

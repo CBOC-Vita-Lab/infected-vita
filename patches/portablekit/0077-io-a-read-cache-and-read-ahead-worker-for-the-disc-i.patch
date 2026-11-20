@@ -1,0 +1,1141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:26:53 -0500
+Subject: [PATCH 77/77] io: a read cache and read-ahead worker for the disc
+ image, reads straight into guest memory, UMD read-ahead hints honoured
+
+IsoReadCache (kernel/iso_read_cache.hpp): aligned 64 KiB blocks (about 8 MB, least recently used out first), a handle of its own on the
+file, and a worker thread that reads blocks ahead of a sequential reader (four slots of streams) and where the game's UMD read-ahead
+command (sceIoDevctl 0x01F300A5) says it will read. The bytes are the file's. Every read of the source goes through one local mutex (to
+be replaced by the shared stdio/open lock of builder-stab at the merge). A failed read is retried once after the source was opened
+again (IsoImage::reopen() / IsoReadCache::reopen() for a wake from sleep); a block that could not be read is never cached. Reads of
+1 MiB or more skip the cache. The worker starts through IoThreadPlatform (core and priority), std::thread by default.
+
+read_file_op reads a disc read into guest memory directly when the range is one piece of it (no vector, no second copy).
+
+<prefix>_IO_CACHE=0 reads as before; _IO_CACHE_MB (8), _IO_CACHE_AHEAD (4 blocks), _IO_CACHE_WORKER=0. iso_cache_stats() gives
+hits, misses, waits, prefetched, errors for the platform's status line.
+
+tests/iso_read_cache_tests.cpp: random and concurrent reads equal direct reads, the end of the image, a truncated source, a failing
+source with reopen and retry, hints, eviction, and IsoImage on a synthetic ISO 9660 file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |  12 ++
+ cmake/PortableKit.cmake        |   1 +
+ host/hle/hle_io.cpp            |  52 +++++-
+ host/kernel/iso_image.cpp      |  80 ++++++++-
+ host/kernel/iso_image.hpp      |  22 +++
+ host/kernel/iso_read_cache.cpp | 317 ++++++++++++++++++++++++++++++++
+ host/kernel/iso_read_cache.hpp | 137 ++++++++++++++
+ tests/iso_read_cache_tests.cpp | 319 +++++++++++++++++++++++++++++++++
+ 8 files changed, 932 insertions(+), 8 deletions(-)
+ create mode 100644 host/kernel/iso_read_cache.cpp
+ create mode 100644 host/kernel/iso_read_cache.hpp
+ create mode 100644 tests/iso_read_cache_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9a58572..7599d6e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -302,6 +302,18 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_rtc_tests COMMAND portablekit_rtc_tests)
+ endif()
+ 
++# The disc read cache and its read-ahead worker, against a synthetic ISO file.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_iso_cache_tests
++        "${PORTABLEKIT_ROOT}/tests/iso_read_cache_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/kernel/iso_read_cache.cpp"
++        "${PORTABLEKIT_ROOT}/host/kernel/iso_image.cpp")
++    target_include_directories(portablekit_iso_cache_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/include")
++    target_link_libraries(portablekit_iso_cache_tests PRIVATE psprecomp_core Threads::Threads)
++    set_target_properties(portablekit_iso_cache_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_iso_cache_tests COMMAND portablekit_iso_cache_tests)
++endif()
++
+ # PGD containers with dummy keys: no console key and no game data.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_pgd_tests
+diff --git a/cmake/PortableKit.cmake b/cmake/PortableKit.cmake
+index be2f0ac..fb3c3cf 100644
+--- a/cmake/PortableKit.cmake
++++ b/cmake/PortableKit.cmake
+@@ -67,6 +67,7 @@ set(PORTABLEKIT_RUNTIME_SOURCES
+     host/kernel/stall_watchdog.cpp
+     host/kernel/load_detector.cpp
+     host/kernel/iso_image.cpp
++    host/kernel/iso_read_cache.cpp
+     host/hle/hle_common.cpp
+     host/hle/hle_threadman.cpp
+     host/hle/hle_sysmem.cpp
+diff --git a/host/hle/hle_io.cpp b/host/hle/hle_io.cpp
+index cce9a46..b11cdf1 100644
+--- a/host/hle/hle_io.cpp
++++ b/host/hle/hle_io.cpp
+@@ -17,6 +17,7 @@
+ #include <cctype>
+ #include <charconv>
+ #include <cstdio>
++#include <cstdlib>
+ #include <ctime>
+ #include <fstream>
+ #include <iostream>
+@@ -412,13 +413,25 @@ std::uint32_t read_file_op(Runtime &rt, std::uint32_t fd, std::uint32_t address,
+     if (file.filter) return read_filtered(rt, fd, file, address, requested);
+     std::vector<std::uint8_t> buffer;
+     std::uint32_t result = 0u;
++    bool direct_read = false;
++    std::size_t disc_bytes = 0u;
+     if (file.kind == OpenFile::Kind::Disc) {
+         const std::uint64_t available = file.position < file.size ? file.size - file.position : 0u;
+         requested = static_cast<std::uint32_t>(std::min<std::uint64_t>(requested, available));
+         const std::uint64_t unit = file.sector_units ? IsoImage::kSectorSize : 1u;
+-        buffer.resize(static_cast<std::size_t>(requested) * unit);
+-        const std::size_t count = io().disc->read(file.disc_offset + file.position * unit, buffer);
+-        buffer.resize(count);
++        const std::size_t wanted = static_cast<std::size_t>(requested) * unit;
++        // Straight into guest memory when the range is one piece of it: no vector and no second copy.
++        std::uint8_t *direct = wanted != 0u ? rt.memory().raw_pointer(address, wanted) : nullptr;
++        std::size_t count;
++        if (direct != nullptr) {
++            count = io().disc->read(file.disc_offset + file.position * unit, {direct, wanted});
++            direct_read = true;
++        } else {
++            buffer.resize(wanted);
++            count = io().disc->read(file.disc_offset + file.position * unit, buffer);
++            buffer.resize(count);
++        }
++        disc_bytes = count;
+         // A raw read answers in sectors, and a partial sector is not one.
+         result = static_cast<std::uint32_t>(count / unit);
+     } else {
+@@ -429,10 +442,11 @@ std::uint32_t read_file_op(Runtime &rt, std::uint32_t fd, std::uint32_t address,
+         buffer.resize(static_cast<std::size_t>(file.host->gcount()));
+         result = static_cast<std::uint32_t>(buffer.size());
+     }
+-    rt.memory().copy_in(address, buffer);
++    if (!direct_read) rt.memory().copy_in(address, buffer);
++    const std::size_t got_bytes = direct_read ? disc_bytes : buffer.size();
+     // A disc read is what tells a load from play (kernel/fast_loading.hpp).
+     if (file.kind == OpenFile::Kind::Disc) {
+-        load_trace::note_disc_read(buffer.size());
++        load_trace::note_disc_read(got_bytes);
+         fast_loading::note_disc_read();
+     } else {
+         load_trace::note_memory_stick_read(buffer.size());
+@@ -441,7 +455,7 @@ std::uint32_t read_file_op(Runtime &rt, std::uint32_t fd, std::uint32_t address,
+         std::cerr << "[io] read fd=" << fd << " " << file.path
+                   << (file.sector_units ? " sector=" : " offset=") << file.position << " got=" << result
+                   << (file.sector_units ? " sectors" : " bytes") << " -> " << psprecomp::hex32(address) << "\n";
+-    file.position += file.kind == OpenFile::Kind::Disc && file.sector_units ? result : buffer.size();
++    file.position += file.kind == OpenFile::Kind::Disc && file.sector_units ? result : got_bytes;
+     return result;
+ }
+ 
+@@ -743,7 +757,27 @@ void register_async_io(HleRegistrar &hle) {
+ } // namespace
+ 
+ void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick) {
+-    if (!disc_image.empty()) io().disc = std::make_unique<IsoImage>(disc_image);
++    if (!disc_image.empty()) {
++        io().disc = std::make_unique<IsoImage>(disc_image);
++        // <prefix>_IO_CACHE=0 reads the image as before (one unbuffered read on the game thread); _IO_CACHE_MB sizes the cache,
++        // _IO_CACHE_AHEAD is how many 64 KiB blocks a sequential reader is read ahead of, _IO_CACHE_WORKER=0 has no read-ahead thread.
++        const auto number = [](const char *name, long fallback) {
++            const char *text = portablekit::env(name);
++            if (text == nullptr || *text == '\0') return fallback;
++            char *end = nullptr;
++            const long value = std::strtol(text, &end, 0);
++            return end == text ? fallback : value;
++        };
++        if (number("IO_CACHE", 1) != 0) {
++            IsoReadCache::Config config;
++            config.capacity_bytes = static_cast<std::size_t>(std::clamp(number("IO_CACHE_MB", 8), 1l, 64l)) * 1024u * 1024u;
++            config.ahead_blocks = static_cast<unsigned>(std::clamp(number("IO_CACHE_AHEAD", 4), 0l, 32l));
++            config.worker = number("IO_CACHE_WORKER", 1) != 0;
++            io().disc->enable_cache(config);
++        } else {
++            std::cout << "Disc: read cache off (io_cache=0)\n";
++        }
++    }
+     io().memory_stick = memory_stick;
+ 
+     hle.add("IoFileMgrForUser", "sceIoOpen", [](Runtime &rt, AllegrexContext &ctx) {
+@@ -985,6 +1019,10 @@ void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, con
+                 request.sectors = memory.load32(input + 12u);
+                 const std::uint32_t id = io().next_read_ahead++;
+                 io().read_ahead.emplace(id, request);
++                // The game says it will read these sectors soon: the cache's worker reads them now.
++                if (io().disc != nullptr)
++                    io().disc->prefetch(static_cast<std::uint64_t>(request.lba) * IsoImage::kSectorSize,
++                                        static_cast<std::uint64_t>(request.sectors) * IsoImage::kSectorSize);
+                 memory.store32(output, id);
+                 if (trace_io())
+                     std::cerr << "[io] " << device << " read ahead " << request.sectors
+diff --git a/host/kernel/iso_image.cpp b/host/kernel/iso_image.cpp
+index 50c43d5..5ab2550 100644
+--- a/host/kernel/iso_image.cpp
++++ b/host/kernel/iso_image.cpp
+@@ -4,7 +4,9 @@
+ #include "psprecomp/common.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
++#include <iostream>
+ 
+ namespace portablekit {
+ namespace {
+@@ -16,7 +18,77 @@ std::uint32_t read_le32(const std::vector<std::uint8_t> &data, std::size_t offse
+ 
+ } // namespace
+ 
+-IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::binary) {
++namespace {
++std::atomic<const IsoReadCache *> g_cache{nullptr};
++
++// The cache's own handle on the image file.
++class FileSource final : public BlockSource {
++public:
++    explicit FileSource(std::filesystem::path path) : path_(std::move(path)), file_(path_, std::ios::binary) {}
++    Result read(std::uint64_t offset, std::uint8_t *destination, std::size_t length) override {
++        Result result;
++        if (!file_.is_open()) {
++            result.error = true;
++            return result;
++        }
++        file_.clear();
++        file_.seekg(static_cast<std::streamoff>(offset));
++        file_.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(length));
++        result.count = static_cast<std::size_t>(file_.gcount());
++        // Fewer bytes with the end of the file reached is a short file; fewer without it is a failure of the device.
++        result.error = result.count < length && !file_.eof();
++        return result;
++    }
++    bool reopen() override {
++        file_.close();
++        file_.clear();
++        file_.open(path_, std::ios::binary);
++        return file_.is_open();
++    }
++
++private:
++    std::filesystem::path path_;
++    std::ifstream file_;
++};
++} // namespace
++
++bool iso_cache_stats(IsoCacheStats &out) {
++    const IsoReadCache *cache = g_cache.load(std::memory_order_acquire);
++    if (cache == nullptr) return false;
++    out = cache->stats();
++    return true;
++}
++
++void IsoImage::enable_cache(const IsoReadCache::Config &config) {
++    if (cache_ != nullptr) return;
++    cache_ = std::make_unique<IsoReadCache>(std::make_unique<FileSource>(path_), size_bytes_, config);
++    g_cache.store(cache_.get(), std::memory_order_release);
++    std::cout << "Disc: read cache on, " << config.capacity_bytes / (1024u * 1024u) << " MiB in blocks of "
++              << config.block_bytes / 1024u << " KiB, read-ahead " << config.ahead_blocks << " blocks, "
++              << (cache_->worker_running() ? "worker thread running" : "no worker thread") << "\n";
++}
++
++void IsoImage::prefetch(std::uint64_t offset, std::uint64_t length) {
++    if (cache_ != nullptr) cache_->hint(offset, length);
++}
++
++bool IsoImage::reopen() {
++    bool ok;
++    if (cache_ != nullptr) ok = cache_->reopen();
++    else ok = true;
++    file_.close();
++    file_.clear();
++    file_.open(path_, std::ios::binary);
++    return ok && file_.is_open();
++}
++
++bool IsoImage::cache_stats(IsoCacheStats &out) const {
++    if (cache_ == nullptr) return false;
++    out = cache_->stats();
++    return true;
++}
++
++IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
+     if (!file_) throw psprecomp::Error("Cannot open disc image: " + path.string());
+     size_bytes_ = std::filesystem::file_size(path);
+     std::vector<std::uint8_t> primary(kSectorSize);
+@@ -29,6 +101,11 @@ IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::bi
+     scan_directory(root_lba, root_size, "", 0);
+ }
+ 
++IsoImage::~IsoImage() {
++    const IsoReadCache *mine = cache_.get();
++    g_cache.compare_exchange_strong(mine, nullptr);
++}
++
+ std::string IsoImage::normalize(std::string path) {
+     std::replace(path.begin(), path.end(), '\\', '/');
+     std::string result;
+@@ -76,6 +153,7 @@ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output)
+     if (offset >= size_bytes_) return 0u;
+     const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
+     const phase::Scope timer(phase::IsoRead);
++    if (cache_ != nullptr) return cache_->read(offset, output.first(count));
+     file_.clear();
+     file_.seekg(static_cast<std::streamoff>(offset));
+     file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));
+diff --git a/host/kernel/iso_image.hpp b/host/kernel/iso_image.hpp
+index e52d6a9..7c55e6f 100644
+--- a/host/kernel/iso_image.hpp
++++ b/host/kernel/iso_image.hpp
+@@ -4,11 +4,14 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <span>
+ #include <string>
+ #include <vector>
+ 
++#include "kernel/iso_read_cache.hpp"
++
+ namespace portablekit {
+ 
+ // Read-only ISO9660 view of a PSP UMD image. Paths are case-insensitive and
+@@ -28,6 +31,7 @@ public:
+     };
+ 
+     explicit IsoImage(const std::filesystem::path &path);
++    ~IsoImage();
+ 
+     [[nodiscard]] std::optional<Entry> find(std::string path) const;
+     [[nodiscard]] std::uint64_t size_bytes() const noexcept { return size_bytes_; }
+@@ -35,13 +39,31 @@ public:
+     std::size_t read(std::uint64_t offset, std::span<std::uint8_t> output);
+     [[nodiscard]] std::vector<std::string> list(std::string directory) const;
+ 
++    // The read cache and its read-ahead worker (kernel/iso_read_cache.hpp): reads then come from aligned blocks kept in memory,
++    // from a handle of its own, and a sequential reader or a read-ahead hint of the game has the next blocks read by a helper
++    // thread. The bytes are the file's. Call once, after the image was opened.
++    void enable_cache(const IsoReadCache::Config &config);
++    // Queues the sectors the game said it will read (sceIoDevctl UMD read-ahead); does nothing without the cache.
++    void prefetch(std::uint64_t offset, std::uint64_t length);
++    // Opens the file again, e.g. after the console woke from sleep; the cached blocks stay valid. True when it can be read.
++    bool reopen();
++    [[nodiscard]] bool cache_enabled() const noexcept { return cache_ != nullptr; }
++    [[nodiscard]] bool cache_stats(IsoCacheStats &out) const;
++
+ private:
+     void scan_directory(std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth);
+     [[nodiscard]] static std::string normalize(std::string path);
+ 
++    std::filesystem::path path_;
+     std::ifstream file_;
++    std::unique_ptr<IsoReadCache> cache_;
+     std::uint64_t size_bytes_{};
+     std::map<std::string, Entry> entries_;
+ };
+ 
+ } // namespace portablekit
++
++namespace portablekit {
++// The statistics of the cache of the disc image in use (false when there is none), for the platform's status line.
++bool iso_cache_stats(IsoCacheStats &out);
++}
+diff --git a/host/kernel/iso_read_cache.cpp b/host/kernel/iso_read_cache.cpp
+new file mode 100644
+index 0000000..2fe7bc1
+--- /dev/null
++++ b/host/kernel/iso_read_cache.cpp
+@@ -0,0 +1,317 @@
++#include "iso_read_cache.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <thread>
++
++namespace portablekit {
++namespace {
++
++IoThreadPlatform g_platform{};
++
++struct StdThread {
++    std::thread thread;
++};
++
++void *default_start(void (*fn)(void *), void *arg, const char *, int, int, std::size_t) {
++    auto *t = new StdThread;
++    t->thread = std::thread([fn, arg] { fn(arg); });
++    return t;
++}
++
++void default_join(void *handle) {
++    auto *t = static_cast<StdThread *>(handle);
++    if (t->thread.joinable()) t->thread.join();
++    delete t;
++}
++
++std::uint64_t now_us() {
++    return static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++} // namespace
++
++void set_io_thread_platform(const IoThreadPlatform &platform) { g_platform = platform; }
++IoThreadPlatform io_thread_platform() { return g_platform; }
++
++IsoReadCache::IsoReadCache(std::unique_ptr<BlockSource> source, std::uint64_t size_bytes, const Config &config)
++    : source_(std::move(source)), config_(config), size_bytes_(size_bytes) {
++    capacity_blocks_ = std::max<std::size_t>(8u, config_.capacity_bytes / std::max<std::size_t>(config_.block_bytes, 1u));
++    if (!config_.worker) return;
++    platform_ = g_platform;
++    if (platform_.thread_start == nullptr || platform_.thread_join == nullptr) {
++        platform_.thread_start = &default_start;
++        platform_.thread_join = &default_join;
++    }
++    thread_ = platform_.thread_start(&IsoReadCache::worker_main, this, "iso-readahead", platform_.core, platform_.priority, 128u * 1024u);
++}
++
++IsoReadCache::~IsoReadCache() {
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        stop_ = true;
++    }
++    work_.notify_all();
++    changed_.notify_all();
++    if (thread_ != nullptr) platform_.thread_join(thread_);
++}
++
++void IsoReadCache::worker_main(void *self) { static_cast<IsoReadCache *>(self)->worker_loop(); }
++
++std::shared_ptr<const IsoReadCache::Block> IsoReadCache::load_block(std::uint64_t index, bool &failed) {
++    failed = false;
++    const std::uint64_t start = index * config_.block_bytes;
++    const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(config_.block_bytes, size_bytes_ - start));
++    auto block = std::make_shared<Block>();
++    block->data.resize(want);
++    std::lock_guard<std::mutex> source_lock(source_mutex_);
++    BlockSource::Result result = source_->read(start, block->data.data(), want);
++    if (result.error) {
++        // One more try after the source was opened again (the console may have slept or the card been re-seated).
++        bool reopened = source_->reopen();
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            ++stats_.reopens;
++        }
++        if (reopened) result = source_->read(start, block->data.data(), want);
++        if (!reopened || result.error) {
++            failed = true;
++            return nullptr;
++        }
++    }
++    block->data.resize(result.count);
++    return block;
++}
++
++void IsoReadCache::evict_locked() {
++    while (lru_.size() > capacity_blocks_) {
++        const std::uint64_t victim = lru_.back();
++        lru_.pop_back();
++        table_.erase(victim);
++    }
++}
++
++void IsoReadCache::publish_locked(std::uint64_t index, Entry &entry, std::shared_ptr<const Block> block) {
++    (void)index;
++    entry.block = std::move(block);
++    entry.state = State::Ready;
++    lru_.push_front(index);
++    entry.lru = lru_.begin();
++    evict_locked();
++}
++
++std::shared_ptr<const IsoReadCache::Block> IsoReadCache::acquire(std::uint64_t index) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    bool counted_wait = false;
++    for (;;) {
++        auto it = table_.find(index);
++        if (it != table_.end() && it->second.state == State::Ready) {
++            lru_.splice(lru_.begin(), lru_, it->second.lru);
++            if (!counted_wait) ++stats_.hits;
++            return it->second.block;
++        }
++        if (it != table_.end() && it->second.state == State::Loading) {
++            if (!counted_wait) {
++                ++stats_.waits;
++                counted_wait = true;
++            }
++            const std::uint64_t t0 = now_us();
++            changed_.wait(lock);
++            stats_.wait_us += now_us() - t0;
++            if (stop_ && table_.find(index) == table_.end()) break;
++            continue;
++        }
++        // Not there, or queued but not started: read it here and now.
++        if (it == table_.end()) it = table_.emplace(index, Entry{}).first;
++        it->second.state = State::Loading;
++        ++stats_.misses;
++        const std::uint64_t t0 = now_us();
++        lock.unlock();
++        bool failed = false;
++        std::shared_ptr<const Block> block = load_block(index, failed);
++        lock.lock();
++        stats_.wait_us += now_us() - t0;
++        it = table_.find(index);
++        if (it != table_.end()) {
++            if (failed) {
++                table_.erase(it);
++                ++stats_.errors;
++            } else {
++                publish_locked(index, it->second, block);
++            }
++        }
++        changed_.notify_all();
++        return failed ? nullptr : block;
++    }
++    return nullptr;
++}
++
++std::size_t IsoReadCache::read_direct(std::uint64_t offset, std::span<std::uint8_t> output) {
++    std::lock_guard<std::mutex> source_lock(source_mutex_);
++    BlockSource::Result result = source_->read(offset, output.data(), output.size());
++    if (result.error) {
++        const bool reopened = source_->reopen();
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            ++stats_.reopens;
++        }
++        if (reopened) result = source_->read(offset, output.data(), output.size());
++        if (!reopened || result.error) {
++            std::lock_guard<std::mutex> lock(mutex_);
++            ++stats_.errors;
++            return 0u;
++        }
++    }
++    return result.count;
++}
++
++void IsoReadCache::queue_range_locked(std::uint64_t first, std::uint64_t last) {
++    if (thread_ == nullptr) return;
++    bool added = false;
++    for (std::uint64_t b = first; b <= last; ++b) {
++        if (b * config_.block_bytes >= size_bytes_) break;
++        if (queue_.size() >= 64u || table_.size() >= capacity_blocks_ + 16u) break;
++        if (table_.count(b) != 0u) continue;
++        table_.emplace(b, Entry{});  // state Queued
++        queue_.push_back(b);
++        added = true;
++    }
++    if (added) work_.notify_one();
++}
++
++void IsoReadCache::note_stream(std::uint64_t offset, std::uint64_t length) {
++    if (thread_ == nullptr || length == 0u) return;
++    const std::uint64_t block = config_.block_bytes;
++    const std::uint64_t end = offset + length;
++    std::lock_guard<std::mutex> lock(mutex_);
++    Stream *match = nullptr;
++    Stream *oldest = &streams_[0];
++    for (Stream &s : streams_) {
++        if (s.used < oldest->used) oldest = &s;
++        if (s.used != 0u && offset + block >= s.next && offset <= s.next + block) {
++            match = &s;
++            break;
++        }
++    }
++    if (match == nullptr) {
++        match = oldest;
++        *match = Stream{};
++    } else {
++        ++match->streak;
++    }
++    match->next = end;
++    match->used = ++tick_;
++    if (match->streak < 1u) return;  // the first read of a new stream may be a single seek
++    const std::uint64_t first = (end + block - 1u) / block;
++    const std::uint64_t last = first + config_.ahead_blocks - 1u;
++    if (last + 1u > match->ahead_to / block || match->ahead_to < end) {
++        queue_range_locked(first, last);
++        match->ahead_to = (last + 1u) * block;
++    }
++}
++
++std::size_t IsoReadCache::read(std::uint64_t offset, std::span<std::uint8_t> output) {
++    if (offset >= size_bytes_ || output.empty()) return 0u;
++    const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
++    std::size_t written = 0u;
++    if (count >= config_.bypass_bytes) {
++        written = read_direct(offset, output.first(count));
++        std::lock_guard<std::mutex> lock(mutex_);
++        ++stats_.bypassed;
++        stats_.bytes += written;
++        return written;
++    }
++    const std::uint64_t block = config_.block_bytes;
++    std::uint64_t position = offset;
++    const std::uint64_t end = offset + count;
++    while (position < end) {
++        const std::uint64_t index = position / block;
++        std::shared_ptr<const Block> data = acquire(index);
++        if (!data) break;
++        const std::uint64_t block_start = index * block;
++        const std::size_t within = static_cast<std::size_t>(position - block_start);
++        if (within >= data->data.size()) break;
++        const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(end - position, block - within));
++        const std::size_t have = std::min(want, data->data.size() - within);
++        std::memcpy(output.data() + written, data->data.data() + within, have);
++        written += have;
++        position += have;
++        if (have < want) break;  // the source holds less than the image said: a short read, as the file would give
++    }
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        stats_.bytes += written;
++    }
++    note_stream(offset, count);
++    return written;
++}
++
++void IsoReadCache::hint(std::uint64_t offset, std::uint64_t length) {
++    if (thread_ == nullptr || length == 0u || offset >= size_bytes_) return;
++    const std::uint64_t block = config_.block_bytes;
++    std::uint64_t last = (offset + length - 1u) / block;
++    const std::uint64_t first = offset / block;
++    last = std::min<std::uint64_t>(last, first + config_.hint_blocks_max - 1u);
++    std::lock_guard<std::mutex> lock(mutex_);
++    queue_range_locked(first, last);
++}
++
++bool IsoReadCache::reopen() {
++    std::lock_guard<std::mutex> source_lock(source_mutex_);
++    const bool ok = source_->reopen();
++    std::lock_guard<std::mutex> lock(mutex_);
++    ++stats_.reopens;
++    return ok;
++}
++
++IsoCacheStats IsoReadCache::stats() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return stats_;
++}
++
++std::size_t IsoReadCache::cached_blocks() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return lru_.size();
++}
++
++void IsoReadCache::drain() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    while (!stop_ && (!queue_.empty() || busy_ != 0u)) changed_.wait_for(lock, std::chrono::milliseconds(5));
++}
++
++void IsoReadCache::worker_loop() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    for (;;) {
++        work_.wait(lock, [this] { return stop_ || !queue_.empty(); });
++        if (stop_) return;
++        const std::uint64_t index = queue_.front();
++        queue_.pop_front();
++        auto it = table_.find(index);
++        if (it == table_.end() || it->second.state != State::Queued) {
++            changed_.notify_all();
++            continue;
++        }
++        it->second.state = State::Loading;
++        ++busy_;
++        lock.unlock();
++        bool failed = false;
++        std::shared_ptr<const Block> block = load_block(index, failed);
++        lock.lock();
++        --busy_;
++        it = table_.find(index);
++        if (it != table_.end()) {
++            if (failed) {
++                table_.erase(it);  // a reader will try again itself and report the error if it persists
++                ++stats_.errors;
++            } else {
++                publish_locked(index, it->second, block);
++                ++stats_.prefetched;
++            }
++        }
++        changed_.notify_all();
++    }
++}
++
++} // namespace portablekit
+diff --git a/host/kernel/iso_read_cache.hpp b/host/kernel/iso_read_cache.hpp
+new file mode 100644
+index 0000000..36e70e9
+--- /dev/null
++++ b/host/kernel/iso_read_cache.hpp
+@@ -0,0 +1,137 @@
++#pragma once
++
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <list>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <deque>
++#include <span>
++#include <vector>
++
++namespace portablekit {
++
++// Where the cache gets its bytes. One implementation reads a host file; the tests use a memory image that can fail on demand.
++// The cache calls a source from one thread at a time (it holds its own source mutex), so an implementation needs no locking.
++class BlockSource {
++public:
++    struct Result {
++        std::size_t count{};  // bytes delivered, which may be fewer than asked for
++        bool error{};         // the read failed (card removed, device asleep): a short count without an error is the end of the data
++    };
++    virtual ~BlockSource() = default;
++    virtual Result read(std::uint64_t offset, std::uint8_t *destination, std::size_t length) = 0;
++    // Opens the source again after an error or after the console slept. True when it can be read from now on.
++    virtual bool reopen() = 0;
++};
++
++// Starts and stops the read-ahead thread. The default is std::thread; the Vita build installs one that can name the core and the
++// priority (set_io_thread_platform), so that the worker runs on the system's core 3 when the application may use it.
++struct IoThreadPlatform {
++    void *(*thread_start)(void (*fn)(void *), void *arg, const char *name, int core, int priority, std::size_t stack_bytes) = nullptr;
++    void (*thread_join)(void *thread) = nullptr;
++    int core = -1;      // where the worker should run: -1 any, otherwise the platform's core number
++    int priority = 0;   // relative: positive is less urgent than the game thread
++};
++void set_io_thread_platform(const IoThreadPlatform &platform);
++[[nodiscard]] IoThreadPlatform io_thread_platform();
++
++struct IsoCacheStats {
++    std::uint64_t hits{};        // blocks a read found in the cache
++    std::uint64_t misses{};      // blocks a read had to read from the source itself
++    std::uint64_t waits{};       // blocks a read found being read by the worker and waited for
++    std::uint64_t prefetched{};  // blocks the worker read ahead
++    std::uint64_t bypassed{};    // large reads that skipped the cache
++    std::uint64_t errors{};      // reads that failed even after the source was opened again
++    std::uint64_t reopens{};     // times the source was opened again after an error
++    std::uint64_t bytes{};       // bytes handed to callers
++    std::uint64_t wait_us{};     // time callers spent waiting for the worker or reading a block
++};
++
++// A read cache in front of a read-only disc image: aligned blocks, least recently used out first, and a worker that reads blocks
++// ahead of a sequential reader or where the game said it will read. The data returned is always exactly what the source holds.
++class IsoReadCache {
++public:
++    struct Config {
++        std::size_t block_bytes = 64u * 1024u;       // a power of two
++        std::size_t capacity_bytes = 8u * 1024u * 1024u;
++        unsigned ahead_blocks = 4u;                  // how far a sequential reader is read ahead of
++        unsigned hint_blocks_max = 32u;              // the most one read-ahead hint of the game queues
++        std::size_t bypass_bytes = 1024u * 1024u;    // a read this large goes straight to the source
++        bool worker = true;                          // false: no thread and no read-ahead
++    };
++
++    IsoReadCache(std::unique_ptr<BlockSource> source, std::uint64_t size_bytes, const Config &config);
++    ~IsoReadCache();
++    IsoReadCache(const IsoReadCache &) = delete;
++    IsoReadCache &operator=(const IsoReadCache &) = delete;
++
++    // Reads up to output.size() bytes at an absolute offset; fewer only at the end of the data or when the source fails twice.
++    // Safe to call from any thread.
++    std::size_t read(std::uint64_t offset, std::span<std::uint8_t> output);
++    // The game said it will read this range soon (the UMD read-ahead command): queue it for the worker.
++    void hint(std::uint64_t offset, std::uint64_t length);
++    // Opens the source again (after the console woke from sleep). The cached blocks stay: the image does not change.
++    bool reopen();
++    [[nodiscard]] IsoCacheStats stats() const;
++    [[nodiscard]] bool worker_running() const noexcept { return thread_ != nullptr; }
++    [[nodiscard]] const Config &config() const noexcept { return config_; }
++    [[nodiscard]] std::size_t cached_blocks() const;
++    // Blocks until the worker has nothing queued or loading (tests, shutdown).
++    void drain();
++
++private:
++    enum class State { Queued, Loading, Ready };
++    struct Block {
++        std::vector<std::uint8_t> data;  // what the source delivered: less than a block at the end of the image
++    };
++    struct Entry {
++        State state{State::Queued};
++        std::shared_ptr<const Block> block;
++        std::list<std::uint64_t>::iterator lru;
++    };
++    struct Stream {
++        std::uint64_t next{};      // where this reader would read next
++        std::uint64_t ahead_to{};  // the end of what has been queued for it
++        unsigned streak{};
++        std::uint64_t used{};
++    };
++
++    // Loads one block from the source: one retry after the source was opened again. Null when it could not be read.
++    std::shared_ptr<const Block> load_block(std::uint64_t block_index, bool &failed);
++    std::shared_ptr<const Block> acquire(std::uint64_t block_index);
++    std::size_t read_direct(std::uint64_t offset, std::span<std::uint8_t> output);
++    void note_stream(std::uint64_t offset, std::uint64_t length);
++    void queue_range_locked(std::uint64_t first_block, std::uint64_t last_block);
++    void evict_locked();
++    void publish_locked(std::uint64_t block_index, Entry &entry, std::shared_ptr<const Block> block);
++    static void worker_main(void *self);
++    void worker_loop();
++
++    // The one mutex every read of the source goes through. ifstream is not thread safe, and the stdio layer under it is not
++    // either on the Vita. NOTE for the merge with builder-stab: replace this by the shared stdio/open lock that branch adds.
++    std::mutex source_mutex_;
++    std::unique_ptr<BlockSource> source_;
++
++    mutable std::mutex mutex_;                // the table, the LRU list, the queue and the statistics
++    std::condition_variable changed_;         // a block became Ready or was dropped
++    std::condition_variable work_;            // the worker has something to do
++    std::map<std::uint64_t, Entry> table_;
++    std::list<std::uint64_t> lru_;            // Ready blocks, most recently used first
++    std::deque<std::uint64_t> queue_;
++    Stream streams_[4];
++    std::uint64_t tick_{0};
++    unsigned busy_{0};                        // blocks the worker is reading
++    bool stop_{false};
++    IsoCacheStats stats_;
++
++    const Config config_;
++    const std::uint64_t size_bytes_;
++    std::size_t capacity_blocks_{};
++    void *thread_{nullptr};
++    IoThreadPlatform platform_;
++};
++
++} // namespace portablekit
+diff --git a/tests/iso_read_cache_tests.cpp b/tests/iso_read_cache_tests.cpp
+new file mode 100644
+index 0000000..cee3f39
+--- /dev/null
++++ b/tests/iso_read_cache_tests.cpp
+@@ -0,0 +1,319 @@
++// The disc read cache and its read-ahead worker: byte-identical data against direct reads (random and concurrent), the end of
++// the image, a source that fails and is opened again, hints, eviction, and the cache under IsoImage on a synthetic ISO file.
++// No game and no disc: the images here are made from a counter.
++
++#include "kernel/iso_image.hpp"
++#include "kernel/iso_read_cache.hpp"
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <thread>
++#include <vector>
++
++using namespace portablekit;
++
++namespace {
++
++int g_failures = 0;
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++std::vector<std::uint8_t> make_image(std::size_t size, std::uint32_t seed) {
++    std::vector<std::uint8_t> data(size);
++    std::mt19937 rng(seed);
++    for (auto &b : data) b = static_cast<std::uint8_t>(rng());
++    return data;
++}
++
++// A memory image as a source. Faults: `fail_reads` reads fail (error), `reopen_ok` says whether reopening works,
++// `truncate_to` makes the source deliver less than the image size (a short file without an error).
++struct MemSource final : BlockSource {
++    struct Shared {
++        std::vector<std::uint8_t> data;
++        std::atomic<int> fail_reads{0};
++        std::atomic<bool> reopen_ok{true};
++        std::atomic<std::uint64_t> reads{0};
++        std::atomic<std::uint64_t> reopens{0};
++        std::atomic<int> delay_us{0};
++        std::size_t truncate_to{~static_cast<std::size_t>(0)};
++    };
++    std::shared_ptr<Shared> s;
++    explicit MemSource(std::shared_ptr<Shared> shared) : s(std::move(shared)) {}
++    Result read(std::uint64_t offset, std::uint8_t *dst, std::size_t length) override {
++        ++s->reads;
++        if (s->delay_us.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(s->delay_us.load()));
++        Result r;
++        if (s->fail_reads.load() > 0) {
++            --s->fail_reads;
++            r.error = true;
++            return r;
++        }
++        const std::size_t limit = std::min(s->data.size(), s->truncate_to);
++        if (offset < limit) r.count = std::min<std::size_t>(length, limit - static_cast<std::size_t>(offset));
++        if (r.count != 0u) std::memcpy(dst, s->data.data() + offset, r.count);
++        return r;
++    }
++    bool reopen() override {
++        ++s->reopens;
++        return s->reopen_ok.load();
++    }
++};
++
++std::shared_ptr<MemSource::Shared> shared_image(std::size_t size, std::uint32_t seed = 1u) {
++    auto s = std::make_shared<MemSource::Shared>();
++    s->data = make_image(size, seed);
++    return s;
++}
++
++IsoReadCache::Config small_config(bool worker) {
++    IsoReadCache::Config c;
++    c.block_bytes = 4096u;
++    c.capacity_bytes = 64u * 4096u;
++    c.ahead_blocks = 4u;
++    c.bypass_bytes = 256u * 1024u;
++    c.worker = worker;
++    return c;
++}
++
++bool same(const std::vector<std::uint8_t> &image, std::uint64_t offset, const std::vector<std::uint8_t> &got, std::size_t n) {
++    return offset + n <= image.size() && std::memcmp(image.data() + offset, got.data(), n) == 0;
++}
++
++void random_reads(bool worker) {
++    auto shared = shared_image(1000003u);   // not a multiple of the block size
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(worker));
++    std::mt19937_64 rng(7);
++    bool ok = true;
++    for (int i = 0; i < 4000 && ok; ++i) {
++        const std::uint64_t off = rng() % shared->data.size();
++        const std::size_t len = static_cast<std::size_t>(rng() % (i % 50 == 0 ? 400000u : 20000u));
++        std::vector<std::uint8_t> got(len);
++        const std::size_t n = cache.read(off, got);
++        const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(len, shared->data.size() - off));
++        ok = n == want && same(shared->data, off, got, n);
++    }
++    check(ok, worker ? "random reads equal direct reads (read-ahead on)" : "random reads equal direct reads (no worker)");
++    check(cache.stats().hits + cache.stats().misses > 0u && cache.cached_blocks() <= 64u, "the cache stays within its capacity");
++}
++
++void concurrent_reads() {
++    auto shared = shared_image(2u * 1024u * 1024u + 77u, 3u);
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(true));
++    std::atomic<int> bad{0};
++    std::vector<std::thread> threads;
++    for (int t = 0; t < 6; ++t) {
++        threads.emplace_back([&, t] {
++            std::mt19937_64 rng(100u + static_cast<unsigned>(t));
++            std::uint64_t seq = static_cast<std::uint64_t>(t) * 300000u;
++            for (int i = 0; i < 1500; ++i) {
++                std::uint64_t off;
++                std::size_t len = 1u + static_cast<std::size_t>(rng() % 9000u);
++                if (t % 2 == 0) {  // a sequential stream, which the worker reads ahead of
++                    off = seq;
++                    seq += len;
++                    if (seq >= shared->data.size()) seq = 0u;
++                } else {
++                    off = rng() % shared->data.size();
++                }
++                if (i % 97 == 0) cache.hint(rng() % shared->data.size(), 100000u);
++                std::vector<std::uint8_t> got(len);
++                const std::size_t n = cache.read(off, got);
++                const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(len, shared->data.size() - off));
++                if (n != want || !same(shared->data, off, got, n)) ++bad;
++            }
++        });
++    }
++    for (auto &th : threads) th.join();
++    check(bad.load() == 0, "six threads reading at once (sequential and random, with hints) get the file's bytes");
++    check(cache.stats().prefetched > 0u, "the worker read blocks ahead");
++}
++
++void end_and_short_reads() {
++    auto shared = shared_image(10000u);
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(true));
++    std::vector<std::uint8_t> got(5000);
++    check(cache.read(8000u, got) == 2000u && same(shared->data, 8000u, got, 2000u), "a read across the end gets what is left");
++    check(cache.read(10000u, got) == 0u && cache.read(99999u, got) == 0u, "a read at or past the end gets nothing");
++    check(cache.read(0u, std::span<std::uint8_t>{}) == 0u, "an empty read is empty");
++    std::vector<std::uint8_t> one(1);
++    check(cache.read(9999u, one) == 1u && one[0] == shared->data[9999], "the last byte is readable");
++
++    // The source holds less than the image said (a truncated copy on the card): the read is short, with no error.
++    auto cut = shared_image(20000u, 5u);
++    cut->truncate_to = 9000u;
++    IsoReadCache truncated(std::make_unique<MemSource>(cut), cut->data.size(), small_config(false));
++    std::vector<std::uint8_t> big(20000);
++    check(truncated.read(0u, big) == 9000u && same(cut->data, 0u, big, 9000u) && truncated.stats().errors == 0u,
++          "a truncated source gives a short read, not an error");
++}
++
++void error_and_reopen() {
++    auto shared = shared_image(300000u, 9u);
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(false));
++    std::vector<std::uint8_t> got(10000);
++    shared->fail_reads = 1;
++    check(cache.read(5000u, got) == 10000u && same(shared->data, 5000u, got, 10000u), "a failed read is retried after the source is opened again");
++    check(cache.stats().reopens >= 1u && cache.stats().errors == 0u && shared->reopens.load() >= 1u, "the retry is counted as a reopen, not an error");
++
++    shared->fail_reads = 1000;
++    shared->reopen_ok = false;
++    const std::size_t n = cache.read(120000u, got);
++    check(n == 0u && cache.stats().errors >= 1u, "when the source cannot be opened again the read fails short and counts an error");
++    shared->fail_reads = 0;
++    shared->reopen_ok = true;
++    check(cache.read(120000u, got) == 10000u && same(shared->data, 120000u, got, 10000u), "once the source is back the same read works (the failure was not cached)");
++
++    // Opened again from outside (the console woke from sleep): the cached blocks still serve, the source is read again.
++    const std::uint64_t before = shared->reopens.load();
++    check(cache.reopen() && shared->reopens.load() == before + 1u, "reopen() opens the source again");
++    check(cache.read(5000u, got) == 10000u && same(shared->data, 5000u, got, 10000u), "reads after a reopen are correct");
++
++    // A big read goes round the cache and gets the same retry.
++    std::vector<std::uint8_t> big(280000);
++    shared->fail_reads = 1;
++    check(cache.read(0u, big) == big.size() && same(shared->data, 0u, big, big.size()), "a read that bypasses the cache is retried too");
++}
++
++void worker_failure_is_not_fatal() {
++    auto shared = shared_image(400000u, 11u);
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(true));
++    shared->fail_reads = 1;
++    shared->reopen_ok = false;   // the worker's read fails for good: the block is dropped, not cached as bad
++    cache.hint(200000u, 8192u);
++    cache.drain();
++    shared->reopen_ok = true;
++    shared->fail_reads = 0;
++    std::vector<std::uint8_t> got(8192);
++    check(cache.read(200000u, got) == 8192u && same(shared->data, 200000u, got, 8192u), "a block the worker could not read is read by the caller");
++}
++
++void hints_and_ahead() {
++    auto shared = shared_image(1024u * 1024u, 13u);
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), small_config(true));
++    cache.hint(40960u, 16384u);   // four blocks
++    cache.drain();
++    const IsoCacheStats before = cache.stats();
++    std::vector<std::uint8_t> got(16384);
++    check(cache.read(40960u, got) == 16384u && same(shared->data, 40960u, got, 16384u), "a hinted range reads correctly");
++    const IsoCacheStats after = cache.stats();
++    check(before.prefetched >= 4u && after.misses == before.misses && after.hits >= before.hits + 4u, "a hinted range is served from the cache without a miss");
++
++    // A sequential reader finds the blocks after it already read.
++    shared->delay_us = 200;
++    std::vector<std::uint8_t> small(2048);
++    std::uint64_t off = 400000u;
++    for (int i = 0; i < 40; ++i) {
++        cache.read(off, small);
++        off += small.size();
++        if (i % 4 == 3) cache.drain();
++    }
++    const IsoCacheStats seq = cache.stats();
++    check(seq.prefetched > before.prefetched && seq.hits > after.hits, "a sequential reader is read ahead of");
++    shared->delay_us = 0;
++}
++
++void eviction() {
++    auto shared = shared_image(1024u * 1024u, 17u);
++    IsoReadCache::Config c = small_config(false);
++    c.capacity_bytes = 8u * c.block_bytes;
++    IsoReadCache cache(std::make_unique<MemSource>(shared), shared->data.size(), c);
++    std::vector<std::uint8_t> got(4096);
++    for (std::uint64_t b = 0; b < 40u; ++b) cache.read(b * 4096u, got);
++    check(cache.cached_blocks() == 8u, "the least recently used blocks are evicted at the capacity");
++    const std::uint64_t reads = shared->reads.load();
++    cache.read(39u * 4096u, got);
++    check(shared->reads.load() == reads, "the most recent block is still cached");
++    cache.read(0u, got);
++    check(shared->reads.load() == reads + 1u && same(shared->data, 0u, got, 4096u), "an evicted block is read again, with the same bytes");
++}
++
++// A minimal ISO 9660 image: the volume descriptor, a root directory with one file.
++std::vector<std::uint8_t> make_iso(std::size_t file_bytes, std::uint32_t &file_lba) {
++    constexpr std::size_t S = 2048u;
++    const std::uint32_t root_lba = 20u;
++    file_lba = 24u;
++    const std::size_t total = (file_lba * S) + ((file_bytes + S - 1u) / S) * S;
++    std::vector<std::uint8_t> iso(total, 0u);
++    auto le32 = [&](std::size_t at, std::uint32_t v) { for (int i = 0; i < 4; ++i) iso[at + i] = static_cast<std::uint8_t>(v >> (8 * i)); };
++    std::uint8_t *pvd = iso.data() + 16u * S;
++    pvd[0] = 1u;
++    std::memcpy(pvd + 1, "CD001", 5);
++    le32(16u * S + 156u + 2u, root_lba);
++    le32(16u * S + 156u + 10u, static_cast<std::uint32_t>(S));
++    const std::string name = "DATA.BIN;1";
++    std::uint8_t *rec = iso.data() + root_lba * S;
++    rec[0] = static_cast<std::uint8_t>(34u + name.size() + ((name.size() % 2u) == 0u ? 1u : 0u));
++    le32(root_lba * S + 2u, file_lba);
++    le32(root_lba * S + 10u, static_cast<std::uint32_t>(file_bytes));
++    rec[25] = 0u;
++    rec[32] = static_cast<std::uint8_t>(name.size());
++    std::memcpy(rec + 33, name.data(), name.size());
++    const auto payload = make_image(file_bytes, 21u);
++    std::memcpy(iso.data() + file_lba * S, payload.data(), payload.size());
++    return iso;
++}
++
++void iso_image_with_cache() {
++    std::uint32_t lba = 0u;
++    const std::size_t file_bytes = 3u * 1024u * 1024u + 123u;
++    const auto iso = make_iso(file_bytes, lba);
++    const auto path = std::filesystem::temp_directory_path() / "pk_iso_cache_test.iso";
++    { std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char *>(iso.data()), static_cast<std::streamsize>(iso.size())); }
++
++    IsoImage image(path);
++    const auto entry = image.find("DATA.BIN");
++    check(entry && entry->size == file_bytes, "the synthetic ISO is parsed");
++    if (!entry) return;
++    IsoReadCache::Config config;
++    config.capacity_bytes = 1024u * 1024u;
++    image.enable_cache(config);
++    check(image.cache_enabled(), "the cache is enabled");
++    const std::uint64_t base = static_cast<std::uint64_t>(entry->lba) * IsoImage::kSectorSize;
++    std::mt19937_64 rng(5);
++    bool ok = true;
++    for (int i = 0; i < 600 && ok; ++i) {
++        const std::uint64_t off = rng() % (iso.size() + 1000u);
++        std::vector<std::uint8_t> got(1u + rng() % 70000u);
++        const std::size_t n = image.read(off, got);
++        const std::size_t want = off >= iso.size() ? 0u : static_cast<std::size_t>(std::min<std::uint64_t>(got.size(), iso.size() - off));
++        ok = n == want && (n == 0u || std::memcmp(got.data(), iso.data() + off, n) == 0);
++        if (i % 50 == 0) image.prefetch(base + (rng() % file_bytes), 200000u);
++    }
++    check(ok, "IsoImage::read through the cache equals the file");
++    // A sequential walk of the whole file in 32 KiB reads.
++    std::vector<std::uint8_t> chunk(32768);
++    bool whole = true;
++    for (std::uint64_t off = 0; off < file_bytes; off += chunk.size()) {
++        const std::size_t n = image.read(base + off, chunk);
++        whole = whole && std::memcmp(chunk.data(), iso.data() + base + off, n) == 0 && n == std::min<std::size_t>(chunk.size(), iso.size() - static_cast<std::size_t>(base + off));
++    }
++    check(whole, "a sequential walk of the file is identical");
++    IsoCacheStats stats;
++    check(iso_cache_stats(stats) && stats.hits > 0u, "the statistics are reachable");
++    check(image.reopen(), "IsoImage::reopen() opens the file again");
++    check(image.read(base, chunk) == chunk.size() && std::memcmp(chunk.data(), iso.data() + base, chunk.size()) == 0, "reads work after the reopen");
++    std::filesystem::remove(path);
++}
++
++} // namespace
++
++int main() {
++    random_reads(false);
++    random_reads(true);
++    concurrent_reads();
++    end_and_short_reads();
++    error_and_reopen();
++    worker_failure_is_not_fatal();
++    hints_and_ahead();
++    eviction();
++    iso_image_with_cache();
++    if (g_failures != 0) std::printf("%d failed\n", g_failures);
++    return g_failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+
