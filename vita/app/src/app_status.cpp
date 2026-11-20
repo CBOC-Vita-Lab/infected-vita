@@ -20,6 +20,7 @@
 #include "psprecomp/runtime.hpp"
 #include "audio/audio_sink.hpp"
 #include "gpu/ge_worker.hpp"
+#include "gpu/gl/gl_platform.h"
 #include "gpu/gl/gl_renderer.hpp"
 #include "gpu/split_renderer.hpp"
 #include "settings/port_settings.hpp"
