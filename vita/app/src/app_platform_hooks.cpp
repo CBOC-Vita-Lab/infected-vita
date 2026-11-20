@@ -9,6 +9,7 @@
 #include "audio/audio_sink.hpp"
 #include "gpu/ge_worker.hpp"
 #include "input/pad_provider.hpp"
+#include "kernel/iso_read_cache.hpp"
 #include "kernel/kernel.hpp"
 #include "kernel/kernel_platform.hpp"
 #include "movie/avc_decoder.hpp"
