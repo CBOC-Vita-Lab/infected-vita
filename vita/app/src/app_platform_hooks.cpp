@@ -9,6 +9,7 @@
 #include "audio/audio_sink.hpp"
 #include "gpu/ge_worker.hpp"
 #include "input/pad_provider.hpp"
+#include "kernel/iso_image.hpp"
 #include "kernel/kernel.hpp"
 #include "kernel/kernel_platform.hpp"
 #include "movie/avc_decoder.hpp"
@@ -105,6 +106,11 @@ size_t audio_pull(int16_t* out, size_t frames) {
 // tenths of a second: a pause, a silent screen), for the pump's clock follower. It is the margin of the producer nearest to being
 // found behind the device and restarted.
 int64_t audio_fill() { return portablekit::audio::AudioSink::instance().telemetry().lead; }
+// The lead the clock follower settles at: the sink's cushion (its restart margin), which grows after real underruns.
+int64_t audio_target() { return (int64_t)portablekit::audio::AudioSink::instance().telemetry().cushion; }
+// sceKernelPowerTick of the game (movies, attract loops): the console's own timers get the tick, at most twice a second.
+void kp_power_tick(uint32_t) { plat::power_tick(500); }
+void on_resume() { portablekit::IsoImage::notify_resumed(); }
 void audio_close_dev() { plat::audio_close(); }
 void audio_gain(float g) { plat::audio_set_volume(g); }
 
@@ -116,6 +122,7 @@ void install_platform_hooks() {
     kp.monotonic_us = &kp_monotonic_us;
     kp.wait_event = &kp_wait;
     kp.signal_event = &kp_signal;
+    kp.power_tick = &kp_power_tick;   // plat::power_tick does nothing when config.txt power_tick=0
     portablekit::set_kernel_platform(kp);
 
     portablekit::gpu::GeWorkerPlatform gw;
@@ -144,12 +151,13 @@ void install_platform_hooks() {
 
     portablekit::audio::AudioOutput out;
     // config.txt audio_follow=0: the pump keeps the device's own rate (no clock follower), to compare by ear and by the stat line.
-    out.pulls = plat::audio_set_source(&audio_pull, app::cfg_bool("audio_follow", true) ? &audio_fill : nullptr);   // false on the desktop null sink, which keeps the push model
+    out.pulls = plat::audio_set_source(&audio_pull, app::cfg_bool("audio_follow", true) ? &audio_fill : nullptr, &audio_target);   // false on the desktop null sink, which keeps the push model
     out.open = &audio_open_44k;
     out.write = &audio_push;
     out.close = &audio_close_dev;
     out.set_gain = &audio_gain;
     portablekit::audio::set_audio_output(out);
+    plat::resume_handler_add(&on_resume);   // after a suspend the disc image is opened again before its next read
     app::hd_movie_install();   // the hardware source of the HD replacement movies (nothing is loaded until one is opened)
     plat::logf("hooks: kernel clock/idle, pad provider and audio output (%s) bound to the platform layer", out.pulls ? "pulled by the device" : "pushed");
 }

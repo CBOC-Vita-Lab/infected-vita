@@ -5,7 +5,7 @@ on:
   pull_request:
   push:
     branches: ['builder*']
-    paths: ['builder/**', '.github/**']
+    paths: ['builder/**', '.github/**', 'vita/platform/**', 'vita/selftest/**']
 
 permissions:
   contents: read
@@ -46,3 +46,20 @@ jobs:
         run: python3 -I .github/scripts/test_make_manifest.py
       - name: Python scripts compile
         run: python3 -m py_compile builder/kit/kit_tool.py builder/hosttool/*.py .github/scripts/*.py
+
+  # The pure parts of the Vita platform layer (header-only, no SDK): the log queue under concurrent writers (also under the thread
+  # sanitizer), the probe retry, the file replace with a refusing rename, the audio clock follower, the resampler, the pad layout.
+  host-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        working-directory: vita/selftest
+        run: |
+          set -e
+          for t in t_log_queue_host t_retry_host t_audio_rate_host t_resample_host t_pad_layout_host; do
+            g++ -O2 -std=c++17 -Wall -pthread -I../platform -I../app/src "$t.cpp" -o "/tmp/$t"
+            "/tmp/$t"
+          done
+          g++ -O1 -g -fsanitize=thread -std=c++17 -pthread -I../platform t_log_queue_host.cpp -o /tmp/t_log_queue_tsan
+          /tmp/t_log_queue_tsan

@@ -370,6 +370,21 @@ void core3_allow(bool) {}
 void core3_unlock_allow(bool) {}
 bool core3_usable() { return false; }
 int helper_core() { return 2; }
+void core3_retry_set(int) {}
+bool core3_reprobe() { return false; }
+Core3Stats core3_stats() { return Core3Stats(); }
+void core3_watch_set(bool) {}
+bool core3_watch_on() { return false; }
+bool core3_period(const char*, uint64_t, uint64_t) { return false; }
+bool log_async_start(int) { return false; }
+void log_async_stop() {}
+LogStats log_stats() { return LogStats(); }
+void power_tick_set(bool) {}
+void power_tick(uint32_t) {}
+uint64_t power_tick_count() { return 0; }
+void resume_handler_add(ResumeHandler) {}
+void power_callbacks_start() {}
+PowerStats power_stats() { return PowerStats(); }
 bool thread_set_priority(Thread*, int) { return true; }   // no-op on the desktop
 
 struct Mutex { pthread_mutex_t m; };
@@ -484,7 +499,7 @@ void audio_close() {
     A.run = false; thread_join(A.th); A.th = nullptr; free(A.ring); A.ring = nullptr; A.open = false;
 }
 bool audio_is_open() { return A.open; }
-bool audio_set_source(AudioSource, AudioFill) { return false; }   // the null sink keeps the push model: desktop runs are paced by the game's clock, not the host's
+bool audio_set_source(AudioSource, AudioFill, AudioTarget) { return false; }   // the null sink keeps the push model: desktop runs are paced by the game's clock, not the host's
 size_t audio_write(const int16_t* in, size_t frames) {
     if (!A.open) return 0;
     uint32_t h = A.head.load(std::memory_order_relaxed), t = A.tail.load(std::memory_order_acquire);
@@ -503,6 +518,7 @@ size_t audio_write(const int16_t* in, size_t frames) {
 size_t audio_free_frames() { return A.open ? (A.mask + 1) - (A.head.load() - A.tail.load()) : 0; }
 size_t audio_queued_frames() { return A.open ? A.head.load() - A.tail.load() : 0; }
 void audio_set_volume(float) {}
+void audio_policy_set(bool, bool) {}
 AudioStats audio_stats() {
     AudioStats s = A.st;
     s.periods_out = A.periods; s.frames_in = A.fin; s.frames_out = A.fout; s.underruns = A.under; s.underrun_frames = A.under_f; s.overruns = A.over;

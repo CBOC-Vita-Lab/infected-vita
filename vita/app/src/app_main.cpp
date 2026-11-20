@@ -28,6 +28,7 @@
 #include "app_pad_script.h"
 #include "app_platform_hooks.h"
 #include "app_settings.h"
+#include "app_stdio_lock.h"
 #include "app_status.h"
 #include "app_ui.h"
 #include "platform.h"
@@ -166,15 +167,30 @@ int main(int, char**) {
     app::config_load("config.txt");
     apply_config_defaults();
     if (app::cfg_bool("log_sync", false)) plat::log_set_sync(true);
+    // One lock around the C stdio writes and around fopen/fclose (newlib's FILE is not safe for two threads); config.txt stdio_lock=0 / fopen_lock=0.
+    app::stdio_lock_configure(app::cfg_bool("stdio_lock", true), app::cfg_bool("fopen_lock", true));
+    plat::logf("stdio: writes %s, fopen/fclose %s", app::cfg_bool("stdio_lock", true) ? "under one lock" : "unlocked (stdio_lock=0)",
+               app::cfg_bool("fopen_lock", true) ? "under one lock" : "unlocked (fopen_lock=0)");
     app::log_redirect_streams();
     app::install_terminate_handler();
     plat::logf("config:\n%s", app::config_dump().c_str());
     app::settings::init();   // settings.txt (the in-game menu's file) before vitaGL: the multisampling is read from it
     // The fourth core, when a plugin lets the application have it: the helper threads (audio pump, movie decoder, GC thread of vitaGL,
     // watchdog) go there and leave core 2 to the display-list walker. config.txt core3=0 keeps them where they were.
+    plat::core3_retry_set((int)app::cfg_int("core3_retries", 6));   // tries of the core-3 probe
+    plat::core3_watch_set(app::cfg_bool("core3_watchdog", true));
+    plat::power_tick_set(app::cfg_bool("power_tick", true));
+    plat::audio_policy_set(app::cfg_bool("audio_fade", true), app::cfg_bool("audio_retry", true));
     plat::core3_allow(app::cfg_bool("core3", true));
     plat::core3_unlock_allow(app::cfg_bool("core3_unlock", true));
     plat::logf("cores: helper threads on core %d (core 3 %s)", plat::helper_core(), plat::core3_usable() ? "usable" : "not available");
+    // The log is written by a thread of its own from here on (core 2, lowest priority); config.txt log_async=0 or log_sync=1 write in the caller.
+    if (app::cfg_bool("log_async", true) && !app::cfg_bool("log_sync", false)) plat::log_async_start(2);
+    // Suspend and resume: the power callback re-checks the clock, core 3, the audio port and the disc image after the console slept.
+    if (app::cfg_bool("resume_handling", true)) plat::power_callbacks_start();
+    plat::logf("power: sceKernelPowerTick %s (config.txt power_tick); audio fade %s, port retry %s (audio_fade, audio_retry); core-3 watchdog %s, %d probe tries",
+               app::cfg_bool("power_tick", true) ? "keeps the screen awake" : "off", app::cfg_bool("audio_fade", true) ? "on" : "off",
+               app::cfg_bool("audio_retry", true) ? "on" : "off", app::cfg_bool("core3_watchdog", true) ? "on" : "off", (int)app::cfg_int("core3_retries", 6));
 
     if (app::cfg_bool("clocks", true)) plat::clocks_set_max();
     if (app::cfg_bool("cost_probe", true)) log_platform_costs();
@@ -284,6 +300,8 @@ int main(int, char**) {
                 }
             });
         }
+        // The console's screen timers: a tick about once a second while the game runs (movies and attract loops take no input).
+        portablekit::kernel().add_vblank_hook([] { plat::power_tick(1000); });
         app::settings::install_appliers();   // perf.cpu_clock, display sync; the touch corner opens the menu
         app::ui::boot_line("Starting the game (%s)", portablekit::kernel().realtime() ? "realtime clock" : "virtual clock");
         plat::logf("%s", app::memory_line().c_str());

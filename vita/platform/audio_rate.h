@@ -24,6 +24,7 @@ struct RateControl {
     static constexpr float kMaxError = 1000.0f;       // frames: a stall or a restart is a jolt, not a measurement of the clocks
     static constexpr float kMaxPpm = 6000.0f;         // 0.6 %: 10 cents of pitch, far more than two crystals differ by
 
+    float target = kTargetFrames;   // the lead to settle at: the sink's cushion, which grows after underruns (set by the pump)
     float average = kTargetFrames;
     float integral = 0.0f;   // the learned clock difference, ppm
     float ppm = 0.0f;        // the correction in use: positive = consume faster
@@ -44,7 +45,7 @@ struct RateControl {
             } else {
                 average += ((float)queued - average) * kAlpha;
             }
-            float error = average - kTargetFrames;
+            float error = average - target;
             if (error > kMaxError) error = kMaxError;
             if (error < -kMaxError) error = -kMaxError;
             integral += error * kKi;
