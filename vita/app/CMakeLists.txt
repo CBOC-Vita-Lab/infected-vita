@@ -174,7 +174,9 @@ target_compile_definitions(infected PRIVATE ${PK_DEFS}
   # Our vitaGL has patch 0003 (scripts/patches): the GL renderer's vgl_skip_redundant setting can switch it on.
   PORTABLEKIT_VITAGL_SKIP_REDUNDANT=1
   # and patch 0004: the HD textures' compressed mip chains are reserved at level 0 (no wait for the GPU between levels).
-  PORTABLEKIT_VITAGL_RESERVE_MIPS=1)
+  PORTABLEKIT_VITAGL_RESERVE_MIPS=1
+  # and patches 0005 (bounded wait for the garbage collector, counters) and 0006/0007 (scene begin checked, scene counters and options).
+  PORTABLEKIT_VITAGL_STATS=1 PORTABLEKIT_VITAGL_SCENE=1)
 if(VITAGL_VARIANT STREQUAL "debug")
   target_compile_definitions(infected PRIVATE INFECTED_VGL_DEBUG=1)
 endif()

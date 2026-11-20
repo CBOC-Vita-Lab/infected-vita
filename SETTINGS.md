@@ -127,6 +127,7 @@ A text file `ux0:data/infected/config.txt` with `name=value` lines changes thing
 | `atrac_ahead=0` | Decodes the music on the game's own core (for comparisons). |
 | `gl_skip_invisible=0` | Draws the fully transparent sprites anyway. |
 | `gl_compact_vertices=0`, `gl_vgl_skip_redundant=0`, `gl_rt_scenes=0`, `gl_alpha_elide=0`, `gl_alpha_elide_range=0` | Turn off the other drawing speed-ups, to compare. `log.txt` lists them in its `[gl] speed features:` line. |
+| `gl_blend_elide=0`, `gl_target_precreate=0`, `gl_scene_depth_trim=0`, `gl_vgl_gc_pause_ms=0` | Turn off the newest speed-ups (blending off where it cannot change the picture, every effect target made at start, shorter wait after a GPU memory failure, shorter depth loads), to compare. `gl_alpha_census` and `gl_warm_check` only count and log. `gl_scene_mask_skip=1` is an experiment. |
 | `gl_aa_auto=0` / `gl_aa_auto=2` | Anti-aliasing Auto behaves as Off (the way it was before Auto existed) / as FXAA always. `gfx.antialiasing=off` fixes the menu row to Off. |
 | `gl_scene_scale=0` / `gl_scene_scale=2` / `hd_recolour_dxt=0` | no temporary 85% scene size as Auto's last step / the 85% size always (to compare) / recoloured HD textures stay RGBA8 (more memory). |
 | `io_cache=0` / `ui_boot_art=0` / `present_vblank_lock=1` | Reads the disc as before, without the cache and read-ahead / the start-up screen without the game's own pictures (text only) / holds every picture for two display refreshes at the 30 cap (experimental). |

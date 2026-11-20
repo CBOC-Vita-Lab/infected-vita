@@ -22,6 +22,7 @@
 #include "psprecomp/runtime.hpp"
 #include "audio/audio_sink.hpp"
 #include "gpu/ge_worker.hpp"
+#include "gpu/gl/gl_platform.h"
 #include "gpu/gl/gl_renderer.hpp"
 #include "gpu/split_renderer.hpp"
 #include "settings/port_settings.hpp"
@@ -384,6 +385,19 @@ void report(const char* why) {
             snprintf(line, sizeof(line), "%shle=%s%s", head.c_str(), num, rest.c_str());
         }
     }
+#if !defined(INFECTED_NO_GL)
+    // vitaGL's own counters (patches 0005-0007), totals since the start: one more line a second.
+    {
+        portablekit::gpu::glp::VitaglStats v;
+        if (portablekit::gpu::glp::vitagl_stats(v, false)) {
+            plat::logf("[vgl] scenes display=%u fbo=%u begin_ms=%.1f (max %.1f) retries=%u failed=%u | mask quads begin=%u scissor=%u skipped=%u | depth made=%u loads=%u trimmed=%u | "
+                       "shaders cache=%u compiled=%u failed=%u | alloc_fail=%u gc_pauses=%u (%.1f ms, max %.1f)",
+                       v.scene_begins_display, v.scene_begins_fbo, v.scene_begin_us / 1000.0, v.scene_begin_us_max / 1000.0, v.scene_begin_retries, v.scene_begin_failures,
+                       v.mask_quads_begin, v.mask_quads_scissor, v.mask_quads_skipped, v.depth_buffers_made, v.depth_loads, v.depth_loads_trimmed,
+                       v.shader_cache_hits, v.shader_compiles, v.shader_compile_failures, v.alloc_failures, v.gc_pauses, v.gc_pause_us / 1000.0, v.gc_pause_us_max / 1000.0);
+        }
+    }
+#endif
     plat::logf("%s", line);
     {
         // The stability counters of this build, one line a second: audio underruns (faded, and the cushion that grew after them),

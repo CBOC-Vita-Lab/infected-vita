@@ -1,0 +1,83 @@
+Infected port: a scene that cannot begin stops the process cleanly instead of hanging the console.
+When sceGxmBeginScene refused (out of memory for the scene, a bad surface), scene_reset ignored the error (NO_DEBUG builds do not even log it), drew into a scene that was never begun and later ended it; on the display the sync object was then never signalled and the console froze. Now the begin is tried again up to 8 times, a millisecond apart, and when it still fails the callback set with vglSetSceneFailCallback is told the sceGxm error and whether it was the display's scene, and the process exits (a clean return to the home screen with the reason in the log). vglGetStats counts the retries and failures.
+
+diff --git a/source/gxm.c b/source/gxm.c
+index 1c9a8f0..cc97af2 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -591,6 +591,33 @@ static inline __attribute__((always_inline)) void scene_end(void) {
+ 		sceDisplayWaitVblankStartMulti(vsync_interval);
+ }
+ 
++// Infected port (patch 0006): sceGxmBeginScene refused (out of memory for the scene's own structures, a bad surface). The
++// stock code carried on, drew into a scene that was never begun, and later ended it; on the display that left the sync object
++// unsignalled and hung the console. Now the begin is tried again a few times (a millisecond apart: the previous scene's
++// resources are being given back), and if it still fails the port's callback is told and the process stops, which is a clean
++// exit to the home screen with a log line instead of a frozen screen.
++static vglSceneFailCallback scene_fail_callback = NULL;
++void vglSetSceneFailCallback(vglSceneFailCallback cb) {
++	scene_fail_callback = cb;
++}
++
++#define SCENE_BEGIN_RETRIES 8
++#define SCENE_BEGIN_CHECKED(r, display, ...) \
++	do { \
++		r = sceGxmBeginScene(__VA_ARGS__); \
++		for (int attempt_ = 0; r && attempt_ < SCENE_BEGIN_RETRIES; attempt_++) { \
++			vgl_stats_cur.scene_begin_retries++; \
++			sceKernelDelayThread(1000); \
++			r = sceGxmBeginScene(__VA_ARGS__); \
++		} \
++		if (r) { \
++			vgl_stats_cur.scene_begin_failures++; \
++			if (scene_fail_callback) \
++				scene_fail_callback(r, display); \
++			sceKernelExitProcess(0); \
++		} \
++	} while (0)
++
+ void scene_reset(void) {
+ 	if (in_use_framebuffer != active_write_fb || needs_scene_reset || dirty_framebuffer || dirty_query) {
+ 		scene_not_flushed = GL_TRUE;
+@@ -638,7 +665,8 @@ void scene_reset(void) {
+ 				gxm_back_buffer_index = (shared_fb_info.index + 1) % 2;
+ 			}
+ 			vgl_gxm_state_touched(); // Infected port (patch 0003)
+-			int r = sceGxmBeginScene(gxm_context, 0, gxm_render_target,
++			int r;
++			SCENE_BEGIN_CHECKED(r, 1, gxm_context, 0, gxm_render_target,
+ 				NULL, NULL,
+ 				gxm_sync_objects[gxm_back_buffer_index],
+ 				&gxm_color_surfaces[gxm_back_buffer_index],
+@@ -693,10 +721,12 @@ void scene_reset(void) {
+ 			fbo_rt->last_frame = vgl_framecount;
+ #endif
+ 			vgl_gxm_state_touched(); // Infected port (patch 0003)
+-			int r = sceGxmBeginScene(gxm_context, 0, fbo_rt->rt,
++			int r;
++			SCENE_BEGIN_CHECKED(r, 0, gxm_context, 0, fbo_rt->rt,
+ #else
+ 			vgl_gxm_state_touched(); // Infected port (patch 0003)
+-			int r = sceGxmBeginScene(gxm_context, 0, active_write_fb->target,
++			int r;
++			SCENE_BEGIN_CHECKED(r, 0, gxm_context, 0, active_write_fb->target,
+ #endif
+ 					NULL, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 5b4d2ce..69e5ec6 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1202,6 +1202,12 @@ void vglGetStats(vgl_stats *out, GLboolean reset);
+ // (the cycle frees a handful of buffers, a fraction of a millisecond when it is not behind). 0 keeps the second.
+ void vglSetGcPauseMs(uint32_t ms);
+ 
++// Infected port (patch 0006): sceGxmBeginScene is tried again (up to 8 times, a millisecond apart) when it refuses; if it still
++// fails the callback is called with the sceGxm error code and whether the scene was the display's, and then the process exits.
++// The callback must only log: the GPU is in no state to draw. Without a callback the process exits all the same.
++typedef void (*vglSceneFailCallback)(int gxm_error, int on_display);
++void vglSetSceneFailCallback(vglSceneFailCallback cb);
++
+ // calloc implementation for vitaGL internal memory pools.
+ void *vglCalloc(uint32_t nmember, uint32_t size);
+ 

@@ -1,0 +1,139 @@
+Infected port: scene counters and options (vglSceneOptions, vglSceneHint).
+Counts scenes begun (display / framebuffer object), the time spent beginning them, the scissor mask-update draws (at a scene's begin and at a scissor change), depth surfaces made and depth loads spared; all in vglGetStats. vglSceneHint(1) tells vitaGL the next framebuffer scene starts with a full depth clear; with vglSceneOptions(depth_trim) a build that force-loads the depth (STORE_DEPTH_STENCIL) then skips the load. The release build never loads depth, so there it only counts. vglSceneOptions(.., mask_skip) is an experiment, off by default: it leaves out the full-target mask-update draw at the start of a scene without a scissor.
+
+diff --git a/source/gxm.c b/source/gxm.c
+index cc97af2..0822fb0 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -618,8 +618,21 @@ void vglSetSceneFailCallback(vglSceneFailCallback cb) {
+ 		} \
+ 	} while (0)
+ 
++// Infected port (patch 0007): what the renderer told vitaGL about the next scene (vglSceneHint) and the options (vglSceneOptions).
++static GLboolean scene_depth_trim = GL_TRUE;
++GLboolean scene_mask_skip = GL_FALSE;
++static uint32_t scene_hints = 0;
++void vglSceneOptions(GLboolean depth_trim, GLboolean mask_skip) {
++	scene_depth_trim = depth_trim;
++	scene_mask_skip = mask_skip;
++}
++void vglSceneHint(uint32_t hints) {
++	scene_hints = hints;
++}
++
+ void scene_reset(void) {
+ 	if (in_use_framebuffer != active_write_fb || needs_scene_reset || dirty_framebuffer || dirty_query) {
++		uint64_t scene_begin_started = sceKernelGetSystemTimeWide();
+ 		scene_not_flushed = GL_TRUE;
+ 		dirty_framebuffer = GL_FALSE;
+ 		dirty_query = GL_FALSE;
+@@ -658,6 +671,10 @@ void scene_reset(void) {
+ #endif
+ 		// Starting drawing scene
+ 		is_rendering_display = !active_write_fb;
++		if (is_rendering_display)
++			vgl_stats_cur.scene_begins_display++;
++		else
++			vgl_stats_cur.scene_begins_fbo++;
+ 		if (is_rendering_display) { // Default framebuffer is used
+ 			if (system_app_mode) {
+ 				sceSharedFbBegin(shared_fb, &shared_fb_info);
+@@ -686,9 +703,25 @@ void scene_reset(void) {
+ 			if (!(active_write_fb->depthbuffer_state & DEPTHBUFFER_READY)) {
+ 				init_depth_stencil_buffer(active_write_fb->width, active_write_fb->height, &active_write_fb->depthbuffer, active_write_fb->depthbuffer_state == DEPTHBUFFER_WANTS_STENCIL, VGL_FRAMEBUFFER_MSAA(active_write_fb));
+ 				active_write_fb->depthbuffer_ptr = &active_write_fb->depthbuffer;
++				vgl_stats_cur.depth_buffers_made++;
+ 				active_write_fb->depthbuffer_state |= DEPTHBUFFER_READY;
+ 			}
+ 
++#ifdef STORE_DEPTH_STENCIL
++			// Infected port (patch 0007): the depth is loaded from memory at the start of the scene only when something may be in
++			// it: not when the renderer said the scene's first operation clears the whole depth buffer
++			if (scene_depth_trim && (scene_hints & 1u)) {
++				sceGxmDepthStencilSurfaceSetForceLoadMode(active_write_fb->depthbuffer_ptr, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
++				vgl_stats_cur.depth_loads_trimmed++;
++			} else {
++				sceGxmDepthStencilSurfaceSetForceLoadMode(active_write_fb->depthbuffer_ptr, SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
++				vgl_stats_cur.depth_loads++;
++			}
++#else
++			vgl_stats_cur.depth_loads_trimmed++; // this build never loads the depth: nothing to spare
++#endif
++			scene_hints = 0;
++
+ 			// If a rendertarget is not bound to the in use framebuffer, we get one for it
+ 			if (!active_write_fb->target) {
+ #ifdef HAVE_SHARED_RENDERTARGETS
+@@ -762,6 +795,11 @@ void scene_reset(void) {
+ 		dirty_scissor_state = GL_TRUE;
+ 		skip_scissor_invalidation = GL_TRUE;
+ #endif
++		scene_hints = 0;
++		uint32_t scene_begin_us = (uint32_t)(sceKernelGetSystemTimeWide() - scene_begin_started);
++		vgl_stats_cur.scene_begin_us += scene_begin_us;
++		if (scene_begin_us > vgl_stats_cur.scene_begin_us_max)
++			vgl_stats_cur.scene_begin_us_max = scene_begin_us;
+ 	}
+ 	
+ 	if (dirty_scissor_state) {
+diff --git a/source/tests.c b/source/tests.c
+index 8147353..b16fd06 100644
+--- a/source/tests.c
++++ b/source/tests.c
+@@ -253,6 +253,8 @@ inline __attribute__((always_inline)) void update_alpha_test_settings() {
+ 	}
+ }
+ 
++extern GLboolean scene_mask_skip; // Infected port (patch 0007): gxm.c, vglSceneOptions
++
+ void update_scissor_test() {
+ 	const float scissor_depth = 1.0f;
+ 
+@@ -294,8 +296,10 @@ void update_scissor_test() {
+ #endif
+ 	
+ #ifdef STORE_DEPTH_STENCIL
++	GLboolean at_scene_begin = GL_FALSE;
+ 	if (scissor_test_state) {
+ #else
++	GLboolean at_scene_begin = skip_scissor_invalidation;
+ 	if (skip_scissor_invalidation) {
+ 		skip_scissor_invalidation = GL_FALSE;
+ 		if (scissor_test_state) {
+@@ -346,7 +350,17 @@ void update_scissor_test() {
+ 	vglSetUniformData((uint8_t *)vertex_buffer + clear_position_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 4, scissor_test_state ? &scissor_test_vertices->x : &clear_vertices->x, SCE_GXM_PARAMETER_TYPE_F32);
+ 	vglSetUniformData((uint8_t *)vertex_buffer + clear_depth_offset, SCE_GXM_PARAMETER_TYPE_F32, 0, 1, 1, &scissor_depth, SCE_GXM_PARAMETER_TYPE_F32);
+ 
+-	sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
++	// Infected port (patch 0007, experimental, off by default): the scene's first mask-update draw covers the whole target when
++	// no scissor is set; vglSceneOptions can leave it out (counted, to compare on the console)
++	if (scene_mask_skip && at_scene_begin && !scissor_test_state) {
++		vgl_stats_cur.mask_quads_skipped++;
++	} else {
++		if (at_scene_begin)
++			vgl_stats_cur.mask_quads_begin++;
++		else
++			vgl_stats_cur.mask_quads_scissor++;
++		sceGxmDrawPrecomputed(gxm_context, &clear_draw_state);
++	}
+ 
+ 	// Restoring viewport and culling
+ 	validate_viewport();
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 69e5ec6..a051e43 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1208,6 +1208,13 @@ void vglSetGcPauseMs(uint32_t ms);
+ typedef void (*vglSceneFailCallback)(int gxm_error, int on_display);
+ void vglSetSceneFailCallback(vglSceneFailCallback cb);
+ 
++// Infected port (patch 0007): options and hints for the scene work. depth_trim: honour vglSceneHint's depth-cleared hint (it only
++// matters in a build that loads the depth at a scene's start, STORE_DEPTH_STENCIL; the release build never does). mask_skip
++// (an experiment, off): leave out the mask-update draw at the start of a scene that has no scissor. vglSceneHint(1) says the next
++// scene on a framebuffer object starts by clearing its whole depth buffer; it is forgotten once that scene has begun.
++void vglSceneOptions(GLboolean depth_trim, GLboolean mask_skip);
++void vglSceneHint(uint32_t hints);
++
+ // calloc implementation for vitaGL internal memory pools.
+ void *vglCalloc(uint32_t nmember, uint32_t size);
+ 

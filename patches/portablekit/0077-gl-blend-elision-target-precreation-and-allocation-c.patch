@@ -1,0 +1,1384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:26:28 -0500
+Subject: [PATCH 77/77] gl: blend elision, target precreation and allocation
+ checks, warm-up check, alpha-test census, vitaGL hooks
+
+Draws whose blend provably yields the source colour are drawn with blending off (gl_blend_elide, exact rule in gl_blend_elide.hpp, brute-force tested); FXAA's second texture is made with the display target and a failed target allocation is logged and skipped; the end of the warm-up reports programs that were not in the shader cache and links during play are counted; a census counts alpha-tested draws that come before opaque draws over the same area; platform hooks for vitaGL patches 0005-0007.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |  25 +++
+ host/gpu/gl/gl_blend_elide.hpp |  94 ++++++++++
+ host/gpu/gl/gl_platform.h      |  66 +++++++
+ host/gpu/gl/gl_post.inc        |  77 ++++++--
+ host/gpu/gl/gl_renderer.cpp    | 328 +++++++++++++++++++++++++++++++--
+ host/gpu/gl/gl_renderer.hpp    |  34 ++++
+ host/perf/frame_stats.cpp      |  29 ++-
+ host/perf/frame_stats.hpp      |  15 ++
+ tests/blend_elide_tests.cpp    |  78 ++++++++
+ tests/gl_synthetic_tests.cpp   | 152 +++++++++++++++
+ tools/ge_replay/ge_replay.cpp  |   8 +
+ 11 files changed, 874 insertions(+), 32 deletions(-)
+ create mode 100644 host/gpu/gl/gl_blend_elide.hpp
+ create mode 100644 tests/blend_elide_tests.cpp
+ create mode 100644 tests/gl_synthetic_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9a58572..9342df5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -412,6 +412,15 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_alpha_test_tests COMMAND portablekit_alpha_test_tests)
+ endif()
+ 
++# When a blend gives the source colour and can be left out (host/gpu/gl/gl_blend_elide.hpp): the decision table. Header only, no GL.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_blend_elide_tests "${PORTABLEKIT_ROOT}/tests/blend_elide_tests.cpp")
++    target_compile_features(portablekit_blend_elide_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_blend_elide_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_blend_elide_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_blend_elide_tests COMMAND portablekit_blend_elide_tests)
++endif()
++
+ # Every row and every value of the settings menu: model, save and reload, the menu's buttons, drawing. No GL, no game.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_settings_smoke_tests
+@@ -737,6 +746,22 @@ if(PORTABLEKIT_GE_REPLAY)
+     set_target_properties(ge_replay PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+ endif()
+ 
++# The GL renderer driven by hand-made draws (tests/gl_synthetic_tests.cpp): same pictures with blend elision, the census and the
++# counters, the display target's second texture made with the target. Needs the desktop GL driver; it skips without one.
++if(PORTABLEKIT_GE_REPLAY AND PORTABLEKIT_GL_RENDERER AND PSPRECOMP_BUILD_TESTS)
++    set(_synthetic_sources ${_replay_sources})
++    list(FILTER _synthetic_sources EXCLUDE REGEX "ge_replay\\.cpp$")
++    list(APPEND _synthetic_sources "${PORTABLEKIT_ROOT}/tests/gl_synthetic_tests.cpp")
++    add_executable(portablekit_gl_synthetic_tests ${_synthetic_sources})
++    target_compile_features(portablekit_gl_synthetic_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_gl_synthetic_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/third_party" "${PORTABLEKIT_ROOT}/include")
++    target_link_libraries(portablekit_gl_synthetic_tests PRIVATE psprecomp_core ${CMAKE_DL_LIBS} Threads::Threads)
++    _portablekit_use_zlib(portablekit_gl_synthetic_tests)
++    _portablekit_use_gl(portablekit_gl_synthetic_tests)
++    set_target_properties(portablekit_gl_synthetic_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_gl_synthetic_tests COMMAND portablekit_gl_synthetic_tests)
++endif()
++
+ # texkey: the replacement key and decoded picture of raster records, from the same code the renderer
+ # uses; the offline texture pack tools (the port repository's tools/texpack) run it.
+ option(PORTABLEKIT_TEXKEY "Build texkey, the offline replacement-key tool" OFF)
+diff --git a/host/gpu/gl/gl_blend_elide.hpp b/host/gpu/gl/gl_blend_elide.hpp
+new file mode 100644
+index 0000000..5621d0d
+--- /dev/null
++++ b/host/gpu/gl/gl_blend_elide.hpp
+@@ -0,0 +1,94 @@
++#pragma once
++
++// A blend that cannot change the source colour does not need to run. The GE blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA for most of
++// what Infected draws (smoke, glass, the HUD, and a great deal of plain geometry whose texture and vertex colours are opaque),
++// and with an alpha of exactly 1 the result is the source colour whatever lies behind it. On a tile-based GPU (the Vita's
++// PowerVR) a draw with blending on cannot take part in hidden-surface removal and reads the destination for every fragment, so
++// the same picture made with blending off costs less. This header is the decision, with no GL and no state in it, so that a test
++// can drive every row of the table; gl_renderer.cpp feeds it the blend plan and what it knows of the draw's alpha.
++//
++// The rule is exact. A blend is dropped only when, for every alpha in the range the draw's fragments can have, the source
++// factor is exactly 1 and the destination factor exactly 0 (the equation being ADD, or SUBTRACT, which with a zero destination
++// term is the source too). The alpha range comes from gl_alpha_test.hpp (the same facts the alpha test elision uses), and only
++// its two ends count: an alpha of exactly 255 (a float of exactly 1.0 in the shader: a clamped 1.0, a product of two 1.0s)
++// or of exactly 0. Nothing in between is ever rounded into either; there is no guard, because there is nothing to guard.
++#include "gl_alpha_test.hpp"
++
++#include <cstdint>
++
++namespace portablekit::gpu::blend_elide {
++
++// The blend factors that matter here; every other factor (a colour, the destination's alpha, a constant) is Other.
++enum class Factor : std::uint8_t {
++    Zero,
++    One,
++    SrcAlpha,
++    OneMinusSrcAlpha,
++    Other,
++};
++
++// The blend equation in effect (GL_FUNC_ADD ...).
++enum class Equation : std::uint8_t {
++    Add,
++    Subtract,
++    ReverseSubtract,
++    Min,
++    Max,
++};
++
++using alpha_test::Range;
++
++// The factor is exactly 1 for every alpha of the range.
++[[nodiscard]] constexpr bool always_one(Factor factor, Range alpha) noexcept {
++    switch (factor) {
++    case Factor::One: return true;
++    case Factor::SrcAlpha: return alpha.low == 255u;
++    case Factor::OneMinusSrcAlpha: return alpha.high == 0u;
++    default: return false;
++    }
++}
++
++// The factor is exactly 0 for every alpha of the range.
++[[nodiscard]] constexpr bool always_zero(Factor factor, Range alpha) noexcept {
++    switch (factor) {
++    case Factor::Zero: return true;
++    case Factor::SrcAlpha: return alpha.high == 0u;
++    case Factor::OneMinusSrcAlpha: return alpha.low == 255u;
++    default: return false;
++    }
++}
++
++// True when blending with these factors gives the source colour for every fragment: the draw can be made with blending off.
++// REVERSE_SUBTRACT is the destination term minus the source term, MIN and MAX compare the two: none of them is the source.
++[[nodiscard]] constexpr bool yields_source(Equation equation, Factor source, Factor destination, Range alpha) noexcept {
++    if (equation != Equation::Add && equation != Equation::Subtract) return false;
++    return always_one(source, alpha) && always_zero(destination, alpha);
++}
++
++// The value a blend gives for one 8-bit source and destination channel and one 8-bit alpha, in exact integer arithmetic
++// (scaled by 255 * 255). What the test compares against the source to check the table by brute force.
++[[nodiscard]] constexpr std::int64_t blend_value(Equation equation, Factor source, Factor destination, std::uint32_t alpha,
++                                                 std::uint32_t source_channel, std::uint32_t destination_channel) noexcept {
++    const auto factor = [alpha](Factor f) -> std::int64_t {   // scaled by 255
++        switch (f) {
++        case Factor::Zero: return 0;
++        case Factor::One: return 255;
++        case Factor::SrcAlpha: return static_cast<std::int64_t>(alpha);
++        case Factor::OneMinusSrcAlpha: return 255 - static_cast<std::int64_t>(alpha);
++        default: return -1;   // not a factor the table models
++        }
++    };
++    const std::int64_t s = factor(source) * static_cast<std::int64_t>(source_channel);
++    const std::int64_t d = factor(destination) * static_cast<std::int64_t>(destination_channel);
++    // GL's MIN and MAX ignore the factors: they compare the two colours themselves.
++    const std::int64_t sc = 255 * static_cast<std::int64_t>(source_channel), dc = 255 * static_cast<std::int64_t>(destination_channel);
++    switch (equation) {
++    case Equation::Add: return s + d;
++    case Equation::Subtract: return s - d;
++    case Equation::ReverseSubtract: return d - s;
++    case Equation::Min: return sc < dc ? sc : dc;
++    default: return sc > dc ? sc : dc;
++    }
++}
++
++} // namespace portablekit::gpu::blend_elide
+diff --git a/host/gpu/gl/gl_platform.h b/host/gpu/gl/gl_platform.h
+index 0f2fc23..db1f7cf 100644
+--- a/host/gpu/gl/gl_platform.h
++++ b/host/gpu/gl/gl_platform.h
+@@ -26,6 +26,7 @@ static inline void glBlendColor(GLfloat, GLfloat, GLfloat, GLfloat) {}
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <string>
+ 
+ namespace portablekit::gpu::glp {
+@@ -102,6 +103,71 @@ inline bool reserve_compressed_mips() {
+ #endif
+ }
+ 
++// What vitaGL (the port's patches 0005-0007) counts, read once a second by the status line and by the renderer's warm-up check.
++// Zeros, and `vitagl_stats` false, on a platform without them.
++struct VitaglStats {
++    std::uint32_t scene_begins_display{}, scene_begins_fbo{};   // scenes begun on the display, on a framebuffer object
++    std::uint32_t scene_begin_retries{}, scene_begin_failures{};   // sceGxmBeginScene refused (retried / given up)
++    std::uint32_t scene_begin_us{}, scene_begin_us_max{};        // time in the scene begin (the whole scene_reset), total and worst
++    std::uint32_t mask_quads_begin{}, mask_quads_scissor{};      // scissor mask-update draws: at a scene's begin, at a scissor change
++    std::uint32_t depth_buffers_made{};                          // depth surfaces allocated (one per framebuffer object, at its first scene)
++    std::uint32_t depth_loads{};                                 // scenes begun with the depth force-loaded (only a STORE_DEPTH_STENCIL build)
++    std::uint32_t depth_loads_trimmed{};                         // scenes the renderer's hint spared that (or that never had one to spare)
++    std::uint32_t mask_quads_skipped{};                          // mask-update draws left out (gl_scene_mask_skip)
++    std::uint32_t shader_cache_hits{}, shader_compiles{}, shader_compile_failures{};
++    std::uint32_t alloc_failures{};                              // GPU allocations that failed the first try
++    std::uint32_t gc_pauses{}, gc_pause_us{}, gc_pause_us_max{}; // waits for the garbage collector after a failed allocation
++};
++// The hints the renderer gives vitaGL for the scene that begins next (one use).
++constexpr std::uint32_t kSceneDepthCleared = 1u;   // the scene's first operation is a clear of the whole depth buffer
++
++inline bool vitagl_stats(VitaglStats &out, bool reset) {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_STATS)
++    vgl_stats raw;
++    vglGetStats(&raw, reset ? GL_TRUE : GL_FALSE);
++    static_assert(sizeof(raw) == sizeof(VitaglStats), "vgl_stats (vitaGL patch 0005) and glp::VitaglStats must match field for field");
++    std::memcpy(&out, &raw, sizeof(out));
++    return true;
++#else
++    (void)out;
++    (void)reset;
++    return false;
++#endif
++}
++
++// vitaGL's wait for its garbage collector after a failed GPU allocation (patch 0005): at most this many milliseconds (0: its own
++// one second). Returns true when the library has the hook.
++inline bool set_gc_pause_ms(std::uint32_t ms) {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_STATS)
++    vglSetGcPauseMs(ms);
++    return true;
++#else
++    (void)ms;
++    return false;
++#endif
++}
++
++// vitaGL's scene begin (patch 0007): `depth_trim` lets the renderer's hints spare the depth load of a scene that begins with a
++// full depth clear; `mask_skip` (an experiment) leaves out the full-target mask-update draw of a scene whose scissor is the whole
++// target. True when the library has them.
++inline bool set_scene_options(bool depth_trim, bool mask_skip) {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_SCENE)
++    vglSceneOptions(depth_trim ? GL_TRUE : GL_FALSE, mask_skip ? GL_TRUE : GL_FALSE);
++    return true;
++#else
++    (void)depth_trim;
++    (void)mask_skip;
++    return false;
++#endif
++}
++inline void scene_hint(std::uint32_t hints) {
++#if defined(__vita__) && defined(PORTABLEKIT_VITAGL_SCENE)
++    vglSceneHint(hints);
++#else
++    (void)hints;
++#endif
++}
++
+ inline void disable_dither() {
+ #if !defined(__vita__)
+     glDisable(GL_DITHER);
+diff --git a/host/gpu/gl/gl_post.inc b/host/gpu/gl/gl_post.inc
+index f98fae5..3ccfd69 100644
+--- a/host/gpu/gl/gl_post.inc
++++ b/host/gpu/gl/gl_post.inc
+@@ -63,6 +63,7 @@
+         next.frame_cap_us = settings.apply_frame_cap ? port::frame_cap_period_us() : 0u;
+         opt = next;
+         offscreen_scale = std::max(settings.offscreen_scale, port::effects_scale());
++        if (opt.fxaa || opt.aa_auto) precreate_post_all();   // the player just chose FXAA or Auto: its texture is made between frames
+     }
+ 
+     // ---- gfx.antialiasing=auto ------------------------------------------------------------------------------------
+@@ -273,6 +274,48 @@
+         }
+     }
+ 
++    // The texture FXAA draws into (the target's second colour texture). False, with FXAA switched off for the rest of the run and
++    // one log line, when it cannot be made: the picture is drawn without it, nothing else changes.
++    bool post_unavailable{};
++    bool ensure_post_texture(Target &target) {
++        if (target.post != 0u) return true;
++        if (post_unavailable) return false;
++        drain_gl_errors();
++        glGenTextures(1, &target.post);
++        bool ok = target.post != 0u;
++        if (ok) {
++            bind_texture(target.post);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height), 0, GL_RGBA,
++                         GL_UNSIGNED_BYTE, nullptr);
++            ok = drain_gl_errors();
++        }
++        if (!ok) {
++            if (target.post != 0u) glDeleteTextures(1, &target.post);
++            target.post = 0u;
++            post_unavailable = true;
++            ++st().target_failures;
++            std::cerr << "[gl] the second texture for FXAA (" << target.width << "x" << target.height
++                      << ") could not be made: FXAA is off for this run" << std::endl;
++            return false;
++        }
++        forget_sampler(target.post);
++        set_sampler(target.post, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
++        ++st().post_textures;
++        note_late_creation("FXAA texture", target.address);
++        return true;
++    }
++
++    // With a display-sized target made, or the options just asking for FXAA (or Auto, which may), make FXAA's second texture now.
++    void precreate_post(Target &target) {
++        if (!settings.target_precreate || target.scene_twin || target.stride < 512u || target.fbo == 0u) return;
++        if (!(opt.fxaa || opt.aa_auto)) return;
++        ensure_post_texture(target);
++    }
++    void precreate_post_all() {
++        for (auto &entry : targets)
++            if (entry.second->fbo != 0u && !entry.second->unusable) precreate_post(*entry.second);
++    }
++
+     // FXAA over the target's picture. The result is drawn into a second texture which then becomes the target's colour
+     // attachment, so nothing is copied; the old texture is the scratch one of the next pass.
+     void run_fxaa(Target &target) {
+@@ -280,14 +323,7 @@
+         Program *program = fxaa_program_for_pass();
+         if (program == nullptr) return;
+         flush();
+-        if (target.post == 0u) {
+-            glGenTextures(1, &target.post);
+-            bind_texture(target.post);
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height),
+-                         0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+-            forget_sampler(target.post);
+-            set_sampler(target.post, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+-        }
++        if (!ensure_post_texture(target)) return;
+         bind_target(target);
+         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.post, 0);
+         const float inv[4] = {1.0f / static_cast<float>(target.width), 1.0f / static_cast<float>(target.height),
+@@ -323,13 +359,15 @@
+     std::uint32_t ss_frame_xform{};      // 3D draws on a display-sized target this frame, whether the rung runs or not
+     bool ss_prev_scene{};                // the last frame was a 3D one
+ 
++    bool ss_failed{};    // the smaller twin could not be allocated: the rung is off
+     [[nodiscard]] bool scene_scale_armed() const {
+-        return settings.scene_scale == 2u || (settings.scene_scale == 1u && opt.scene_scale);
++        return !ss_failed && (settings.scene_scale == 2u || (settings.scene_scale == 1u && opt.scene_scale));
+     }
+ 
+     // After a present: what the next frame does.
+     void scene_scale_frame_start() {
+         ss_prev_scene = ss_frame_xform >= kFxaaMinDraws;
++        if (ss_prev_scene) play_started = true;
+         ss_frame_xform = 0u;
+         ss_draws = 0u;
+         ss_composite = false;
+@@ -356,24 +394,30 @@
+     // the middle of a slow frame: some 3 MB of colour and depth on the console).
+     void scene_scale_prepare(const Target &display) {
+         const bool may = settings.scene_scale == 2u || (settings.scene_scale == 1u && opt.aa_auto && settings.display_scale_percent == 0u && ssaa_scale == 0u);
+-        if (!may || display.fbo == 0u) return;
++        if (!may || display.fbo == 0u || ss_failed) return;
+         if (!ss_twin) ss_twin = std::make_unique<Target>();
+         scene_scale_size_twin(*ss_twin, display);
+     }
+ 
+     // Gives `twin` the size of `display` at the scene scale, allocating its colour and depth when that changes.
+-    void scene_scale_size_twin(Target &twin, const Target &display) {
++    bool scene_scale_size_twin(Target &twin, const Target &display) {
+         const float scale = display.scale * static_cast<float>(settings.scene_scale_percent) / 100.0f;
+-        if (twin.fbo != 0u && twin.stride == display.stride && twin.psp_width == display.psp_width && twin.psp_height == display.psp_height &&
+-            twin.scale == scale && twin.format == display.format)
+-            return;
++        if (twin.fbo != 0u && !twin.unusable && twin.stride == display.stride && twin.psp_width == display.psp_width &&
++            twin.psp_height == display.psp_height && twin.scale == scale && twin.format == display.format)
++            return true;
+         twin.scene_twin = true;
++        twin.address = display.address;
+         twin.stride = display.stride;
+         twin.format = display.format;
+         twin.psp_width = display.psp_width;
+         twin.psp_height = display.psp_height;
+         twin.scale = scale;
+-        allocate_target(twin);
++        if (allocate_target(twin)) return true;
++        // The smaller twin could not be made: the resolution rung is off for the rest of the run, the picture stays full size.
++        ss_failed = true;
++        ss_twin.reset();
++        std::cerr << "[gl] the scene scale rung is off for this run (its smaller target could not be made)" << std::endl;
++        return false;
+     }
+ 
+     bool scene_scale_begin(std::uint32_t key, const DrawCall &call) {
+@@ -382,9 +426,10 @@
+         Target &display = *found->second;
+         if (!covers_display(call, display)) return false;
+         flush();
++        if (ss_failed) return false;
+         if (!ss_twin) ss_twin = std::make_unique<Target>();
++        if (!scene_scale_size_twin(*ss_twin, display)) return false;
+         Target &twin = *ss_twin;
+-        scene_scale_size_twin(twin, display);
+         twin.address = key;
+         twin.guest_words.clear();
+         twin.last_drawn_frame = ~0ull;
+diff --git a/host/gpu/gl/gl_renderer.cpp b/host/gpu/gl/gl_renderer.cpp
+index f437fb7..6dabb61 100644
+--- a/host/gpu/gl/gl_renderer.cpp
++++ b/host/gpu/gl/gl_renderer.cpp
+@@ -21,6 +21,7 @@
+ #include "../triangle_indices.hpp"
+ #include "../auto_aa.hpp"
+ #include "gl_alpha_test.hpp"
++#include "gl_blend_elide.hpp"
+ #include "gl_overlay.hpp"
+ #include "gl_hd_movie.hpp"
+ #include "gl_hd_textures.hpp"
+@@ -225,6 +226,8 @@ struct Target {
+     std::uint64_t draws{};
+     std::uint64_t last_drawn_frame{~0ull};
+     std::vector<std::uint32_t> guest_words;  // every 256th byte's word, as the target was last drawn
++    bool unusable{};            // its allocation failed: nothing draws to it, and it is tried again at retry_frame
++    std::uint64_t retry_frame{};
+ };
+ 
+ // ---- programs --------------------------------------------------------------------------------
+@@ -557,9 +560,33 @@ struct GlRenderer::Impl {
+         return shader;
+     }
+ 
++    // What the last link did on a platform that counts it (vitaGL's patch 0005): the shader compiler ran (the program was not in
++    // the shader cache), or it was found there. Compiles on the device are listed; a link once play has begun is counted.
++    bool last_link_compiled{};
++    std::uint32_t compiled_on_device{};
++    std::vector<std::string> compiled_names;
++
++    void note_link(const char *label, const glp::VitaglStats &before, bool counted, std::uint64_t us) {
++        glp::VitaglStats after;
++        last_link_compiled = counted && glp::vitagl_stats(after, false) && after.shader_compiles > before.shader_compiles;
++        if (last_link_compiled) {
++            ++compiled_on_device;
++            if (compiled_names.size() < 64u) compiled_names.emplace_back(label);
++            std::cerr << "[gl] shader compiled on the device (not in the shader cache): " << label << ", " << us / 1000u << " ms" << std::endl;
++        }
++        if (play_started) {
++            ++st().late_compiles;
++            perf::count_gl_event(perf::GlEvent::LateCompiles);
++            std::cerr << "[gl] program linked during play (frame " << frames << "): " << label << ", " << us / 1000u << " ms"
++                      << (counted ? (last_link_compiled ? ", compiled" : ", from the cache") : "") << std::endl;
++        }
++    }
++
+     bool link(Program &program, const std::string &vertex, const std::string &fragment, const char *label,
+               bool blit) {
+         const auto start = Clock::now();
++        glp::VitaglStats stats_before;
++        const bool counted = glp::vitagl_stats(stats_before, false);
+         const GLuint vs = compile(GL_VERTEX_SHADER, vertex, label);
+         const GLuint fs = vs != 0u ? compile(GL_FRAGMENT_SHADER, fragment, label) : 0u;
+         if (vs == 0u || fs == 0u) {
+@@ -590,8 +617,9 @@ struct GlRenderer::Impl {
+         }
+         for (std::uint32_t i = 0; i < glsl::kUniformCount; ++i)
+             program.location[i] = glGetUniformLocation(program.id, glsl::uniform_name(static_cast<glsl::Uniform>(i)));
+-        st().shader_compile_us += static_cast<std::uint64_t>(
+-            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
++        const auto link_us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
++        st().shader_compile_us += link_us;
++        note_link(label, stats_before, counted, link_us);
+         return true;
+     }
+ 
+@@ -621,10 +649,25 @@ struct GlRenderer::Impl {
+     std::vector<std::uint32_t> warm_flags;   // what warm_up_step() links, in order
+     std::size_t warm_next{};
+     bool warm_started{}, warm_done{};
+-    std::uint32_t warm_linked{}, warm_failed{};
++    std::uint32_t warm_linked{}, warm_failed{}, warm_compiled{};
+     std::uint64_t warm_us{};
+     bool variant_file_started{};
+ 
++    // The end of the warm-up: did the listed programs come out of the shader cache? One line (the verdict) and one per program
++    // that had to be compiled on the device; a program of the list that failed to link is named in the "[gl] program ... FAILED"
++    // line before it. (A platform that does not count compiles says so, and the check is then only the failed count.)
++    void warm_check_report() {
++        glp::VitaglStats now;
++        const bool counted = glp::vitagl_stats(now, false);
++        const bool ok = warm_failed == 0u && warm_compiled == 0u;
++        std::cerr << "[gl] warm-up check: " << (counted ? (ok ? "OK" : "INCOMPLETE") : "compiles not counted on this platform") << ": "
++                  << warm_flags.size() << " listed, " << warm_linked << " linked, " << warm_failed << " failed, " << warm_compiled
++                  << " compiled on the device (not in the shader cache), " << compiled_on_device << " compiled in all";
++        if (counted) std::cerr << "; shader cache hits " << now.shader_cache_hits << ", compiles " << now.shader_compiles << ", compile failures " << now.shader_compile_failures;
++        std::cerr << std::endl;
++        for (const std::string &name : compiled_names) std::cerr << "[gl] warm-up check: compiled on the device: " << name << std::endl;
++    }
++
+     static std::string folder_of(const std::string &path) {
+         const std::size_t slash = path.find_last_of("/\\:");
+         return slash == std::string::npos ? std::string() : path.substr(0, slash + 1u);
+@@ -886,31 +929,84 @@ struct GlRenderer::Impl {
+         scene_fresh = true;
+     }
+ 
+-    void allocate_target(Target &target) {
++    // GL errors raised since the last look: false when one of them is an allocation or a state failure. vitaGL sets
++    // GL_OUT_OF_MEMORY when the storage of a texture could not be made (its patch 0006); a desktop driver reports its own.
++    static bool drain_gl_errors() {
++        bool clean = true;
++        for (GLenum error = glGetError(); error != GL_NO_ERROR; error = glGetError()) clean = false;
++        return clean;
++    }
++
++    // Counts a render target or an extra texture made once play has begun (the first 3D frame has been drawn), with one log line.
++    void note_late_creation(const char *what, std::uint32_t address) {
++        if (!play_started) return;
++        ++st().late_targets;
++        perf::count_gl_event(perf::GlEvent::LateTargets);
++        std::cout << "[gl] made late (frame " << frames << "): " << what << " 0x" << std::hex << address << std::dec << std::endl;
++    }
++    bool play_started{};   // a 3D frame has been presented: from here on, making a target is a stall in the middle of play
++
++    // The allocation of `target` failed at `step`: one log line, the objects a new target made are given back (a target that
++    // already existed keeps its own: the GPU may still be drawing into them), and nothing draws to it until retry_frame.
++    bool target_failed(Target &target, bool fresh, const char *step) {
++        ++st().target_failures;
++        std::cerr << "[gl] render target 0x" << std::hex << target.address << std::dec << " " << target.psp_width << "x"
++                  << target.psp_height << " (" << target.width << "x" << target.height << " pixels) could not be made: " << step
++                  << "; drawing to it is skipped" << std::endl;
++        if (fresh) {
++            if (target.fbo != 0u) glDeleteFramebuffers(1, &target.fbo);
++            if (target.color != 0u) {
++                glDeleteTextures(1, &target.color);
++                forget_sampler(target.color);
++            }
++            if (target.depth != 0u) glDeleteRenderbuffers(1, &target.depth);
++            target.fbo = target.color = target.depth = 0u;
++        }
++        target.unusable = true;
++        target.retry_frame = frames + 120u;
++        cache.fbo = -1;
++        glBindFramebuffer(GL_FRAMEBUFFER, 0u);
++        return false;
++    }
++
++    // Makes (or remakes at a new size) the colour texture, the depth and the framebuffer object of a target, and clears it.
++    // False, with the target marked unusable, when GL could not.
++    bool allocate_target(Target &target) {
+         target.width = static_cast<std::uint32_t>(std::lround(static_cast<float>(target.psp_width) * target.scale));
+         target.height = static_cast<std::uint32_t>(std::lround(static_cast<float>(target.psp_height) * target.scale));
+-        if (target.fbo == 0u) {
++        const bool fresh = target.fbo == 0u;
++        drain_gl_errors();
++        if (fresh) {
++            // glGen* leaves its output alone when no slot is free: start from 0 and look.
++            target.fbo = target.color = target.depth = 0u;
+             glGenFramebuffers(1, &target.fbo);
+             glGenTextures(1, &target.color);
+             glGenRenderbuffers(1, &target.depth);
++            if (target.fbo == 0u || target.color == 0u || target.depth == 0u) return target_failed(target, true, "no free framebuffer, texture or renderbuffer");
+         }
+         bind_texture(target.color);
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(target.width), static_cast<GLsizei>(target.height),
+                      0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++        if (!drain_gl_errors()) return target_failed(target, fresh, "no memory for the colour texture");
+         forget_sampler(target.color);
+         set_sampler(target.color, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+         glBindRenderbuffer(GL_RENDERBUFFER, target.depth);
+         const GLenum depth_format = settings.depth_bits > 16u ? GL_DEPTH_COMPONENT24 : GL_DEPTH_COMPONENT16;
+         glRenderbufferStorage(GL_RENDERBUFFER, depth_format, static_cast<GLsizei>(target.width),
+                               static_cast<GLsizei>(target.height));
++        if (!drain_gl_errors()) return target_failed(target, fresh, "no memory for the depth buffer");
+         glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+         cache.fbo = target.fbo;
+         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.color, 0);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth);
+         const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+-        if (status != GL_FRAMEBUFFER_COMPLETE)
+-            std::cerr << "[gl] framebuffer for 0x" << std::hex << target.address << std::dec << " is incomplete (0x"
+-                      << std::hex << status << std::dec << ")\n";
++        if (status != GL_FRAMEBUFFER_COMPLETE || !drain_gl_errors()) {
++            std::cerr << "[gl] framebuffer for 0x" << std::hex << target.address << std::dec << " is incomplete (0x" << std::hex
++                      << status << std::dec << ")\n";
++            return target_failed(target, fresh, "the framebuffer is incomplete");
++        }
++        target.unusable = false;
++        if (fresh) note_late_creation("render target", target.address);
+         // A new target starts transparent black, as untouched VRAM reads.
+         glDisable(GL_SCISSOR_TEST);
+         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+@@ -920,6 +1016,7 @@ struct GlRenderer::Impl {
+         } else {
+             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+             glClearDepthf(0.0f);
++            if (settings.scene_depth_trim) glp::scene_hint(glp::kSceneDepthCleared);   // the target's first scene: a whole-buffer clear
+             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+         }
+         glEnable(GL_SCISSOR_TEST);
+@@ -937,6 +1034,7 @@ struct GlRenderer::Impl {
+             target.post = 0u;
+         }
+         target.copy_serial = ~0ull;
++        return true;
+     }
+ 
+     Target &target_for(std::uint32_t address, std::uint32_t stride, std::uint32_t format) {
+@@ -950,7 +1048,9 @@ struct GlRenderer::Impl {
+         const float scale = target.scene_twin ? target.scale : scale_for(stride);
+         std::uint32_t width = 0u, height = 0u;
+         size_for(stride, width, height);
+-        if (target.fbo == 0u || target.stride != stride || target.psp_width != width || target.scale != scale) {
++        if (target.unusable && frames < target.retry_frame && target.stride == stride && target.psp_width == width && target.scale == scale)
++            return target;
++        if (target.fbo == 0u || target.unusable || target.stride != stride || target.psp_width != width || target.scale != scale) {
+             flush();
+             const bool created = target.fbo == 0u;
+             target.stride = stride;
+@@ -958,8 +1058,11 @@ struct GlRenderer::Impl {
+             target.psp_width = width;
+             target.psp_height = height;
+             target.scale = scale;
+-            allocate_target(target);
+-            if (stride >= 512u && !target.scene_twin) scene_scale_prepare(target);   // the pre-allocated smaller twin, before any frame needs it
++            if (!allocate_target(target)) return target;
++            if (stride >= 512u && !target.scene_twin) {
++                scene_scale_prepare(target);   // the pre-allocated smaller twin, before any frame needs it
++                precreate_post(target);        // and FXAA's second texture, when the options can use it
++            }
+             if (pending_picture == &target) pending_picture = nullptr;   // the picture was in the old allocation
+             target.guest_words.clear();
+             if (created) ++st().targets_created;
+@@ -972,7 +1075,7 @@ struct GlRenderer::Impl {
+ 
+     Target *find_target(std::uint32_t address) {
+         const auto found = targets.find(GuestMemory::canonical(address));
+-        return found == targets.end() ? nullptr : found->second.get();
++        return found == targets.end() || found->second->unusable ? nullptr : found->second.get();
+     }
+ 
+     static std::uint32_t target_bytes(const Target &target) {
+@@ -2008,6 +2111,10 @@ struct GlRenderer::Impl {
+             bits |= GL_DEPTH_BUFFER_BIT;
+         }
+         if (bits != 0u) {
++            // A scene that begins with this clear, and the clear takes the whole depth buffer: there is nothing in it worth loading.
++            if (clear_depth && settings.scene_depth_trim && scene_fresh && rect[0] == 0 && rect[1] == 0 &&
++                rect[2] == static_cast<std::int32_t>(target->width) && rect[3] == static_cast<std::int32_t>(target->height))
++                glp::scene_hint(glp::kSceneDepthCleared);
+             glClear(bits);
+             ++st().clears;
+         }
+@@ -2370,6 +2477,131 @@ struct GlRenderer::Impl {
+         return true;
+     }
+ 
++    // ---- blends that change nothing (settings.blend_elide) ---------------------------------------------------------
++    // The decision is gl_blend_elide.hpp (tested on its own); this maps the plan's GL factors onto it and gathers the draw's alpha.
++
++    static blend_elide::Factor elide_factor(GLenum factor) {
++        switch (factor) {
++        case GL_ZERO: return blend_elide::Factor::Zero;
++        case GL_ONE: return blend_elide::Factor::One;
++        case GL_SRC_ALPHA: return blend_elide::Factor::SrcAlpha;
++        case GL_ONE_MINUS_SRC_ALPHA: return blend_elide::Factor::OneMinusSrcAlpha;
++        default: return blend_elide::Factor::Other;
++        }
++    }
++
++    static blend_elide::Equation elide_equation(GLenum equation) {
++        switch (equation) {
++        case GL_FUNC_SUBTRACT: return blend_elide::Equation::Subtract;
++        case GL_FUNC_REVERSE_SUBTRACT: return blend_elide::Equation::ReverseSubtract;
++        case GL_FUNC_ADD: return blend_elide::Equation::Add;
++        case 0x8007: return blend_elide::Equation::Min;   // GL_MIN_EXT
++        default: return blend_elide::Equation::Max;
++        }
++    }
++
++    // The blend of this draw leaves every fragment's colour as the shader wrote it.
++    bool blend_cannot_change_source(const DrawCall &call, const BlendPlan &plan, const TextureBinding &binding, bool textured,
++                                    bool lit, const GuestMemory &memory) {
++        // The fix-up that overrides the source alpha for the destination factor (a fixed colour on both sides) is not "the
++        // fragment's alpha": leave it alone.
++        if (plan.shader[0] > 3.5f) return false;
++        const blend_elide::Equation equation = elide_equation(plan.equation);
++        const blend_elide::Factor source = elide_factor(plan.source), destination = elide_factor(plan.destination);
++        // Cheap test first: could any alpha make this a source-only blend? (Then the facts, which may scan a texture, are worth it.)
++        if (!blend_elide::yields_source(equation, source, destination, {255u, 255u}) &&
++            !blend_elide::yields_source(equation, source, destination, {0u, 0u}))
++            return false;
++        alpha_test::Facts facts;
++        facts.texel = alpha_test::texel_alpha_use(textured, call.texture.alpha_from_texture, call.texture.function);
++        if (facts.texel != alpha_test::TexelAlpha::Replace) {
++            if (!colour_alpha_range(call, lit, facts.colour)) return false;
++        }
++        if (facts.texel != alpha_test::TexelAlpha::Unused) facts.texel_opaque = texel_alpha_is_255(call, binding, memory);
++        return blend_elide::yields_source(equation, source, destination, alpha_test::fragment_range(facts));
++    }
++
++    // The screen rectangle (pixels of the PSP picture) a draw covers, from up to 128 of its vertices (a sample for a big mesh,
++    // so a bounding box of a sample can be smaller than the draw). False when it cannot be known (no vertices, a vertex behind
++    // the eye). `transform` is the draw's clip transform, the column-major matrix the shader uses.
++    bool draw_bounds(const DrawCall &call, bool through, const Target &target, const float *transform, float *out) const {
++        const std::size_t count = call.vertices.size();
++        if (count == 0u) return false;
++        const std::size_t step = count > 128u ? (count + 127u) / 128u : 1u;
++        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++        const float width = static_cast<float>(target.psp_width), height = static_cast<float>(target.psp_height);
++        for (std::size_t i = 0; i < count; i += step) {
++            const auto &p = call.vertices[i].position;
++            float x, y;
++            if (through) {
++                x = p[0];
++                y = p[1];
++            } else {
++                const float w = transform[3] * p[0] + transform[7] * p[1] + transform[11] * p[2] + transform[15];
++                if (!(w > 1e-4f)) return false;
++                const float cx = transform[0] * p[0] + transform[4] * p[1] + transform[8] * p[2] + transform[12];
++                const float cy = transform[1] * p[0] + transform[5] * p[1] + transform[9] * p[2] + transform[13];
++                x = (cx / w * 0.5f + 0.5f) * width;
++                y = (0.5f - cy / w * 0.5f) * height;   // the sign does not matter to an overlap test
++            }
++            x0 = std::min(x0, x);
++            x1 = std::max(x1, x);
++            y0 = std::min(y0, y);
++            y1 = std::max(y1, y);
++        }
++        out[0] = std::max(x0, 0.0f);
++        out[1] = std::max(y0, 0.0f);
++        out[2] = std::min(x1, width);
++        out[3] = std::min(y1, height);
++        return out[2] > out[0] && out[3] > out[1];
++    }
++
++    // ---- the census of alpha-tested draws before opaque ones (settings.alpha_census) ---------------------------------
++    // A draw with a `discard` in its program cannot take part in hidden-surface removal, and the opaque draws drawn over it
++    // afterwards would not have been shaded at all had they come first. Counts the discard draws of a frame (on one target) that
++    // an opaque depth-writing draw covers some of afterwards: one per discard draw, with the pixels they share.
++    struct CensusRect {
++        float box[4];
++    };
++    static constexpr std::size_t kCensusRects = 48u;
++    CensusRect census_rects[kCensusRects]{};
++    std::size_t census_count{};
++    std::uint32_t census_target{};
++
++    void census_reset() { census_count = 0u; }
++
++    void census_note(const DrawCall &call, bool discard, bool opaque, bool through, const Target &target, const float *transform) {
++        if (!settings.alpha_census || (!discard && !(opaque && census_count != 0u))) return;
++        if (census_target != target.address) {
++            census_target = target.address;
++            census_count = 0u;
++        }
++        float box[4];
++        if (!draw_bounds(call, through, target, transform, box)) return;
++        if (discard) {
++            if (census_count < kCensusRects) {
++                std::memcpy(census_rects[census_count].box, box, sizeof(box));
++                ++census_count;
++            }
++            return;
++        }
++        std::size_t kept = 0u;
++        for (std::size_t i = 0; i < census_count; ++i) {
++            const float *r = census_rects[i].box;
++            const float w = std::min(r[2], box[2]) - std::max(r[0], box[0]);
++            const float h = std::min(r[3], box[3]) - std::max(r[1], box[1]);
++            if (w > 0.0f && h > 0.0f) {
++                ++st().alpha_early;
++                st().alpha_early_px += static_cast<std::uint64_t>(w * h);
++                perf::count_gl_event(perf::GlEvent::AlphaBeforeOpaque);
++                perf::count_gl_event(perf::GlEvent::AlphaBeforeOpaqueKpx, static_cast<std::uint64_t>(w * h) / 1000u);
++            } else {
++                census_rects[kept++] = census_rects[i];
++            }
++        }
++        census_count = kept;
++    }
++
+     // ---- draws that change nothing (settings.skip_invisible) -------------------------------------------------------
+ 
+     // Every fragment of an unlit draw has alpha 0: the vertex colours' (or the material's) alpha is 0 everywhere, and the
+@@ -2518,10 +2750,20 @@ struct GlRenderer::Impl {
+                 // The draw reads the picture it is drawing into: read a copy of it as it stands.
+                 flush();
+                 if (from.copy == 0u) {
++                    drain_gl_errors();
+                     glGenTextures(1, &from.copy);
++                    if (from.copy == 0u) return false;   // no free texture slot: this draw is skipped
+                     bind_texture(from.copy);
+                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(from.width),
+                                  static_cast<GLsizei>(from.height), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++                    if (!drain_gl_errors()) {
++                        std::cerr << "[gl] no memory for the feedback copy of target 0x" << std::hex << from.address << std::dec
++                                  << "; draws that sample their own target are skipped" << std::endl;
++                        glDeleteTextures(1, &from.copy);
++                        from.copy = 0u;
++                        return false;
++                    }
++                    note_late_creation("feedback copy", from.address);
+                     set_sampler(from.copy, GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+                     from.copy_serial = ~0ull;
+                 }
+@@ -2739,6 +2981,10 @@ struct GlRenderer::Impl {
+         }
+         if (call.target.color_stride >= 512u) scene_scale_step(call, memory);
+         Target &target = target_for(call.target.color_address, call.target.color_stride, call.target.color_format);
++        if (target.unusable) {
++            ++st().skipped_draws;
++            return;
++        }
+         resolve_picture(target);
+         if (target.last_drawn_frame != frames || target.guest_words.empty()) {
+             snapshot_guest_words(memory, target);
+@@ -2823,7 +3069,22 @@ struct GlRenderer::Impl {
+                            (((call.pixel_mask_rgb & 0xFF0000u) == 0xFF0000u) ? 0u : 4u) |
+                            ((call.pixel_mask_alpha & 0xFFu) == 0xFFu ? 0u : 8u);
+         // Blending.
+-        const BlendPlan blend = plan_blend(call.blend);
++        BlendPlan blend = plan_blend(call.blend);
++        bool blend_elided = false;
++        if (blend.enable) {
++            ++st().blend_draws;
++            perf::count_gl_event(perf::GlEvent::BlendDraws);
++            if (settings.blend_elide && blend_cannot_change_source(call, blend, binding, textured, lit, memory)) {
++                // Drawn as ONE / ZERO with blending off: the same colour, and the alpha written is the source's either way.
++                blend.enable = false;
++                blend.source = GL_ONE;
++                blend.destination = GL_ZERO;
++                blend.equation = GL_FUNC_ADD;
++                blend.constant = false;
++                std::fill(std::begin(blend.color), std::end(blend.color), 0.0f);
++                blend_elided = true;
++            }
++        }
+         state.blend_enable = blend.enable ? 1u : 0u;
+         state.blend_source = blend.source;
+         state.blend_destination = blend.destination;
+@@ -2980,6 +3241,21 @@ struct GlRenderer::Impl {
+         batch_open = true;
+         (void)before_indices;
+         if (merge && batch_indices.size() > 0u) ++st().merged;
++        if (blend_elided) {
++            ++st().blend_elided;
++            perf::count_gl_event(perf::GlEvent::BlendElided);
++            float box[4];
++            if (draw_bounds(call, through, target, state.transform, box)) {
++                const auto pixels = static_cast<std::uint64_t>((box[2] - box[0]) * (box[3] - box[1]));
++                st().blend_elided_px += pixels;
++                perf::count_gl_event(perf::GlEvent::BlendElidedKpx, pixels / 1000u);
++            }
++        }
++        if (settings.alpha_census) {
++            const bool opaque_draw = !alpha_test && !blend.enable && state.depth_test != 0u && state.depth_write != 0u &&
++                                     state.color_mask == 15u && !call.stencil.enabled;
++            census_note(call, alpha_test, opaque_draw, through, target, state.transform);
++        }
+         ++target.draw_serial;
+         ++target.draws;
+         if (settings.trace) {
+@@ -3096,6 +3372,7 @@ struct GlRenderer::Impl {
+         scene_scale_end(true);
+         flush();
+         Target &target = target_for(display_address, 512u, 3u);
++        if (target.unusable) return;
+         // upload_texture is about to change: a different target still waiting for its enlargement gets it now (the same
+         // target's waiting picture is replaced, never having been seen).
+         if (pending_picture != nullptr && pending_picture != &target) resolve_picture(*pending_picture);
+@@ -3135,6 +3412,7 @@ struct GlRenderer::Impl {
+         flush();
+         Target *target = find_target(display_address);
+         if (target == nullptr) target = &target_for(display_address, 512u, 3u);
++        if (target->unusable) return false;
+         presented = target->address;
+         has_presented = true;
+         // A 3D frame with no HUD after it (or one the trigger in submit() did not see) gets its FXAA now.
+@@ -3162,6 +3440,7 @@ struct GlRenderer::Impl {
+         // The options change between frames: the next frame sees what the overlay has set by now.
+         refresh_options(false);
+         scene_scale_frame_start();
++        census_reset();
+         hold_frame_cap();
+         return true;
+     }
+@@ -3240,6 +3519,13 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+     else if (name == "specialize") settings.specialize = flag;
+     else if (name == "alpha_elide") settings.alpha_elide = flag;
+     else if (name == "alpha_elide_range") settings.alpha_elide_range = flag;
++    else if (name == "blend_elide") settings.blend_elide = flag;
++    else if (name == "alpha_census") settings.alpha_census = flag;
++    else if (name == "target_precreate") settings.target_precreate = flag;
++    else if (name == "warm_check") settings.warm_check = flag;
++    else if (name == "vgl_gc_pause_ms") settings.vgl_gc_pause_ms = u32;
++    else if (name == "scene_depth_trim") settings.scene_depth_trim = flag;
++    else if (name == "scene_mask_skip") settings.scene_mask_skip = flag;
+     else if (name == "fxaa_quality") settings.fxaa_quality = (value == "high" || value == "1" || value == "full") ? 1u : 0u;
+     else if (name == "aa_auto") settings.aa_auto = std::min(u32, 2u);
+     else if (name == "aa_auto_retry_s") settings.aa_auto_retry_s = u32;
+@@ -3284,7 +3570,7 @@ bool apply_gl_setting(GlSettings &settings, const std::string &name, const std::
+ const std::vector<std::string> &gl_setting_names() {
+     static const std::vector<std::string> names = {
+         "display_scale", "display_scale_percent", "offscreen_scale", "no_blend_color", "through_depth", "texture_check_interval",
+-        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "fxaa_quality", "aa_auto", "scene_scale", "scene_scale_percent", "scene_scale_retry_s", "scene_scale_need_idle_us", "aa_auto_retry_s", "aa_auto_need_idle_us", "aa_auto_budget_ms", "aa_auto_min_frames", "test_slow_ms", "test_slow_from", "test_slow_frames", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
++        "writeback", "texture_budget_mb", "stats_every", "timing", "gpu_timing", "scratch_buffers", "texture_always_validate", "merge", "null_draw", "fill_test", "specialize", "alpha_elide", "alpha_elide_range", "blend_elide", "alpha_census", "target_precreate", "warm_check", "vgl_gc_pause_ms", "scene_depth_trim", "scene_mask_skip", "fxaa_quality", "aa_auto", "scene_scale", "scene_scale_percent", "scene_scale_retry_s", "scene_scale_need_idle_us", "aa_auto_retry_s", "aa_auto_need_idle_us", "aa_auto_budget_ms", "aa_auto_min_frames", "test_slow_ms", "test_slow_from", "test_slow_frames", "skip_invisible", "ui_upscale", "ui_upscale_budget_us", "ui_upscale_max_us", "prewarm", "variant_dir", "compact_vertices", "vgl_skip_redundant", "depth_bits", "target_textures",
+         "use_glclear", "quad_clear", "rect_clamp", "cull", "lighting", "fog", "alpha_test", "blend", "depth_test", "flip_winding",
+         "trace", "trace_targets", "draw_first", "draw_last"};
+     return names;
+@@ -3304,6 +3590,11 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     glp::disable_dither();
+     glp::skip_redundant_state(impl.settings.vgl_skip_redundant);
+     if (impl.settings.vgl_skip_redundant) std::cout << "[gl] vitaGL: GXM state the previous draw set is not set again\n";
++    if (glp::set_gc_pause_ms(impl.settings.vgl_gc_pause_ms))
++        std::cout << "[gl] vitaGL: a failed GPU allocation waits for the garbage collector at most " << impl.settings.vgl_gc_pause_ms
++                  << " ms" << (impl.settings.vgl_gc_pause_ms == 0u ? " (vitaGL's own second)" : "") << "\n";
++    if (glp::set_scene_options(impl.settings.scene_depth_trim, impl.settings.scene_mask_skip))
++        std::cout << "[gl] vitaGL: scene begin: depth trim " << impl.settings.scene_depth_trim << ", mask skip " << impl.settings.scene_mask_skip << "\n";
+     glEnable(GL_SCISSOR_TEST);
+     glEnableVertexAttribArray(0u);
+     glEnableVertexAttribArray(1u);
+@@ -3321,7 +3612,8 @@ bool GlRenderer::initialize(const RendererConfig &, std::string &error) {
+     {
+         const GlSettings &g = impl.settings;
+         std::cout << "[gl] speed features: specialize=" << g.specialize << " alpha_elide=" << g.alpha_elide << "/" << g.alpha_elide_range
+-                  << " skip_invisible=" << g.skip_invisible << " compact_vertices=" << g.compact_vertices
++                  << " blend_elide=" << g.blend_elide << " alpha_census=" << g.alpha_census << " target_precreate=" << g.target_precreate
++                  << " warm_check=" << g.warm_check << " skip_invisible=" << g.skip_invisible << " compact_vertices=" << g.compact_vertices
+                   << " vgl_skip_redundant=" << g.vgl_skip_redundant << " scratch_buffers=" << g.scratch_buffers
+                   << " merge=" << g.merge_draws << " ui_upscale=" << g.ui_upscale << " prewarm=" << g.prewarm
+                   << " fxaa_quality=" << (g.fxaa_quality == 0u ? "fast" : "high") << " aa_auto=" << g.aa_auto << " scene_scale=" << g.scene_scale << "/" << g.scene_scale_percent << "%\n";
+@@ -3484,7 +3776,10 @@ bool GlRenderer::warm_up_step(std::uint64_t quiet_us) {
+         } else if (impl.frames == 0u || quiet_us >= 20000u) {
+             impl.fxaa_warm_done = true;
+             const auto start = std::chrono::steady_clock::now();
++            const std::uint32_t compiled_before = impl.compiled_on_device;
+             const bool ok = impl.fxaa_program_for_pass() != nullptr;
++            if (impl.settings.warm_check && impl.compiled_on_device != compiled_before)
++                std::cerr << "[gl] warm-up check: the FXAA program was NOT in the shader cache and was compiled on the device\n";
+             std::cerr << "[gl] warm-up: the FXAA program " << (ok ? "is ready" : "FAILED") << ", "
+                       << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() << " ms\n";
+             return true;
+@@ -3506,11 +3801,14 @@ bool GlRenderer::warm_up_step(std::uint64_t quiet_us) {
+         if (!impl.warm_flags.empty())
+             std::cerr << "[gl] warm-up: " << impl.warm_linked << " of " << impl.warm_flags.size() << " listed programs linked, "
+                       << impl.warm_failed << " failed, " << impl.warm_us / 1000u << " ms of linking\n";
++        if (impl.settings.warm_check) impl.warm_check_report();
+         return false;
+     }
+     const auto start = std::chrono::steady_clock::now();
++    impl.last_link_compiled = false;
+     if (impl.find_or_link_program(impl.warm_flags[impl.warm_next]) != nullptr) ++impl.warm_linked;
+     else ++impl.warm_failed;
++    if (impl.last_link_compiled) ++impl.warm_compiled;
+     ++impl.warm_next;
+     impl.warm_us += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+     return true;
+diff --git a/host/gpu/gl/gl_renderer.hpp b/host/gpu/gl/gl_renderer.hpp
+index c3f3072..2897670 100644
+--- a/host/gpu/gl/gl_renderer.hpp
++++ b/host/gpu/gl/gl_renderer.hpp
+@@ -77,6 +77,31 @@ struct GlSettings {
+     // the lighting's ambient alpha, an opaque texture), not only "all 255": a fade of an opaque texture at a constant alpha
+     // passes "greater than 0" too. Off (gl_alpha_elide_range=0), only draws whose every fragment has alpha 255 lose the test.
+     bool alpha_elide_range{true};
++    // A blend that cannot change the source colour is drawn with blending off (gl_blend_elide.hpp: SRC_ALPHA / ONE_MINUS_SRC_ALPHA
++    // when every fragment has alpha 255, ONE / ZERO, ...). Exact: the picture is the same. On a tile-based GPU a draw without
++    // blending can take part in hidden-surface removal and does not read the destination. gl_blend_elide=0 keeps every blend.
++    bool blend_elide{true};
++    // Counts, per frame, alpha-tested draws (draws whose program has a `discard`) that come before an opaque depth-writing draw
++    // over the same screen area (the perf line's "discard-before-opaque"). Only counts; nothing is reordered. gl_alpha_census=0.
++    bool alpha_census{true};
++    // Make every render target the renderer can need before a frame needs it: with a display-sized target, the second texture
++    // FXAA draws into and the smaller twin of the scene scale rung (when the options can switch them on). A target made in the
++    // middle of a frame is a stall of tens of milliseconds on the console. A failed allocation is logged once and the feature
++    // that needed it is turned off. gl_target_precreate=0 makes them at first use.
++    bool target_precreate{true};
++    // At the end of the warm-up, check that every program of the variant lists was found in the shader cache (linked without a
++    // compile) and log the ones that had to be compiled. gl_warm_check=0 skips the check (the programs are linked as before).
++    bool warm_check{true};
++    // vitaGL only (the port's patch 0005): after a GPU allocation failed, vitaGL waits for its garbage collector to free memory; it
++    // slept a full second. This is the most it waits, in milliseconds (0: vitaGL's own second). gl_vgl_gc_pause_ms.
++    std::uint32_t vgl_gc_pause_ms{16};
++    // vitaGL only (patch 0007): a scene that begins with a clear of the whole depth buffer does not load the depth it is about to
++    // overwrite (the renderer says so before such a clear). Nothing is spared where depth is never loaded (the release library:
++    // vitaGL only loads it in a STORE_DEPTH_STENCIL build), and the counters say which it is. gl_scene_depth_trim=0 sends no hint.
++    bool scene_depth_trim{true};
++    // vitaGL only (patch 0007), an experiment that is off: a scene whose scissor is the whole target leaves out vitaGL's full-target
++    // mask-update draw. Whether the hardware's mask bit starts the way that needs is for a console run to find out. gl_scene_mask_skip.
++    bool scene_mask_skip{false};
+     // gfx.antialiasing=fxaa: 0 the cheaper pass (default: the edge test first, two blur taps for an edge pixel, vertex-stage tap
+     // coordinates, medium-precision colour), 1 the first version (nine taps for every pixel, four of them dependent reads).
+     // gl_fxaa_quality=fast|high. The cheaper pass falls back to the first if its program does not build.
+@@ -251,6 +276,15 @@ struct GlStats {
+     std::uint64_t clut_hash_bytes{};
+     std::uint64_t shader_compile_us{};
+     std::uint64_t unsupported_blend{};  // blend factors approximated
++    std::uint64_t blend_draws{};        // draws that reached the renderer with blending on (before gl_blend_elide)
++    std::uint64_t blend_elided{};       // ... of which drawn with blending off
++    std::uint64_t blend_elided_px{};    // screen pixels (bounding boxes) of those
++    std::uint64_t alpha_early{};        // alpha-tested draws followed by an opaque depth-writing draw over the same area
++    std::uint64_t alpha_early_px{};     // ... and the pixels the two share
++    std::uint64_t late_compiles{};      // programs compiled or linked outside the warm-up
++    std::uint64_t late_targets{};       // targets and extra textures made after the first frame of play
++    std::uint64_t post_textures{};      // FXAA second textures made (at the display target's creation, or when the options asked for FXAA)
++    std::uint64_t target_failures{};    // allocations of a target that failed (logged once each)
+     // Why a draw could not join the batch in flight: the state group that differed first
+     // (a draw can differ in several; it is counted once, under the first of these in order).
+     enum MergeBreak : std::size_t {
+diff --git a/host/perf/frame_stats.cpp b/host/perf/frame_stats.cpp
+index 7805d23..d78d74d 100644
+--- a/host/perf/frame_stats.cpp
++++ b/host/perf/frame_stats.cpp
+@@ -122,6 +122,8 @@ struct State {
+     std::uint64_t copy_sum{};
+     std::atomic<std::uint64_t> alpha_test_sum{};   // the GL thread counts, the reporting thread reads
+     std::atomic<std::uint64_t> alpha_dropped_sum{};
++    std::atomic<std::uint64_t> gl_event_sum[static_cast<std::size_t>(GlEvent::Count)]{};
++    std::atomic<std::uint64_t> gl_event_total[static_cast<std::size_t>(GlEvent::Count)]{};
+     std::uint64_t vertex_peak{};
+     std::uint64_t index_peak{};
+     StallTallies stall_sum{};
+@@ -146,7 +148,7 @@ State &state() {
+ }
+ 
+ void print(const Summary &s) {
+-    char line[512];
++    char line[768];
+     int length = std::snprintf(line, sizeof(line),
+                                "[perf] fps %.1f game %.1f speed %.0f%% | frame avg %.1f max %.1f ms | guest %.1f "
+                                "render %.1f wait %.1f ms | lists %.0f/s draws %.0f/%.0f | %s %ux%u",
+@@ -178,6 +180,19 @@ void print(const Summary &s) {
+     if (s.alpha_tested > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+         length += std::snprintf(line + length, sizeof(line) - length, " | alpha-test draws %.0f, without discard %.0f",
+                                 s.alpha_tested, s.alpha_dropped);
++    {
++        const auto &g = s.gl_events;
++        const auto at = [&g](GlEvent e) { return g[static_cast<std::size_t>(e)]; };
++        if (at(GlEvent::BlendDraws) > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
++            length += std::snprintf(line + length, sizeof(line) - length, " | blend draws %.0f, off %.0f (%.0f kpx)", at(GlEvent::BlendDraws),
++                                    at(GlEvent::BlendElided), at(GlEvent::BlendElidedKpx));
++        if (at(GlEvent::AlphaBeforeOpaque) > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
++            length += std::snprintf(line + length, sizeof(line) - length, " | discard-before-opaque %.1f (%.0f kpx)",
++                                    at(GlEvent::AlphaBeforeOpaque), at(GlEvent::AlphaBeforeOpaqueKpx));
++        if ((at(GlEvent::LateCompiles) > 0.0 || at(GlEvent::LateTargets) > 0.0) && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
++            length += std::snprintf(line + length, sizeof(line) - length, " | late: shaders %.0f targets %.0f", at(GlEvent::LateCompiles),
++                                    at(GlEvent::LateTargets));
++    }
+     if (s.overlay_ms > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+         length += std::snprintf(line + length, sizeof(line) - length, " | overlay %.2f ms", s.overlay_ms);
+     if (alternate().paths != 0u && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+@@ -269,6 +284,7 @@ void restart_measurement() {
+     s.pass_sum = s.copy_sum = s.cleared_pass_sum = 0u;
+     s.alpha_test_sum.store(0u, std::memory_order_relaxed);
+     s.alpha_dropped_sum.store(0u, std::memory_order_relaxed);
++    for (auto &e : s.gl_event_sum) e.store(0u, std::memory_order_relaxed);
+     s.stall_sum = StallTallies{};
+     s.gpu_sum_ms = s.gpu_max_ms = 0.0;
+     s.vertex_peak = s.index_peak = 0u;
+@@ -375,6 +391,11 @@ void count_target_copy() { ++state().copy_sum; }
+ void count_cleared_pass() { ++state().cleared_pass_sum; }
+ void count_alpha_test_draw() { state().alpha_test_sum.fetch_add(1u, std::memory_order_relaxed); }
+ void count_alpha_test_dropped() { state().alpha_dropped_sum.fetch_add(1u, std::memory_order_relaxed); }
++void count_gl_event(GlEvent event, std::uint64_t amount) {
++    const auto i = static_cast<std::size_t>(event);
++    state().gl_event_sum[i].fetch_add(amount, std::memory_order_relaxed);
++    state().gl_event_total[i].fetch_add(amount, std::memory_order_relaxed);
++}
+ 
+ void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes) {
+     State &s = state();
+@@ -490,6 +511,11 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
+     out.copies = static_cast<double>(s.copy_sum) / frames;
+     out.alpha_tested = static_cast<double>(s.alpha_test_sum.load(std::memory_order_relaxed)) / frames;
+     out.alpha_dropped = static_cast<double>(s.alpha_dropped_sum.load(std::memory_order_relaxed)) / frames;
++    for (std::size_t i = 0; i < static_cast<std::size_t>(GlEvent::Count); ++i) {
++        const bool total = i == static_cast<std::size_t>(GlEvent::LateCompiles) || i == static_cast<std::size_t>(GlEvent::LateTargets);
++        out.gl_events[i] = total ? static_cast<double>(s.gl_event_total[i].load(std::memory_order_relaxed))
++                                 : static_cast<double>(s.gl_event_sum[i].load(std::memory_order_relaxed)) / frames;
++    }
+     out.frame_avg_ms = s.presents != 0u ? s.present_sum_ms / presents : 0.0;
+     out.frame_max_ms = s.present_max_ms;
+     const double gpu_wait_ms = to_ms(s.wait_sum) / frames;
+@@ -540,6 +566,7 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
+     s.pass_sum = s.copy_sum = s.cleared_pass_sum = 0u;
+     s.alpha_test_sum.store(0u, std::memory_order_relaxed);
+     s.alpha_dropped_sum.store(0u, std::memory_order_relaxed);
++    for (auto &e : s.gl_event_sum) e.store(0u, std::memory_order_relaxed);
+     s.stall_sum = StallTallies{};
+     s.gpu_sum_ms = s.gpu_max_ms = 0.0;
+     s.vertex_peak = s.index_peak = 0u;
+diff --git a/host/perf/frame_stats.hpp b/host/perf/frame_stats.hpp
+index c301e61..33d79a7 100644
+--- a/host/perf/frame_stats.hpp
++++ b/host/perf/frame_stats.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <cstddef>
+ #include <chrono>
+ #include <cstdint>
+ #include <string>
+@@ -85,6 +86,19 @@ void count_cleared_pass();
+ // `discard`, which on a tile-based GPU keeps the hardware from hiding what is behind); shown per frame on the perf line.
+ void count_alpha_test_draw();
+ void count_alpha_test_dropped();
++// Renderer events counted per frame on the perf line (the GL thread counts, the reporting thread reads). Late* are not per
++// frame: totals since the start, because they should be 0 once play has begun.
++enum class GlEvent : std::uint32_t {
++    BlendDraws,        // draws that reached the renderer with blending on
++    BlendElided,       // ... of which drawn with blending off (the blend cannot change the source colour)
++    BlendElidedKpx,    // thousands of screen pixels those draws cover (2D draws exactly, 3D draws when measured)
++    AlphaBeforeOpaque, // alpha-tested (discard) draws that came before an opaque draw covering the same area
++    AlphaBeforeOpaqueKpx,
++    LateCompiles,      // shader programs compiled or linked outside the warm-up (during play)
++    LateTargets,       // render targets or their extra textures made after play began
++    Count
++};
++void count_gl_event(GlEvent event, std::uint64_t amount = 1u);
+ // Bytes of the vertex and index buffers one frame's draws took; the perf line
+ // shows the most a frame took in the second, against the room each frame has.
+ void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes);
+@@ -124,6 +138,7 @@ struct Summary {
+     double copies{};          // full-size render target copies and blits per frame
+     double alpha_tested{};    // draws with an alpha test that could reject, per frame
+     double alpha_dropped{};   // ... of which drawn without it
++    double gl_events[static_cast<std::size_t>(GlEvent::Count)]{};   // per frame (GlEvent::Late*: totals)
+     double frame_avg_ms{};
+     double frame_max_ms{};
+     double guest_ms{};
+diff --git a/tests/blend_elide_tests.cpp b/tests/blend_elide_tests.cpp
+new file mode 100644
+index 0000000..e4154ea
+--- /dev/null
++++ b/tests/blend_elide_tests.cpp
+@@ -0,0 +1,78 @@
++// When a blend can be left out (host/gpu/gl/gl_blend_elide.hpp): the decision table checked against a brute-force evaluation of
++// every 8-bit alpha, source and destination channel. No GL, no game.
++
++#include "gpu/gl/gl_blend_elide.hpp"
++
++#include <cstdio>
++
++namespace {
++
++using namespace portablekit::gpu::blend_elide;
++
++int g_failures = 0;
++
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++const Factor kFactors[] = {Factor::Zero, Factor::One, Factor::SrcAlpha, Factor::OneMinusSrcAlpha, Factor::Other};
++const Equation kEquations[] = {Equation::Add, Equation::Subtract, Equation::ReverseSubtract, Equation::Min, Equation::Max};
++
++// The blend gives the source channel, whatever the destination, for every alpha of the range (found by trying them all).
++// Other is a factor the table does not model: it is never the source.
++bool brute_force(Equation equation, Factor source, Factor destination, Range alpha) {
++    if (source == Factor::Other || destination == Factor::Other) return false;
++    for (std::uint32_t a = alpha.low; a <= alpha.high; ++a)
++        for (std::uint32_t s = 0; s < 256u; s += 5u)
++            for (std::uint32_t d = 0; d < 256u; d += 5u)
++                if (blend_value(equation, source, destination, a, s, d) != static_cast<std::int64_t>(s) * 255) return false;
++    return true;
++}
++
++} // namespace
++
++int main() {
++    // 1. Every equation and factor pair against every range that starts or ends at an extreme, plus interior ranges: the rule
++    //    says "drop" only where trying every alpha agrees, and drops everything such a brute force finds for those ranges.
++    {
++        bool sound = true, complete = true;
++        std::uint32_t rows = 0, dropped = 0;
++        const std::uint32_t edges[] = {0u, 1u, 2u, 127u, 128u, 253u, 254u, 255u};
++        for (Equation e : kEquations)
++            for (Factor s : kFactors)
++                for (Factor d : kFactors)
++                    for (std::uint32_t low : edges)
++                        for (std::uint32_t high : edges) {
++                            if (high < low) continue;
++                            const Range range{low, high};
++                            ++rows;
++                            const bool rule = yields_source(e, s, d, range), truth = brute_force(e, s, d, range);
++                            if (rule) ++dropped;
++                            if (rule && !truth) {
++                                sound = false;
++                                std::printf("     unsound: eq %d src %d dst %d alpha %u..%u\n", static_cast<int>(e), static_cast<int>(s), static_cast<int>(d), low, high);
++                            }
++                            if (!rule && truth) {
++                                complete = false;
++                                std::printf("     missed: eq %d src %d dst %d alpha %u..%u\n", static_cast<int>(e), static_cast<int>(s), static_cast<int>(d), low, high);
++                            }
++                        }
++        check(sound, "a blend is dropped only where every alpha, source and destination gives the source");
++        check(complete, "every blend that gives the source for the whole range is found");
++        std::printf("     (%u rows, %u dropped)\n", rows, dropped);
++    }
++    // 2. The rows Infected relies on.
++    check(yields_source(Equation::Add, Factor::SrcAlpha, Factor::OneMinusSrcAlpha, {255u, 255u}), "SRC_ALPHA / ONE_MINUS_SRC_ALPHA at alpha 255");
++    check(!yields_source(Equation::Add, Factor::SrcAlpha, Factor::OneMinusSrcAlpha, {254u, 255u}), "... not when alpha may be 254");
++    check(!yields_source(Equation::Add, Factor::SrcAlpha, Factor::OneMinusSrcAlpha, {0u, 255u}), "... not for the whole range");
++    check(!yields_source(Equation::Add, Factor::SrcAlpha, Factor::OneMinusSrcAlpha, {0u, 0u}), "... not at alpha 0 (that leaves the destination)");
++    check(yields_source(Equation::Add, Factor::One, Factor::Zero, {0u, 255u}), "ONE / ZERO whatever the alpha");
++    check(!yields_source(Equation::Add, Factor::One, Factor::One, {255u, 255u}), "ONE / ONE (additive) stays");
++    check(!yields_source(Equation::ReverseSubtract, Factor::One, Factor::Zero, {255u, 255u}), "reverse subtract stays");
++    check(!yields_source(Equation::Max, Factor::One, Factor::Zero, {255u, 255u}), "max stays");
++    check(yields_source(Equation::Add, Factor::OneMinusSrcAlpha, Factor::SrcAlpha, {0u, 0u}), "ONE_MINUS_SRC_ALPHA / SRC_ALPHA at alpha 0");
++    check(!yields_source(Equation::Add, Factor::One, Factor::Other, {255u, 255u}), "an unmodelled destination factor stays");
++    std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILED");
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tests/gl_synthetic_tests.cpp b/tests/gl_synthetic_tests.cpp
+new file mode 100644
+index 0000000..4e209a4
+--- /dev/null
++++ b/tests/gl_synthetic_tests.cpp
+@@ -0,0 +1,152 @@
++// The GL renderer driven by hand-made draws on the desktop driver (Mesa, no window): what this round's changes promise that
++// needs no game. Blend elision gives the same picture and counts what it dropped; the census counts an alpha-tested draw before
++// an opaque one; the display target's FXAA texture is made with the target and not in the middle of a frame; a failed allocation
++// is a skipped draw and not a crash. Skips (exit 0 with a note) when no GL driver can be had.
++
++#include "gpu/ge_state.hpp"
++#include "gpu/gl/gl_renderer.hpp"
++#include "gpu/renderer.hpp"
++#include "psprecomp/guest_memory.hpp"
++#include "settings/port_settings.hpp"
++
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++
++// renderer.cpp (the window title from the build label) is not part of this test.
++namespace portablekit::gpu {
++std::string default_window_title() { return "synthetic"; }
++}
++
++namespace {
++
++using namespace portablekit::gpu;
++
++int g_failures = 0;
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++
++constexpr std::uint32_t kDisplay = 0x04000000u;
++
++// A through-mode rectangle (a sprite) on the display target.
++DrawCall rect(float x0, float y0, float x1, float y1, std::uint32_t colour, float depth, bool blend, bool depth_write, bool alpha_test = false) {
++    DrawCall call;
++    call.primitive = PrimitiveType::Sprites;
++    call.through = true;
++    call.vertices.resize(2);
++    call.vertices[0].position = {x0, y0, depth, 1.0f};
++    call.vertices[1].position = {x1, y1, depth, 1.0f};
++    call.vertices[0].color = call.vertices[1].color = colour;
++    call.has_vertex_color = true;
++    call.target.color_address = kDisplay;
++    call.target.color_stride = 512u;
++    call.target.color_format = 3u;
++    call.viewport.scissor_x1 = 0u;
++    call.viewport.scissor_y1 = 0u;
++    call.viewport.scissor_x2 = 479u;
++    call.viewport.scissor_y2 = 271u;
++    call.depth.test_enabled = true;
++    call.depth.write_enabled = depth_write;
++    call.depth.function = 7u;   // greater or equal, the PSP's usual
++    call.blend.enabled = blend;
++    call.blend.source_factor = 2u;       // SRC_ALPHA
++    call.blend.destination_factor = 3u;  // ONE_MINUS_SRC_ALPHA
++    call.alpha_test.enabled = alpha_test;
++    call.alpha_test.function = 6u;       // greater than
++    call.alpha_test.reference = 0u;
++    return call;
++}
++
++struct Result {
++    std::vector<std::uint8_t> picture;
++    GlStats stats;
++    bool ok{};
++};
++
++// One frame: opaque red background, a blended opaque green square (alpha 255), a blended half-transparent blue square, an
++// alpha-tested half-transparent square followed by an opaque one over it.
++Result run(bool blend_elide, bool precreate) {
++    Result result;
++    portablekit::port::settings().set(portablekit::port::Key::GfxAntialiasing, static_cast<std::uint8_t>(portablekit::port::Antialiasing::Fxaa));   // FXAA chosen: its texture is made with the display target
++    GlRenderer renderer;
++    GlSettings settings = renderer.settings();
++    settings.display_scale = 1u;
++    settings.blend_elide = blend_elide;
++    settings.target_precreate = precreate;
++    settings.through_depth = true;
++    renderer.set_settings(settings);
++    std::string error;
++    if (!renderer.initialize(RendererConfig{}, error)) {
++        std::printf("note: no GL driver (%s)\n", error.c_str());
++        return result;
++    }
++    GuestMemory memory;
++    renderer.begin_display_list();
++    renderer.reset_frame_stats();
++    renderer.submit(rect(0, 0, 480, 272, 0xFF0000FFu, 100.0f, false, true), memory);          // red (ABGR: R is the low byte)
++    renderer.submit(rect(20, 20, 200, 120, 0xFF00FF00u, 200.0f, true, true), memory);         // green, alpha 255, blended
++    renderer.submit(rect(220, 20, 400, 120, 0x80FF0000u, 300.0f, true, true), memory);        // blue, alpha 128, blended
++    DrawCall tested = rect(20, 150, 200, 250, 0xFFFFFFFFu, 400.0f, false, true, true);                 // white, alpha-tested:
++    tested.vertices[0].color = 0x20FFFFFFu;                                                              // the alphas run from 32 to 255,
++    tested.alpha_test.reference = 0x80u;                                                                 // so "greater than 128" can fail
++    renderer.submit(tested, memory);
++    renderer.submit(rect(60, 170, 160, 230, 0xFF00FFFFu, 500.0f, false, true), memory);       // yellow, opaque, over it
++    renderer.flush();
++    result.stats = renderer.frame_stats();
++    renderer.present(kDisplay);
++    std::uint32_t width = 0, height = 0;
++    result.ok = renderer.read_presented(result.picture, width, height);
++    return result;
++}
++
++// A target the driver cannot make (a texture far over its size limit stands in for "no memory"): the draw is skipped, the
++// failure counted and logged, nothing crashes, and nothing is presented.
++bool failing_target_is_skipped(GlStats &stats) {
++    GlRenderer renderer;
++    GlSettings settings = renderer.settings();
++    settings.display_scale = 1000u;
++    renderer.set_settings(settings);
++    std::string error;
++    if (!renderer.initialize(RendererConfig{}, error)) return false;
++    GuestMemory memory;
++    renderer.begin_display_list();
++    renderer.reset_frame_stats();
++    renderer.submit(rect(0, 0, 480, 272, 0xFF0000FFu, 100.0f, false, true), memory);
++    renderer.submit(rect(0, 0, 480, 272, 0xFF00FF00u, 200.0f, false, true), memory);
++    renderer.flush();
++    stats = renderer.frame_stats();
++    return !renderer.present(kDisplay);
++}
++
++} // namespace
++
++int main() {
++    const Result with = run(true, true);
++    if (!with.ok) {
++        std::printf("skipped: the renderer could not start or present\n");
++        return 0;
++    }
++    const Result without = run(false, false);
++    check(without.ok, "second renderer runs");
++    check(with.picture == without.picture, "blend elision and precreation: the presented picture is byte-identical");
++    check(with.stats.blend_draws == 2u, "two draws reached the renderer with blending on");
++    check(with.stats.blend_elided == 1u, "the one with alpha 255 was drawn with blending off");
++    check(without.stats.blend_elided == 0u, "gl_blend_elide=0 keeps every blend");
++    check(with.stats.blend_elided_px >= 180u * 100u - 1u && with.stats.blend_elided_px <= 180u * 100u + 1u, "its area is counted (180 x 100 pixels)");
++    check(with.stats.alpha_early == 1u, "census: the alpha-tested draw before an opaque one over it is counted once");
++    check(with.stats.alpha_early_px == 100u * 60u, "census: the shared area is the opaque square (100 x 60)");
++    check(with.stats.late_targets == 0u && with.stats.target_failures == 0u, "no target was made late and none failed");
++    std::printf("     post textures made at target creation: %llu (without precreate: %llu)\n",
++                static_cast<unsigned long long>(with.stats.post_textures), static_cast<unsigned long long>(without.stats.post_textures));
++    check(with.stats.post_textures == 1u, "FXAA chosen: its second texture was made when the display target was");
++    check(with.stats.late_targets == 0u, "... and nothing was made late");
++    GlStats failed;
++    check(failing_target_is_skipped(failed), "a target that cannot be made: nothing is presented, nothing crashes");
++    check(failed.target_failures >= 1u && failed.skipped_draws >= 2u, "... the failure is counted and both draws are skipped");
++    std::printf("%s\n", g_failures == 0 ? "all passed" : "FAILED");
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tools/ge_replay/ge_replay.cpp b/tools/ge_replay/ge_replay.cpp
+index cf7b24c..6d748ed 100644
+--- a/tools/ge_replay/ge_replay.cpp
++++ b/tools/ge_replay/ge_replay.cpp
+@@ -1157,6 +1157,14 @@ int main(int argc, char **argv) {
+         line("alpha-tested draws (could reject)", t.alpha_tested);
+         line("... drawn without the test/discard", t.alpha_elided);
+         line("invisible draws skipped (alpha 0)", t.invisible_skipped);
++        line("draws with blending on (before gl_blend_elide)", t.blend_draws);
++        line("... drawn with blending off", t.blend_elided);
++        line("... screen pixels of those (bounding boxes)", t.blend_elided_px);
++        line("alpha-tested draws before an opaque one over them", t.alpha_early);
++        line("... pixels they share", t.alpha_early_px);
++        line("FXAA textures made", t.post_textures);
++        line("targets made after play began", t.late_targets);
++        line("target allocations that failed", t.target_failures);
+         line("textures uploaded at 2x (MMPX)", t.ui2x_textures);
+         line("... microseconds spent on them", t.ui2x_us);
+         line("... passes put off by the budget", t.ui2x_deferred);
+-- 
+2.43.0
+

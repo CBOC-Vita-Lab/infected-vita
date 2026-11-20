@@ -104,6 +104,14 @@ bool gl_shader_compiler_available() {
     return false;
 }
 
+// vitaGL patch 0006: a scene that would not begin (after eight tries): the library stops the process after this returns.
+// vitaGL's own log is compiled out of the release build, so this is the only trace of why the app went back to the home screen.
+static void scene_fail_cb(int gxm_error, int on_display) {
+    logf("GL: FATAL sceGxmBeginScene refused (0x%08X) on %s after 8 tries: stopping instead of drawing into a scene that never began",
+         (unsigned)gxm_error, on_display ? "the display" : "a framebuffer object");
+    log_flush();
+}
+
 bool gl_init(const GlParams& p) {
     if (g_gl_ready) return true;
 
@@ -119,6 +127,7 @@ bool gl_init(const GlParams& p) {
     }
 
     // 2. vitaGL options that must be set before vglInit*
+    vglSetSceneFailCallback(scene_fail_cb);
     if (p.shader_cache_dir) {
         char path[200];
         if (path_resolve(Root::Data, p.shader_cache_dir, path, sizeof(path))) {
