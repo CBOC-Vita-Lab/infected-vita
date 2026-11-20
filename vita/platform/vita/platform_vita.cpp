@@ -2,6 +2,9 @@
 // Audio lives in audio_vita.cpp, GL in gl_vita.cpp. All SDK signatures used here were checked against
 // $VITASDK/arm-vita-eabi/include (see LOG.md); anything not checkable offline is marked UNVERIFIED.
 #include "../platform.h"
+#include "../file_replace.h"
+#include "../log_queue.h"
+#include "../retry.h"
 
 #include <atomic>
 #include <malloc.h>
@@ -24,6 +27,7 @@
 #include <psp2/kernel/modulemgr.h>
 #include <taihen.h>
 #include <psp2/power.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
 
 namespace plat {
@@ -51,7 +55,8 @@ static int core3_probe_main(SceSize, void*) {
     g_probe_cpu = (int)sceKernelGetCpuId();
     return 0;
 }
-static bool core3_probe() {
+static bool core3_probe_once() {
+    g_probe_cpu = -1;
     SceUID id = sceKernelCreateThread("core3-probe", core3_probe_main, prio_abs(0), 0x4000, 0, kCpu3Mask, nullptr);
     if (id < 0) {
         logf("core3: a thread on the CPU 3 mask is refused (0x%08X): the fourth core is reserved for the system here", (unsigned)id);
@@ -69,6 +74,19 @@ static bool core3_probe() {
     logf("core3: probe thread ran on CPU %d (start rc=0x%08X): %s", g_probe_cpu, (unsigned)rc,
          usable ? "the fourth core is usable" : "not usable, helper threads stay on core 2");
     return usable;
+}
+
+// One probe can miss for a moment (the thread placed elsewhere, a slow start): it is tried up to g_core3_retries times, a few
+// milliseconds apart, and the number of tries is logged.
+static int g_core3_retries = 6;
+static int g_core3_tries = 0;
+static bool core3_probe() {
+    int tried = 0;
+    const int won = retry_probe(g_core3_retries < 1 ? 1 : g_core3_retries, [](int) { return core3_probe_once(); },
+                                [](int n) { logf("core3: probe try %d failed, trying again", n); sceKernelDelayThread(8000); }, &tried);
+    g_core3_tries = tried;
+    if (tried > 1) logf("core3: probe %s after %d tries", won ? "worked" : "did not work", tried);
+    return won != 0;
 }
 
 // The package's own kernel module (vita/core3/core3.c) that lets the CPU 3 mask through: loaded from app0: through taiHEN, which every
@@ -148,6 +166,45 @@ bool core3_usable() {
     return g_core3_state == 1;
 }
 int helper_core() { return core3_usable() ? 3 : 2; }
+void core3_retry_set(int attempts) { g_core3_retries = attempts < 1 ? 1 : (attempts > 20 ? 20 : attempts); }
+
+// Threads that were started for core 3: after a lost core (resume) or three late periods they are moved to core 2.
+static const int kMaxHelpers = 12;
+static Thread* g_helpers[kMaxHelpers];
+static std::atomic<int> g_helpers_lock{0};
+static void helpers_lock() { while (g_helpers_lock.exchange(1, std::memory_order_acquire)) sceKernelDelayThread(50); }
+static void helpers_unlock() { g_helpers_lock.store(0, std::memory_order_release); }
+static std::atomic<uint32_t> g_c3_late{0}, g_c3_moved{0};
+static bool g_c3_watch = true;
+Core3Stats core3_stats() {
+    Core3Stats c;
+    c.probe_tries = g_core3_tries;
+    c.late_periods = g_c3_late.load();
+    c.threads_moved = g_c3_moved.load();
+    return c;
+}
+void core3_watch_set(bool on) { g_c3_watch = on; }
+bool core3_watch_on() { return g_c3_watch; }
+
+bool core3_period(const char* who, uint64_t gap_us, uint64_t period_us) {
+    // thread_local would be one more thing to get wrong on this C library: the caller (the pump) is the only user per name
+    static LateCounter counter;
+    if (!g_c3_watch || sceKernelGetCpuId() != 3) { counter.in_a_row = 0; return false; }
+    const bool late = period_is_late(gap_us, period_us, 3, 1500000);
+    if (late) {
+        const uint32_t n = ++g_c3_late;
+        if (n <= 20 || n % 100 == 0)
+            logf("core3 watchdog: %s missed its deadline: a period of %u us took %u us (late period %u, %d in a row)", who, (unsigned)period_us,
+                 (unsigned)gap_us, (unsigned)n, counter.in_a_row + 1);
+    }
+    const bool move = counter.note(late, 3);
+    if (move) {
+        counter.in_a_row = 0;
+        g_c3_moved++;
+        logf("core3 watchdog: %s moves to core 2 (three late periods in a row)", who);
+    }
+    return move;
+}
 
 static int core_mask(int core) {
     if (core == 3) return core3_usable() ? kCpu3Mask : SCE_KERNEL_CPU_MASK_USER_2;
@@ -186,20 +243,127 @@ static void log_flush_locked() {
     }
 }
 
-void log_raw(const char* text, size_t len) {
-    if (!len) return;
+// Writes straight to the file under the log lock (the synchronous path: before the writer thread starts, in log_sync mode, and
+// for what the writer takes from the queue).
+static void log_write_direct(const char* text, size_t len) {
     log_lock();
     if (g_log_fd >= 0) {
         sceIoWrite(g_log_fd, text, len);
         if (g_log_sync) log_flush_locked();
     }
     log_unlock();
-    // mirror (sceClibPrintf has a small internal buffer; the file is the authoritative record)
+}
+
+static void log_mirror(const char* text, size_t len) {
+    // sceClibPrintf has a small internal buffer; the file is the authoritative record
     char tmp[256];
     size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
     memcpy(tmp, text, n);
     tmp[n] = 0;
     sceClibPrintf("%s", tmp);
+}
+
+// ---- the queue and its writer thread
+static LogQueue g_logq;
+static std::atomic<bool> g_log_async{false};
+static std::atomic<bool> g_log_writer_run{false};
+static std::atomic<uint32_t> g_log_max_depth{0};
+static Thread* g_log_writer = nullptr;
+static SceKernelLwMutexWork g_drain_mtx;   // one consumer at a time: the writer thread, or a caller of log_flush / log_async_stop
+static bool g_drain_mtx_ok = false;
+
+// Takes what is queued and writes it to the file in as few calls as it can. Returns the lines taken.
+static uint32_t log_drain() {
+    if (!g_logq.ready()) return 0;
+    static char stage[16 * 1024];
+    static char line[LogQueue::kSlotBytes];
+    if (g_drain_mtx_ok) sceKernelLockLwMutex(&g_drain_mtx, 1, nullptr);
+    const uint32_t depth = g_logq.depth();
+    if (depth > g_log_max_depth.load(std::memory_order_relaxed)) g_log_max_depth.store(depth, std::memory_order_relaxed);
+    uint32_t taken = 0;
+    size_t used = 0;
+    size_t len = 0;
+    while (g_logq.pop(line, &len)) {
+        if (used + len > sizeof(stage)) {
+            log_write_direct(stage, used);
+            used = 0;
+        }
+        memcpy(stage + used, line, len);
+        used += len;
+        log_mirror(line, len);
+        taken++;
+    }
+    const uint64_t lost = g_logq.take_dropped();
+    if (lost) {
+        char note[96];
+        const int n = snprintf(note, sizeof(note), "[log] %llu line(s) dropped: the log queue was full\n", (unsigned long long)lost);
+        if (used + (size_t)n > sizeof(stage)) { log_write_direct(stage, used); used = 0; }
+        memcpy(stage + used, note, (size_t)n);
+        used += (size_t)n;
+    }
+    if (used) log_write_direct(stage, used);
+    if (g_drain_mtx_ok) sceKernelUnlockLwMutex(&g_drain_mtx, 1);
+    return taken;
+}
+
+static void log_writer_main(void*) {
+    while (g_log_writer_run.load(std::memory_order_acquire)) {
+        if (log_drain() == 0) sceKernelDelayThread(20000);
+        else sceKernelDelayThread(2000);   // let more lines gather: one write for many
+    }
+}
+
+bool log_async_start(int core) {
+    if (g_log_async.load() || g_log_sync) return g_log_async.load();
+    if (!g_log_mtx_ok) return false;
+    if (!g_drain_mtx_ok && sceKernelCreateLwMutex(&g_drain_mtx, "plat-log-drain", 0, 0, nullptr) >= 0) g_drain_mtx_ok = true;
+    if (!g_logq.ready() && !g_logq.init(256)) {
+        logf("log: no memory for the log queue, lines are written by their callers");
+        return false;
+    }
+    g_log_writer_run = true;
+    ThreadDesc d;
+    d.name = "plat-log";
+    d.fn = log_writer_main;
+    d.core = core == 0 ? 2 : core;   // never core 0: that is the guest
+    d.priority = 28;                 // the least urgent of the platform's threads
+    d.stack_bytes = 32 * 1024;
+    g_log_writer = thread_start(d);
+    if (!g_log_writer) {
+        g_log_writer_run = false;
+        logf("log: the log writer thread did not start, lines are written by their callers");
+        return false;
+    }
+    g_log_async = true;
+    logf("log: asynchronous, a queue of 256 lines drained by a writer thread on core %d (config.txt log_async=0 writes in the caller)", d.core);
+    return true;
+}
+
+void log_async_stop() {
+    if (!g_log_async.exchange(false)) return;
+    g_log_writer_run = false;
+    thread_join(g_log_writer);
+    g_log_writer = nullptr;
+    log_drain();
+}
+
+LogStats log_stats() {
+    LogStats st;
+    st.async = g_log_async.load();
+    st.queued = g_logq.pushed();
+    st.dropped = g_logq.dropped();
+    st.max_depth = g_log_max_depth.load(std::memory_order_relaxed);
+    return st;
+}
+
+void log_raw(const char* text, size_t len) {
+    if (!len) return;
+    if (g_log_async.load(std::memory_order_acquire) && !g_log_sync) {
+        g_logq.push(text, len);   // false: full, counted, reported by the writer
+        return;
+    }
+    log_write_direct(text, len);
+    log_mirror(text, len);
 }
 
 void logf(const char* fmt, ...) {
@@ -221,11 +385,15 @@ void logf(const char* fmt, ...) {
 }
 
 void log_flush() {
+    if (g_log_async.load()) log_drain();
     log_lock();
     log_flush_locked();
     log_unlock();
 }
-void log_set_sync(bool on) { g_log_sync = on; }
+void log_set_sync(bool on) {
+    if (on && g_log_async.load()) log_drain();   // what is queued goes first; later lines are written in order by their callers
+    g_log_sync = on;
+}
 const char* log_path() { return g_log_path; }
 
 // Referenced by the debug vitaGL (built with -DsceClibPrintf=vgl_hook_printf): every vitaGL / vitaShaRK message ends up in the log.
@@ -335,7 +503,23 @@ struct File {
     size_t cap = 0;
     size_t buf_off = 0;     // Read: next unread byte in buf        Write: unused
     size_t buf_len = 0;     // Read: valid bytes in buf             Write: pending bytes
+    char path[256] = {0};   // Read mode: to open the file again when a read fails (stale handle after sleep)
 };
+
+static std::atomic<uint32_t> g_file_reopens{0};
+// A read that fails (sceIoRead < 0) on a file that was fine: the descriptor may have gone stale while the console slept. Open it again,
+// seek back to where it was and let the caller read once more. One try per failed read.
+static bool file_reopen_for_read(File* f) {
+    if (f->mode != FileMode::Read || !f->path[0]) return false;
+    const SceUID fd = sceIoOpen(f->path, SCE_O_RDONLY, 0);
+    if (fd < 0) return false;
+    if (sceIoLseek(fd, f->phys, SCE_SEEK_SET) < 0) { sceIoClose(fd); return false; }
+    sceIoClose(f->fd);
+    f->fd = fd;
+    g_file_reopens++;
+    logf("file: %s read failed, opened again at %lld", f->path, (long long)f->phys);
+    return true;
+}
 
 File* file_open(Root r, const char* rel, FileMode m, size_t buffer_bytes) {
     char full[256];
@@ -352,6 +536,7 @@ File* file_open(Root r, const char* rel, FileMode m, size_t buffer_bytes) {
     File* f = new File();
     f->fd = fd;
     f->mode = m;
+    if (m == FileMode::Read) snprintf(f->path, sizeof(f->path), "%s", full);
     if (m == FileMode::Read) {
         SceOff end = sceIoLseek(fd, 0, SCE_SEEK_END);
         sceIoLseek(fd, 0, SCE_SEEK_SET);
@@ -419,12 +604,14 @@ size_t file_read(File* f, void* dst, size_t n) {
         size_t want = n - done;
         if (!f->buf || want >= f->cap) {  // large request: straight into the destination
             SceSSize r = sceIoRead(f->fd, out + done, want);
+            if (r < 0 && file_reopen_for_read(f)) r = sceIoRead(f->fd, out + done, want);
             if (r <= 0) break;
             f->phys += r;
             done += (size_t)r;
             if ((size_t)r < want) break;
         } else {
             SceSSize r = sceIoRead(f->fd, f->buf, f->cap);
+            if (r < 0 && file_reopen_for_read(f)) r = sceIoRead(f->fd, f->buf, f->cap);
             if (r <= 0) break;
             f->phys += r;
             f->buf_off = 0;
@@ -683,11 +870,21 @@ Thread* thread_start(const ThreadDesc& d) {
         delete t;
         return nullptr;
     }
+    if (d.core == 3 && core3_usable()) {
+        helpers_lock();
+        for (int i = 0; i < kMaxHelpers; i++)
+            if (!g_helpers[i]) { g_helpers[i] = t; break; }
+        helpers_unlock();
+    }
     return t;
 }
 
 void thread_join(Thread* t) {
     if (!t) return;
+    helpers_lock();
+    for (int i = 0; i < kMaxHelpers; i++)
+        if (g_helpers[i] == t) g_helpers[i] = nullptr;
+    helpers_unlock();
     int stat = 0;
     sceKernelWaitThreadEnd(t->thid, &stat, nullptr);
     sceKernelDeleteThread(t->thid);
@@ -700,6 +897,29 @@ int thread_current_core() { return (int)sceKernelGetCpuId(); }
 bool thread_set_core(Thread* t, int core) {
     SceUID id = t ? t->thid : sceKernelGetThreadId();
     return sceKernelChangeThreadCpuAffinityMask(id, core_mask(core)) >= 0;
+}
+
+bool core3_reprobe() {
+    if (!g_core3_allowed) return false;
+    const bool was = g_core3_state == 1;
+    if (g_core3_state < 0) return core3_usable();
+    const bool now = core3_probe();
+    if (was && !now) {
+        g_core3_state = 0;   // core_mask(3) now answers core 2
+        int moved = 0;
+        helpers_lock();
+        for (int i = 0; i < kMaxHelpers; i++)
+            if (g_helpers[i] && thread_set_core(g_helpers[i], 3)) moved++;
+        helpers_unlock();
+        g_c3_moved += (uint32_t)moved;
+        logf("core3: after the resume the fourth core is gone: %d helper thread(s) moved to core 2", moved);
+    } else if (!was && now) {
+        g_core3_state = 1;
+        logf("core3: after the resume the fourth core is usable (threads already running stay where they are)");
+    } else {
+        logf("core3: after the resume the fourth core is %s, helper threads stay valid", now ? "still usable" : "still unavailable");
+    }
+    return g_core3_state == 1;
 }
 
 bool thread_set_priority(Thread* t, int priority) {
@@ -811,7 +1031,17 @@ bool psvshell_installed() {
     return sceIoGetstat("ur0:tai/PSVshellPlus_Kernel.skprx", &st) >= 0 || sceIoGetstat(kProfileDir, &st) >= 0;
 }
 
+static bool io_rename(const char* a, const char* b) { return sceIoRename(a, b) >= 0; }
+static bool io_remove(const char* p) { return sceIoRemove(p) >= 0; }
+static bool io_exists(const char* p) { SceIoStat st; return sceIoGetstat(p, &st) >= 0; }
+static const filereplace::Ops& sceio_ops() {
+    static const filereplace::Ops ops{&io_rename, &io_remove, &io_exists};
+    return ops;
+}
+
 int psvshell_profile_set(int mhz) {
+    // A run killed between the two renames left INFC00001.bak and no profile: the old one comes back first.
+    if (filereplace::recover(sceio_ops(), kProfilePath)) logf("clock: the PSVshellPlus profile was restored from its .bak");
     unsigned char want[28], v444[28];
     memcpy(want, kProfile500, sizeof(want));
     memcpy(v444, kProfile500, sizeof(v444));
@@ -848,13 +1078,9 @@ int psvshell_profile_set(int mhz) {
         sceIoRemove(kProfileTmp);
         return -2;
     }
-    int rc = sceIoRename(kProfileTmp, kProfilePath);
-    if (rc < 0 && in >= 0) {                            // a firmware whose rename will not replace a file: remove the old one first
-        sceIoRemove(kProfilePath);
-        rc = sceIoRename(kProfileTmp, kProfilePath);
-    }
-    if (rc < 0) {
-        logf("clock: cannot rename the profile into place (0x%08X)", (unsigned)rc);
+    // sceIoRename may refuse an existing target: filereplace moves the old profile to .bak first (and never leaves a moment with none)
+    if (filereplace::replace(sceio_ops(), kProfileTmp, kProfilePath) == filereplace::Result::Failed) {
+        logf("clock: cannot rename the profile into place");
         sceIoRemove(kProfileTmp);
         return -2;
     }
@@ -862,7 +1088,9 @@ int psvshell_profile_set(int mhz) {
     return 1;
 }
 
+static int g_arm_requested = 0;   // the last ARM clock the application asked for: put back after a resume
 int clock_set_arm(int mhz, int* applied_mhz) {
+    g_arm_requested = mhz;
     const int rc = scePowerSetArmClockFrequency(mhz);
     const int now = scePowerGetArmClockFrequency();
     if (applied_mhz) *applied_mhz = now;
@@ -870,10 +1098,109 @@ int clock_set_arm(int mhz, int* applied_mhz) {
     return rc;
 }
 
+// ------------------------------------------------------------------------------------------------ power
+static bool g_power_tick_on = true;
+static std::atomic<uint64_t> g_power_ticks{0};
+static std::atomic<uint64_t> g_power_last_us{0};
+void power_tick_set(bool on) { g_power_tick_on = on; }
+uint64_t power_tick_count() { return g_power_ticks.load(); }
+void power_tick(uint32_t min_interval_ms) {
+    if (!g_power_tick_on) return;
+    const uint64_t now = now_us();
+    const uint64_t last = g_power_last_us.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < (uint64_t)min_interval_ms * 1000u) return;
+    g_power_last_us.store(now, std::memory_order_relaxed);
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);   // the console does not suspend by itself
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);       // the screen does not switch off
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_DIMMING);   // and does not dim first
+    g_power_ticks++;
+}
+
+static const int kMaxResumeHandlers = 8;
+static ResumeHandler g_resume_handlers[kMaxResumeHandlers];
+static std::atomic<uint32_t> g_suspends{0}, g_resumes{0};
+static std::atomic<int> g_mhz_after_resume{0};
+static std::atomic<uint64_t> g_last_resume_us{0};
+void resume_handler_add(ResumeHandler h) {
+    for (int i = 0; i < kMaxResumeHandlers; i++)
+        if (!g_resume_handlers[i]) { g_resume_handlers[i] = h; return; }
+}
+PowerStats power_stats() {
+    PowerStats p;
+    p.suspends = g_suspends.load();
+    p.resumes = g_resumes.load();
+    p.mhz_after_resume = g_mhz_after_resume.load();
+    return p;
+}
+void audio_note_resume();   // audio_vita.cpp
+
+static const unsigned kPowerSuspendBits = SCE_POWER_CB_SYSTEM_SUSPEND | SCE_POWER_CB_APP_SUSPEND;
+static const unsigned kPowerResumeBits = SCE_POWER_CB_SYSTEM_RESUME | SCE_POWER_CB_SYSTEM_RESUMING | SCE_POWER_CB_APP_RESUME |
+                                         SCE_POWER_CB_APP_RESUMING | SCE_POWER_CB_AFTER_SYSTEM_RESUME;
+
+// What is done once after the console came back (the notification comes in several bits, one after the other: the first one counts).
+static void do_resume() {
+    const uint32_t n = ++g_resumes;
+    sceKernelDelayThread(300000);   // let the system settle: the pad, the card and the audio device wake up
+    logf("resume %u: the console is back; re-checking the clock, core 3, the audio port and the disc image", (unsigned)n);
+    if (g_arm_requested > 0 && scePowerGetArmClockFrequency() != g_arm_requested) {
+        const int rc = scePowerSetArmClockFrequency(g_arm_requested);
+        logf("resume %u: the ARM clock was %d MHz, asked for %d again (rc=0x%08X), now %d MHz", (unsigned)n, scePowerGetArmClockFrequency(),
+             g_arm_requested, (unsigned)rc, scePowerGetArmClockFrequency());
+    }
+    const int mhz = clock_measure_mhz();
+    g_mhz_after_resume = mhz;
+    logf("resume %u: the ARM core measures %d MHz (the system reports %d); core 3 %s", (unsigned)n, mhz, scePowerGetArmClockFrequency(),
+         core3_reprobe() ? "usable" : "not in use");
+    audio_note_resume();
+    for (int i = 0; i < kMaxResumeHandlers; i++)
+        if (g_resume_handlers[i]) g_resume_handlers[i]();
+}
+
+static int power_callback(int, int, int arg, void*) {
+    const unsigned bits = (unsigned)arg;
+    if (bits & kPowerSuspendBits) {
+        const uint32_t n = ++g_suspends;
+        logf("suspend %u: power callback 0x%08X", (unsigned)n, bits);
+    }
+    if (bits & kPowerResumeBits) {
+        // SYSTEM_RESUMING, SYSTEM_RESUME and APP_RESUME arrive within a moment of each other: one resume.
+        const uint64_t now = now_us();
+        const uint64_t last = g_last_resume_us.load();
+        if (last == 0 || now - last > 3000000u) {
+            g_last_resume_us = now;
+            logf("resume: power callback 0x%08X", bits);
+            do_resume();
+        }
+    }
+    return 0;
+}
+
+static int power_thread_main(SceSize, void*) {
+    const SceUID cb = sceKernelCreateCallback("infected-power", 0, power_callback, nullptr);
+    if (cb < 0) {
+        logf("power: sceKernelCreateCallback failed 0x%08X: suspend and resume are not handled", (unsigned)cb);
+        return 0;
+    }
+    const int rc = scePowerRegisterCallback(cb);
+    logf("power: callback registered (rc=0x%08X): a resume re-checks the clock, core 3, the audio port and the disc image", (unsigned)rc);
+    for (;;) sceKernelDelayThreadCB(250000);   // callbacks run inside a callback-aware wait of the thread that made them
+    return 0;
+}
+
+void power_callbacks_start() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    const SceUID id = sceKernelCreateThread("plat-power", power_thread_main, prio_abs(20), 0x4000, 0, SCE_KERNEL_CPU_MASK_USER_2, nullptr);
+    if (id < 0 || sceKernelStartThread(id, 0, nullptr) < 0) logf("power: the callback thread did not start (0x%08X)", (unsigned)id);
+}
+
 // ------------------------------------------------------------------------------------------------ lifecycle
 bool init(const InitParams& p) {
     g_t0 = now_us();
     if (sceKernelCreateLwMutex(&g_log_mtx, "plat-log", 0, 0, nullptr) >= 0) g_log_mtx_ok = true;
+    if (sceKernelCreateLwMutex(&g_drain_mtx, "plat-log-drain", 0, 0, nullptr) >= 0) g_drain_mtx_ok = true;
     bool ok = dir_make(Root::Data, "");
     if (p.log_file) {
         char full[256];
@@ -895,6 +1222,7 @@ void shutdown() {
     audio_close();
     core3_release();
     logf("platform shutdown");
+    log_async_stop();   // the queue is written out before the file is closed
     log_lock();
     if (g_log_fd >= 0) { sceIoClose(g_log_fd); g_log_fd = -1; }
     log_unlock();

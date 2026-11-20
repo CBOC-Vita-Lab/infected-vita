@@ -60,6 +60,20 @@ void log_raw(const char* text, size_t len);   // no prefix, no newline added (us
 void log_flush();                              // push everything to the filesystem layer now (Vita: sceIoSyncByFd)
 void log_set_sync(bool on);                    // same as InitParams::log_sync_each_line, but switchable after init (e.g. from a config file)
 const char* log_path();                        // full path of the log file ("" if none)
+// Asynchronous log writing (Vita): after log_async_start the callers of logf/log_raw only copy their line into a queue (log_queue.h:
+// many writers, one reader, no lock, no file call) and a writer thread of low priority, on `core` (never core 0), writes the file
+// and mirrors the line to the debug console. A full queue drops the new line and counts it. log_set_sync(true) (config.txt
+// log_sync=1, for crash hunting) bypasses the queue: every line is written, and synced, before logf returns. log_flush() drains
+// the queue in the caller and syncs the file. Desktop: no queue, logf writes at once (log_async_start returns false).
+bool log_async_start(int core);
+void log_async_stop();                         // drains, stops the writer; later lines are written by their callers again
+struct LogStats {
+    bool async = false;
+    uint64_t queued = 0;                       // lines that went through the queue
+    uint64_t dropped = 0;                      // lines lost to a full queue
+    uint32_t max_depth = 0;                    // most lines waiting that the writer saw
+};
+LogStats log_stats();
 
 // ============================================================================================ clock
 // Monotonic microseconds since process start. Vita: sceKernelGetProcessTimeWide (64 bit, no wrap). Never goes backwards.
@@ -94,6 +108,25 @@ ClockReport clocks_read();                     // read only
 // the best of three runs, about 12 ms in all). A PSVshellPlus profile runs the CPU at 500 MHz while scePowerGetArmClockFrequency
 // still answers 444, so this is the number to trust. Desktop: 0.
 int clock_measure_mhz();
+
+// ============================================================================================ power
+// Vita: sceKernelPowerTick keeps the screen from dimming and switching off and the console from suspending by itself while the
+// game runs (a movie or an attract loop takes no input for minutes). power_tick() makes the three calls (auto suspend, OLED off,
+// OLED dimming) at most once per `min_interval_ms`. config.txt power_tick=0 turns it off. Desktop: nothing.
+void power_tick_set(bool on);
+void power_tick(uint32_t min_interval_ms);
+uint64_t power_tick_count();
+// Suspend and resume. power_callbacks_start() registers a power callback (scePowerRegisterCallback) handled on a thread of its
+// own. On a resume it re-probes core 3 (core3_reprobe), puts the ARM clock back and measures it (logged), tells the audio pump to
+// check its port, and then calls every handler added with resume_handler_add (on that thread; keep them short).
+using ResumeHandler = void (*)();
+void resume_handler_add(ResumeHandler h);
+void power_callbacks_start();
+struct PowerStats {
+    uint32_t suspends = 0, resumes = 0;
+    int mhz_after_resume = 0;                  // measured, after the last resume
+};
+PowerStats power_stats();
 
 // ============================================================================================ memory
 struct MemInfo {
@@ -160,6 +193,23 @@ void core3_allow(bool allowed);
 void core3_unlock_allow(bool allowed);
 bool core3_usable();
 int helper_core();
+// The probe of core 3 is tried up to `attempts` times (a thread that ran elsewhere or timed out once may succeed a moment later);
+// config.txt core3_retries. Call before the first core3_usable().
+void core3_retry_set(int attempts);
+// After a suspend: probes again. When core 3 is gone the helper threads that were started on it move to core 2; when it is back
+// they are left where they are. Returns core3_usable() afterwards. Desktop: false.
+bool core3_reprobe();
+struct Core3Stats {
+    int probe_tries = 0;                       // tries the last probe took
+    uint32_t late_periods = 0;                 // periods of a helper thread that came more than three times too late
+    uint32_t threads_moved = 0;                // helper threads moved from core 3 to core 2 (watchdog or lost core)
+};
+Core3Stats core3_stats();
+void core3_watch_set(bool on);                 // config.txt core3_watchdog
+bool core3_watch_on();
+// A helper thread on core 3 reports one of its periods (the audio pump: each sceAudioOutOutput). Returns true when it has missed its
+// deadline three periods running and should move itself to core 2 (the platform logs the late periods and the move).
+bool core3_period(const char* who, uint64_t gap_us, uint64_t period_us);
 
 struct Mutex;                                  // non-recursive mutex; Vita: SceKernelLwMutex
 Mutex* mutex_create(const char* name);
@@ -278,7 +328,10 @@ void audio_set_volume(float v);                // 0..1 software gain applied in 
 // follows it with a slow, small change of its resampling ratio (audio_rate.h) so that the device's clock and the game's stay together.
 using AudioSource = size_t (*)(int16_t* out, size_t frames);
 using AudioFill = int64_t (*)();
-bool audio_set_source(AudioSource fn, AudioFill fill = nullptr);
+// `target` (optional) is the lead in frames the producers aim for (the sink's cushion, which grows after underruns); the clock
+// follower settles the queue there instead of at its built-in value.
+using AudioTarget = int64_t (*)();
+bool audio_set_source(AudioSource fn, AudioFill fill = nullptr, AudioTarget target = nullptr);
 struct AudioStats {
     uint64_t periods_out = 0;                  // sceAudioOutOutput calls completed
     uint64_t frames_in = 0;                    // frames accepted from the producer
@@ -293,8 +346,16 @@ struct AudioStats {
     int port_type = -1;                        // Vita: SCE_AUDIO_OUT_PORT_TYPE_*
     int port_grain = 0;
     int open_rc = 0;                           // raw return code of the open call
+    uint32_t port_reopens = 0;                 // the port was released and opened again after an output error (suspend, Home)
+    uint32_t port_reopen_failures = 0;
+    uint32_t late_periods = 0;                 // periods that came more than three times too late (core-3 watchdog)
+    uint32_t fades = 0;                        // zero-filled gaps of the pump that were faded instead of cut
     bool resampling = false;
 };
+// Policy of the pump (config.txt audio_fade, audio_retry): fade the last frame to zero over ~2 ms where the pump has to fill a gap with
+// silence; release and open the port again (one retry of the period) when sceAudioOutOutput fails, as after sleep or Home.
+// Desktop: nothing.
+void audio_policy_set(bool fade, bool retry);
 AudioStats audio_stats();
 
 // ============================================================================================ GL (vitaGL on Vita)

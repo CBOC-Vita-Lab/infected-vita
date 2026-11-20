@@ -116,6 +116,7 @@ set(APP_SOURCES
   src/app_main.cpp
   src/app_config.cpp
   src/app_log.cpp
+  src/app_stdio_lock.cpp
   src/app_memory.cpp
   src/app_ui.cpp
   src/app_status.cpp
@@ -221,6 +222,12 @@ target_link_options(infected PRIVATE "LINKER:-u,pthread_cancel" "LINKER:-u,pthre
   "LINKER:-u,pthread_cond_init" "LINKER:-u,pthread_cond_destroy" "LINKER:-u,pthread_create" "LINKER:-u,pthread_join"
   "LINKER:-u,pthread_detach" "LINKER:-u,pthread_equal" "LINKER:-u,pthread_self" "LINKER:-u,sched_yield"
   "LINKER:-u,pthread_mutexattr_init" "LINKER:-u,pthread_mutexattr_settype" "LINKER:-u,pthread_mutexattr_destroy")
+# One lock around the stdio calls that write and the ones that open and close files (src/app_stdio_lock.cpp): newlib's FILE is not
+# safe for two threads here. --wrap redirects every caller, the libraries included.
+target_link_options(infected PRIVATE
+  "LINKER:--wrap,printf" "LINKER:--wrap,vprintf" "LINKER:--wrap,puts" "LINKER:--wrap,putchar" "LINKER:--wrap,fprintf"
+  "LINKER:--wrap,vfprintf" "LINKER:--wrap,fputs" "LINKER:--wrap,fputc" "LINKER:--wrap,putc" "LINKER:--wrap,fwrite"
+  "LINKER:--wrap,fflush" "LINKER:--wrap,fopen" "LINKER:--wrap,freopen" "LINKER:--wrap,fdopen" "LINKER:--wrap,fclose")
 add_custom_command(TARGET infected POST_BUILD
   COMMAND sh -c "if ${CMAKE_NM} \"$1\" | grep -E '^ +w (pthread_|sched_)'; then echo 'error: pthread functions above are weak and undefined: add them to the -u list (vita/app/CMakeLists.txt)'; exit 1; fi" sh "$<TARGET_FILE:infected>"
   VERBATIM)

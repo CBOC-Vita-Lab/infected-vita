@@ -12,6 +12,7 @@
 
 #include "app_config.h"
 #include "app_memory.h"
+#include "app_stdio_lock.h"
 #include "app_ui.h"
 #include "platform.h"
 
@@ -27,6 +28,7 @@
 #include "infected_tuning.hpp"
 #include "hle/hle_common.hpp"
 #include "kernel/kernel.hpp"
+#include "kernel/iso_image.hpp"
 #include "perf/bringup_stats.hpp"
 #include "perf/frame_stats.hpp"
 #include "perf/phase_timers.hpp"
@@ -113,7 +115,8 @@ Snap take() {
     s.interp_calls = e.interpreted_calls;
     s.hle_calls = e.hle_calls;
     s.switches = kernel().switch_count();
-    s.underruns = plat::audio_is_open() ? plat::audio_stats().underruns : 0;
+    // gaps of the pump (the device found nothing) and of the sink (producers behind the device while audio was playing)
+    s.underruns = (plat::audio_is_open() ? plat::audio_stats().underruns : 0) + portablekit::audio::AudioSink::instance().telemetry().underruns;
     if (gpu::Renderer* r = media_renderer()) {
         s.presented = r->frames_presented();
         s.submits = r->draws_submitted();
@@ -362,6 +365,22 @@ void report(const char* why) {
         }
     }
     plat::logf("%s", line);
+    {
+        // The stability counters of this build, one line a second: audio underruns (faded, and the cushion that grew after them),
+        // the audio port reopened after sleep, the log queue, the stdio lock, disc reopens, power ticks, suspends and core 3.
+        const plat::AudioStats as = plat::audio_is_open() ? plat::audio_stats() : plat::AudioStats();
+        const plat::LogStats ls = plat::log_stats();
+        const app::StdioLockStats sl = app::stdio_lock_stats();
+        const plat::PowerStats ps = plat::power_stats();
+        const plat::Core3Stats c3 = plat::core3_stats();
+        plat::logf("[stab] audio underruns=%llu(%llu frames) cushion=%llu fades=%u pump_late=%u port_reopens=%u(fail %u) | log %s queued=%llu dropped=%llu maxq=%u | "
+                   "stdio locked=%llu opens=%llu wait<=%uus openhold<=%uus | iso reopens=%llu(fail %llu) | power ticks=%llu suspends=%u resumes=%u clock_after=%dMHz | core3 tries=%d late=%u moved=%u",
+                   (unsigned long long)snd.underruns, (unsigned long long)snd.underrun_frames, (unsigned long long)snd.cushion, as.fades, as.late_periods,
+                   as.port_reopens, as.port_reopen_failures, ls.async ? "async" : "sync", (unsigned long long)ls.queued, (unsigned long long)ls.dropped,
+                   ls.max_depth, (unsigned long long)sl.locked_calls, (unsigned long long)sl.open_calls, sl.max_wait_us, sl.max_hold_open_us,
+                   (unsigned long long)portablekit::IsoImage::reopen_total(), (unsigned long long)portablekit::IsoImage::reopen_failed_total(),
+                   (unsigned long long)plat::power_tick_count(), ps.suspends, ps.resumes, ps.mhz_after_resume, c3.probe_tries, c3.late_periods, c3.threads_moved);
+    }
     plat::log_flush();   // one flush per status line: a crash or a power-off loses at most the last second
 
     // hle_top=N: the N most called HLE imports of the last second, each with the return address of its most frequent call site.

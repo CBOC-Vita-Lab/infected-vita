@@ -5,6 +5,7 @@
 #include "../platform.h"
 #include "../audio_rate.h"
 #include "../audio_resample.h"
+#include "../retry.h"
 
 #include <atomic>
 #include <malloc.h>
@@ -30,6 +31,7 @@ struct Audio {
     int grain = 1024;
     bool resample = false;
     Thread* th = nullptr;
+    AudioTarget target_fn = nullptr; // ... and the lead it should settle at (the sink's cushion)
     AudioFill fill = nullptr;        // pull mode: how far ahead of the device the producers are (for the rate follower)
     RateControl rate;                // follows it
     AudioSource source = nullptr;    // pull mode: the pump takes its source frames from here instead of the ring (set before audio_open)
@@ -40,6 +42,10 @@ struct Audio {
     // stats (single writer each; relaxed)
     std::atomic<uint64_t> periods{0}, frames_in{0}, frames_out{0}, underruns{0}, underrun_frames{0}, overruns{0}, out_errors{0};
     std::atomic<uint32_t> max_out_us{0};
+    std::atomic<uint32_t> reopens{0}, reopen_failures{0}, late_periods{0}, fades{0};
+    std::atomic<bool> resumed{false};   // the console slept: the port is checked at the next period
+    SceAudioOutPortType type = SCE_AUDIO_OUT_PORT_TYPE_MAIN;   // what was opened, to open it again
+    int open_rate = 48000;
     AudioStats st_static;            // port_rate/type/grain/open_rc/resampling filled at open
 };
 Audio g;
@@ -56,7 +62,36 @@ void ring_peek(int16_t* dst, uint32_t offset_frames, uint32_t n) {
     }
 }
 
+bool fade_on = true;    // config.txt audio_fade
+bool retry_on = true;   // config.txt audio_retry
+
+bool reopen_port(const char* why, int rc) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        sceAudioOutReleasePort(g.port);
+        const int port = sceAudioOutOpenPort(g.type, g.grain, g.open_rate, SCE_AUDIO_OUT_MODE_STEREO);
+        if (port >= 0) {
+            g.port = port;
+            g.reopens.fetch_add(1, std::memory_order_relaxed);
+            logf("audio: the port was opened again after %s (0x%08X): port %d, try %d", why, (unsigned)rc, port, attempt);
+            return true;
+        }
+        logf("audio: opening the port again failed (0x%08X), try %d of 3", (unsigned)port, attempt);
+        sleep_us(50000);
+    }
+    g.reopen_failures.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+// After a resume the port may be dead without an error code: a silent buffer written to it shows it (a dead port answers < 0).
+void check_port_after_resume() {
+    const int rc = sceAudioOutGetRestSample(g.port);
+    if (rc < 0 && retry_on) { reopen_port("the resume", rc); return; }
+    logf("audio: the port answers after the resume (rest sample %d)", rc);
+}
+
 void pump_main(void*) {
+    uint64_t last_done = 0;
+    const uint64_t period_us = g.dst_rate > 0 ? (uint64_t)g.grain * 1000000ull / (uint64_t)g.dst_rate : 0;
     while (g.run.load(std::memory_order_acquire)) {
         const uint32_t grain = (uint32_t)g.grain;
         uint32_t produced = 0;      // frames of valid audio in g.out
@@ -75,6 +110,10 @@ void pump_main(void*) {
             }
         } else {
             uint32_t step = (uint32_t)(((uint64_t)g.src_rate << 16) / (uint32_t)g.dst_rate);   // source frames per output frame, 16.16
+            if (g.target_fn) {
+                const int64_t t = g.target_fn();
+                if (t > 0) g.rate.target = (float)t;
+            }
             if (g.fill) step = g.rate.update(step, g.fill());   // the game's clock and the device's differ by a few hundred ppm: follow
             const uint32_t need = resample_cubic_need(g.phase, step, grain);                           // source frames touched this period
             // top up the staging buffer: from the source callback (pull mode: it always delivers, silence where nothing was written)
@@ -110,6 +149,15 @@ void pump_main(void*) {
         if (!g.resample) g.frames_out.fetch_add(produced, std::memory_order_relaxed);
         if (missing) {
             memset(g.out + 2 * produced, 0, (size_t)missing * 4);
+            if (produced > 0 && fade_on) {   // hold the last frame and run it down over ~2 ms (96 frames at 48 kHz) instead of a step
+                const uint32_t n = missing < 96u ? missing : 96u;
+                const int32_t l = g.out[2 * (produced - 1)], r = g.out[2 * (produced - 1) + 1];
+                for (uint32_t i = 0; i < n; i++) {
+                    g.out[2 * (produced + i)] = (int16_t)((l * (int32_t)(96 - i)) / 97);
+                    g.out[2 * (produced + i) + 1] = (int16_t)((r * (int32_t)(96 - i)) / 97);
+                }
+                g.fades.fetch_add(1, std::memory_order_relaxed);
+            }
             if (g.armed.load(std::memory_order_relaxed)) {
                 g.underruns.fetch_add(1, std::memory_order_relaxed);
                 g.underrun_frames.fetch_add(missing, std::memory_order_relaxed);
@@ -119,13 +167,29 @@ void pump_main(void*) {
         if (vol != 65536) {
             for (uint32_t k = 0; k < grain * 2; k++) g.out[k] = (int16_t)(((int32_t)g.out[k] * (int32_t)vol) >> 16);
         }
+        if (g.resumed.exchange(false)) check_port_after_resume();
         uint64_t t0 = now_us();
         int rc = sceAudioOutOutput(g.port, g.out);
         uint32_t dt = (uint32_t)(now_us() - t0);
         if (rc < 0) {
             g.out_errors.fetch_add(1, std::memory_order_relaxed);
-            sleep_us(5000);   // do not spin if the port went away
+            // Sleep or Home can take the port away: release it and open it again, then play this period once more (one retry).
+            if (retry_on && reopen_port("output error", rc)) {
+                t0 = now_us();
+                rc = sceAudioOutOutput(g.port, g.out);
+                dt = (uint32_t)(now_us() - t0);
+            }
+            if (rc < 0) sleep_us(5000);   // do not spin if the port went away
         }
+        // the core-3 watchdog: the time between two finished periods is the period when the thread keeps up
+        const uint64_t done = now_us();
+        if (last_done != 0) {
+            const uint64_t gap = done - last_done;
+            if (period_us > 0 && period_is_late(gap, period_us, 3, 1500000)) g.late_periods.fetch_add(1, std::memory_order_relaxed);
+            if (core3_period("audio pump", gap, period_us) && thread_set_core(nullptr, 2))
+                logf("audio pump: now on core %d", thread_current_core());
+        }
+        last_done = done;
         if (dt > g.max_out_us.load(std::memory_order_relaxed)) g.max_out_us.store(dt, std::memory_order_relaxed);
         g.periods.fetch_add(1, std::memory_order_relaxed);
     }
@@ -161,6 +225,8 @@ bool audio_open(const AudioParams& p) {
     }
     if (port < 0) return false;
 
+    g.type = type;
+    g.open_rate = rate;
     g.src_rate = p.sample_rate;
     g.dst_rate = rate;
     g.resample = (p.sample_rate != rate);
@@ -176,6 +242,7 @@ bool audio_open(const AudioParams& p) {
     memset(g.out, 0, (size_t)grain * 4);
     memset(g.stg, 0, (size_t)g.stg_cap * 4);
     g.head = 0; g.tail = 0; g.stg_n = 1; g.phase = 0;   // stg frame 0 is the (silent) history frame of the cubic
+    g.reopens = 0; g.reopen_failures = 0; g.late_periods = 0; g.fades = 0; g.resumed = false;
     g.periods = 0; g.frames_in = 0; g.frames_out = 0; g.underruns = 0; g.underrun_frames = 0; g.overruns = 0; g.out_errors = 0; g.max_out_us = 0;
     g.armed = false;
     g.run = true;
@@ -214,9 +281,13 @@ void audio_close() {
 
 bool audio_is_open() { return g.open; }
 
-bool audio_set_source(AudioSource fn, AudioFill fill) {
+void audio_note_resume() { g.resumed.store(true); }
+void audio_policy_set(bool fade, bool retry) { fade_on = fade; retry_on = retry; }
+
+bool audio_set_source(AudioSource fn, AudioFill fill, AudioTarget target) {
     g.source = fn;
     g.fill = fill;
+    g.target_fn = target;
     return true;
 }
 
@@ -263,6 +334,10 @@ AudioStats audio_stats() {
     s.overruns = g.overruns.load(std::memory_order_relaxed);
     s.output_errors = g.out_errors.load(std::memory_order_relaxed);
     s.max_output_us = g.max_out_us.load(std::memory_order_relaxed);
+    s.port_reopens = g.reopens.load(std::memory_order_relaxed);
+    s.port_reopen_failures = g.reopen_failures.load(std::memory_order_relaxed);
+    s.late_periods = g.late_periods.load(std::memory_order_relaxed);
+    s.fades = g.fades.load(std::memory_order_relaxed);
     s.rate_ppm = (int32_t)g.rate.ppm;   // written by the pump thread, read here for the log: a torn read is a wrong digit at worst
     return s;
 }

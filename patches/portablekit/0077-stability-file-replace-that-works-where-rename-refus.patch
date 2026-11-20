@@ -1,0 +1,974 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:20:54 -0500
+Subject: [PATCH 77/77] stability: file replace that works where rename refuses, ISO
+ self-heal, power tick hook, audio underrun fade and cushion
+
+- host/file_replace.hpp: rename; if the target exists and rename refuses, target -> .bak, temp -> target, delete .bak; recover()
+  puts a .bak back when the target is missing. Used by savedata_store write_file (recovery on load/exists/write) and by the
+  settings writer (which no longer removes the target first; load() also reads a .bak). Tests simulate a refusing rename.
+- IsoImage::read reopens the file once and retries when a read comes up short; notify_resumed() reopens before the next read.
+- KernelPlatform::power_tick: sceKernelPowerTick reaches the platform.
+- AudioSink::pull fades the last sample to zero over 2 ms at a gap and fades the audio after it in; underruns (gaps under 250 ms)
+  are counted and grow the restart margin by 20 ms up to 128 ms, which shrinks again after 30 s of calm.
+  INFECTED_AUDIO_FADE=0 and INFECTED_AUDIO_CUSHION=0 switch them off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                    |  21 +++++
+ host/audio/audio_sink.cpp         |  24 ++++++
+ host/audio/audio_sink.hpp         |   3 +
+ host/audio/underrun_fade.hpp      | 124 ++++++++++++++++++++++++++++++
+ host/file_replace.hpp             |  81 +++++++++++++++++++
+ host/hle/hle_sysmem.cpp           |   8 +-
+ host/kernel/iso_image.cpp         |  45 +++++++++--
+ host/kernel/iso_image.hpp         |  17 ++++
+ host/kernel/kernel_platform.hpp   |   3 +
+ host/save_data/savedata_store.cpp |  26 ++++++-
+ host/settings/port_settings.cpp   |  12 +--
+ host/settings/port_settings.hpp   |   4 +-
+ tests/audio_underrun_tests.cpp    | 115 +++++++++++++++++++++++++++
+ tests/iso_image_tests.cpp         |  70 +++++++++++++++++
+ tests/port_settings_tests.cpp     |  38 +++++++++
+ tests/savedata_tests.cpp          |  57 ++++++++++++++
+ 16 files changed, 632 insertions(+), 16 deletions(-)
+ create mode 100644 host/audio/underrun_fade.hpp
+ create mode 100644 host/file_replace.hpp
+ create mode 100644 tests/audio_underrun_tests.cpp
+ create mode 100644 tests/iso_image_tests.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9a58572..3b407f0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -252,6 +252,27 @@ if(PSPRECOMP_BUILD_TESTS)
+     add_test(NAME portablekit_adhoc_tests COMMAND portablekit_adhoc_tests)
+ endif()
+ 
++# The disc image reader on a synthetic ISO: self-healing after a suspend.
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_iso_image_tests
++        "${PORTABLEKIT_ROOT}/tests/iso_image_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/kernel/iso_image.cpp")
++    target_compile_features(portablekit_iso_image_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_iso_image_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/include")
++    target_link_libraries(portablekit_iso_image_tests PRIVATE psprecomp_core)
++    set_target_properties(portablekit_iso_image_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_iso_image_tests COMMAND portablekit_iso_image_tests)
++endif()
++
++# The audio underrun fade and the adaptive cushion (header only).
++if(PSPRECOMP_BUILD_TESTS)
++    add_executable(portablekit_audio_underrun_tests "${PORTABLEKIT_ROOT}/tests/audio_underrun_tests.cpp")
++    target_compile_features(portablekit_audio_underrun_tests PRIVATE cxx_std_20)
++    target_include_directories(portablekit_audio_underrun_tests PRIVATE "${PORTABLEKIT_ROOT}/host")
++    set_target_properties(portablekit_audio_underrun_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
++    add_test(NAME portablekit_audio_underrun_tests COMMAND portablekit_audio_underrun_tests)
++endif()
++
+ # Fixed-size memory pools (sceKernel*Fpl): their bookkeeping, with no kernel.
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_pool_tests
+diff --git a/host/audio/audio_sink.cpp b/host/audio/audio_sink.cpp
+index 2c42452..b9899ed 100644
+--- a/host/audio/audio_sink.cpp
++++ b/host/audio/audio_sink.cpp
+@@ -1,6 +1,7 @@
+ #include "../profile.hpp"
+ #include "audio/audio_sink.hpp"
+ 
++#include "audio/underrun_fade.hpp"
+ #include "perf/phase_timers.hpp"
+ #include "settings/settings.hpp"
+ 
+@@ -132,6 +133,10 @@ struct AudioSink::Impl {
+     std::uint64_t prebuffer{kPrebufferFrames};   // how far ahead of the device a restarted producer starts
+     std::uint64_t total_restarts{};
+     std::uint64_t total_writes{};
++    UnderrunFader fader;
++    Cushion cushion{static_cast<std::uint32_t>(kPulledPrebufferFrames), 882u, 5632u};
++    bool cushion_on{true};
++
+     // What each producer (a channel's cursor) had queued ahead of the device at its last write, and when (in pulls: the device's own
+     // clock). Eight producers are more than the game has channels.
+     struct ProducerMark {
+@@ -286,6 +291,13 @@ void AudioSink::initialize() {
+         impl.output_open = true;
+         impl.output_pulls = g_output.pulls;
+         if (impl.output_pulls) impl.prebuffer = kPulledPrebufferFrames;
++        // INFECTED_AUDIO_FADE=0: gaps are zeros as before. INFECTED_AUDIO_CUSHION=0: the margin stays at its base.
++        const char *fade = portablekit::env("AUDIO_FADE");
++        impl.fader.set_apply(fade == nullptr || std::strcmp(fade, "0") != 0);
++        const char *cushion = portablekit::env("AUDIO_CUSHION");
++        impl.cushion_on = cushion == nullptr || std::strcmp(cushion, "0") != 0;
++        std::cout << "Audio: underrun fade " << (impl.fader.apply_enabled() ? "on" : "off") << ", adaptive cushion "
++                  << (impl.cushion_on ? "on" : "off") << "\n";
+         if (g_output.set_gain != nullptr) g_output.set_gain(impl.gain);
+         std::cout << "Audio: 44100 Hz stereo playback open (platform device, " << (impl.output_pulls ? "pulled" : "pushed") << ")\n";
+         return;
+@@ -366,7 +378,16 @@ void AudioSink::pull(std::int16_t *out, std::size_t frames) {
+         return;
+     }
+     ++impl.pulls_seen;
++    const std::uint64_t written = impl.write_end > impl.read_position ? impl.write_end - impl.read_position : 0u;
+     impl.retire(frames, out, true);
++    impl.fader.process(out, frames, static_cast<std::size_t>(std::min<std::uint64_t>(written, frames)));
++    if (impl.cushion_on) {
++        impl.cushion.advance(frames);
++        for (std::uint32_t n = impl.fader.take_new_underruns(); n > 0u; --n) impl.cushion.on_underrun();
++        impl.prebuffer = impl.cushion.frames();
++    } else {
++        (void)impl.fader.take_new_underruns();
++    }
+ }
+ 
+ AudioSink::Telemetry AudioSink::telemetry() const {
+@@ -378,6 +399,9 @@ AudioSink::Telemetry AudioSink::telemetry() const {
+     t.dropped = impl.total_dropped;
+     t.restarts = impl.total_restarts;
+     t.writes = impl.total_writes;
++    t.underruns = impl.fader.underruns();
++    t.underrun_frames = impl.fader.underrun_frames();
++    t.cushion = impl.prebuffer;
+     for (const auto &mark : impl.marks) {
+         if (mark.key == nullptr || impl.pulls_seen - mark.at > 20u) continue;   // about 0.4 s of 1024-frame periods
+         const auto ahead = static_cast<std::int64_t>(mark.ahead);
+diff --git a/host/audio/audio_sink.hpp b/host/audio/audio_sink.hpp
+index 72553a1..b6244b6 100644
+--- a/host/audio/audio_sink.hpp
++++ b/host/audio/audio_sink.hpp
+@@ -84,6 +84,9 @@ public:
+         // device when it wrote last (before adding its own chunk), or -1 when none did. This is the margin of the producer closest
+         // to being found behind the device and restarted; `fill` is the furthest one, which says nothing about that.
+         std::int64_t lead{-1};
++        std::uint64_t underruns{};          // gaps shorter than 250 ms in audio that was playing (a pulled device)
++        std::uint64_t underrun_frames{};    // ... and their length
++        std::uint64_t cushion{};            // frames a restarted producer starts ahead of the device (grows after underruns)
+     };
+     [[nodiscard]] Telemetry telemetry() const;
+ 
+diff --git a/host/audio/underrun_fade.hpp b/host/audio/underrun_fade.hpp
+new file mode 100644
+index 0000000..41856d8
+--- /dev/null
++++ b/host/audio/underrun_fade.hpp
+@@ -0,0 +1,124 @@
++#pragma once
++
++// What happens at a gap in the stream the device is playing, and how much margin the stream keeps ahead of the device.
++//
++// UnderrunFader: when the device asks for more frames than the producers have written, the rest used to be zeros, a step from
++// the last sample to silence, which clicks. The fader holds the last sample and runs it down to zero over ~2 ms, and brings the
++// next audio in from zero over the same time. A gap that ends within 250 ms of audio counts as an underrun (a longer one is a
++// pause, a menu, the end of a track).
++//
++// Cushion: the margin a restarted producer starts ahead of the device. It starts at the base, grows 20 ms with each underrun up to a
++// cap, and goes back down 20 ms after every 30 s without one.
++//
++// Header only, no platform calls: the sink uses it and tests/audio_underrun_tests.cpp runs the same code.
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++
++namespace portablekit::audio {
++
++class UnderrunFader {
++public:
++    static constexpr std::uint32_t kRampFrames = 88;          // 2 ms at 44100 Hz
++    static constexpr std::uint64_t kMaxGapFrames = 11025;     // 250 ms: a longer gap is a pause, not an underrun
++
++    // out[0 .. valid) holds audio, out[valid .. frames) is zero. Interleaved stereo s16.
++    void process(std::int16_t *out, std::size_t frames, std::size_t valid) {
++        valid = std::min(valid, frames);
++        if (valid > 0) {
++            if (in_gap_) {
++                if (had_audio_ && gap_frames_ > 0 && gap_frames_ < kMaxGapFrames) {
++                    ++underruns_;
++                    underrun_frames_ += gap_frames_;
++                    ++pending_underruns_;
++                }
++                // Fade in from the silence the device was left with.
++                const std::size_t n = apply_ ? std::min<std::size_t>(valid, kRampFrames) : 0u;
++                for (std::size_t i = 0; i < n; ++i) {
++                    const std::int32_t gain = static_cast<std::int32_t>(i + 1);   // 1..ramp
++                    out[2 * i] = static_cast<std::int16_t>((out[2 * i] * gain) / static_cast<std::int32_t>(kRampFrames + 1));
++                    out[2 * i + 1] = static_cast<std::int16_t>((out[2 * i + 1] * gain) / static_cast<std::int32_t>(kRampFrames + 1));
++                }
++                in_gap_ = false;
++                gap_frames_ = 0;
++            }
++            for (std::size_t i = 0; i < valid && !had_audio_; ++i)
++                if (out[2 * i] != 0 || out[2 * i + 1] != 0) had_audio_ = true;
++            last_[0] = out[2 * (valid - 1)];
++            last_[1] = out[2 * (valid - 1) + 1];
++        }
++        if (valid < frames) {
++            const std::size_t gap = frames - valid;
++            if (!in_gap_) {
++                // The gap starts here: hold the last sample and run it to zero.
++                const std::size_t n = apply_ ? std::min<std::size_t>(gap, kRampFrames) : 0u;
++                for (std::size_t i = 0; i < n; ++i) {
++                    const std::int32_t gain = static_cast<std::int32_t>(kRampFrames - i);   // ramp..1
++                    out[2 * (valid + i)] = static_cast<std::int16_t>((last_[0] * gain) / static_cast<std::int32_t>(kRampFrames + 1));
++                    out[2 * (valid + i) + 1] = static_cast<std::int16_t>((last_[1] * gain) / static_cast<std::int32_t>(kRampFrames + 1));
++                }
++                in_gap_ = true;
++                gap_frames_ = 0;
++            }
++            gap_frames_ += gap;
++            if (gap_frames_ >= kMaxGapFrames) had_audio_ = false;   // a pause: the audio that follows starts a new stretch
++        }
++    }
++
++    // false: only count (the fade is switched off), the samples are left as they are.
++    void set_apply(bool apply) noexcept { apply_ = apply; }
++    [[nodiscard]] bool apply_enabled() const noexcept { return apply_; }
++    [[nodiscard]] std::uint64_t underruns() const noexcept { return underruns_; }
++    [[nodiscard]] std::uint64_t underrun_frames() const noexcept { return underrun_frames_; }
++    // The underruns found since the last call (for the cushion).
++    std::uint32_t take_new_underruns() noexcept {
++        const std::uint32_t n = pending_underruns_;
++        pending_underruns_ = 0;
++        return n;
++    }
++
++private:
++    std::int16_t last_[2]{0, 0};
++    bool apply_{true};
++    bool in_gap_{false};
++    bool had_audio_{false};
++    std::uint64_t gap_frames_{0};
++    std::uint64_t underruns_{0};
++    std::uint64_t underrun_frames_{0};
++    std::uint32_t pending_underruns_{0};
++};
++
++class Cushion {
++public:
++    static constexpr std::uint64_t kCalmFrames = 30ull * 44100ull;   // 30 s
++
++    Cushion() = default;
++    Cushion(std::uint32_t base, std::uint32_t step, std::uint32_t cap) : base_(base), current_(base), step_(step), cap_(cap) {}
++
++    void on_underrun() {
++        current_ = std::min(cap_, current_ + step_);
++        calm_ = 0;
++    }
++    // `frames` of audio went by (any number of them).
++    void advance(std::uint64_t frames) {
++        calm_ += frames;
++        while (calm_ >= kCalmFrames && current_ > base_) {
++            current_ = std::max(base_, current_ - std::min(step_, current_ - base_));
++            calm_ -= kCalmFrames;
++        }
++        if (current_ == base_ && calm_ > kCalmFrames) calm_ = kCalmFrames;
++    }
++    [[nodiscard]] std::uint32_t frames() const noexcept { return current_; }
++    [[nodiscard]] std::uint32_t base() const noexcept { return base_; }
++
++private:
++    std::uint32_t base_{3072};
++    std::uint32_t current_{3072};
++    std::uint32_t step_{882};   // 20 ms
++    std::uint32_t cap_{5632};   // 128 ms; the sink's ring holds 8192 frames
++    std::uint64_t calm_{0};
++};
++
++} // namespace portablekit::audio
+diff --git a/host/file_replace.hpp b/host/file_replace.hpp
+new file mode 100644
+index 0000000..28ed4f1
+--- /dev/null
++++ b/host/file_replace.hpp
+@@ -0,0 +1,81 @@
++#pragma once
++
++// Replacing a file that already exists, where rename() may refuse to.
++//
++// A writer puts the new contents in `<target>.tmp` and renames that over the target, so an interrupted write never leaves a half
++// file in place of a good one. POSIX rename() replaces the target in one step, but sceIoRename on the PS Vita (and rename() on
++// Windows) refuses when the target exists, and the old fix (remove the target, then rename) leaves a window with no file at all.
++//
++// replace() therefore does:
++//   1. rename(temp, target). Done when it works.
++//   2. When it fails and the target exists: rename(target, target.bak), rename(temp, target), remove(target.bak).
++//      A failure after the first of those puts the old file back.
++// recover() is for the start of the next run: when the target is missing and `target.bak` is there (the run was killed between the
++// two renames), the old file is put back, so the player has the last good save instead of none.
++//
++// The file system calls go through Ops so a test can make rename() refuse an existing target, or fail at a chosen step.
++
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <system_error>
++
++namespace portablekit::filereplace {
++
++struct Ops {
++    bool (*rename)(const char *from, const char *to){nullptr};   // true when `from` is now `to`
++    bool (*remove)(const char *path){nullptr};
++    bool (*exists)(const char *path){nullptr};
++};
++
++inline bool default_rename(const char *from, const char *to) { return std::rename(from, to) == 0; }
++inline bool default_remove(const char *path) { return std::remove(path) == 0; }
++inline bool default_exists(const char *path) {
++    std::error_code ec;
++    return std::filesystem::exists(path, ec);
++}
++
++inline const Ops &system_ops() {
++    static const Ops ops{&default_rename, &default_remove, &default_exists};
++    return ops;
++}
++
++// The ops in use: the system's unless a test installed its own (nullptr puts the system's back).
++inline const Ops *&override_slot() {
++    static const Ops *slot = nullptr;
++    return slot;
++}
++inline void set_ops_for_test(const Ops *ops) { override_slot() = ops; }
++inline const Ops &ops() { return override_slot() != nullptr ? *override_slot() : system_ops(); }
++
++enum class Result {
++    Renamed,            // the plain rename worked
++    ReplacedViaBackup,  // the rename refused an existing target; the old file went to .bak, the new one in, the .bak was deleted
++    Failed,             // the target is as it was; the temporary file is still there (the caller removes it)
++};
++
++inline Result replace(const Ops &o, const std::string &temp, const std::string &target) {
++    if (o.rename(temp.c_str(), target.c_str())) return Result::Renamed;
++    if (!o.exists(target.c_str())) return Result::Failed;   // not "the target is in the way": nothing more to try
++    const std::string backup = target + ".bak";
++    if (o.exists(backup.c_str())) o.remove(backup.c_str());   // a leftover of an earlier run
++    if (!o.rename(target.c_str(), backup.c_str())) return Result::Failed;
++    if (!o.rename(temp.c_str(), target.c_str())) {
++        (void)o.rename(backup.c_str(), target.c_str());       // put the old one back
++        return Result::Failed;
++    }
++    o.remove(backup.c_str());
++    return Result::ReplacedViaBackup;
++}
++inline Result replace(const std::string &temp, const std::string &target) { return replace(ops(), temp, target); }
++
++// True when the target was missing and `target.bak` has been put back in its place.
++inline bool recover(const Ops &o, const std::string &target) {
++    if (o.exists(target.c_str())) return false;
++    const std::string backup = target + ".bak";
++    if (!o.exists(backup.c_str())) return false;
++    return o.rename(backup.c_str(), target.c_str());
++}
++inline bool recover(const std::string &target) { return recover(ops(), target); }
++
++} // namespace portablekit::filereplace
+diff --git a/host/hle/hle_sysmem.cpp b/host/hle/hle_sysmem.cpp
+index 6fe5a1e..ac21f04 100644
+--- a/host/hle/hle_sysmem.cpp
++++ b/host/hle/hle_sysmem.cpp
+@@ -5,6 +5,7 @@
+ #include "psprecomp/common.hpp"
+ 
+ #include "gpu/ge_state.hpp"
++#include "kernel/kernel_platform.hpp"
+ 
+ #include <cstdlib>
+ #include <iostream>
+@@ -97,7 +98,12 @@ void register_sysmem(HleRegistrar &hle) {
+         kernel().finish(ctx, 0u);
+     });
+ 
+-    hle.add("sceSuspendForUser", "sceKernelPowerTick", success);
++    // The game keeps the console awake (movies, attract loops): on a platform with a power timer of its own the tick goes through.
++    hle.add("sceSuspendForUser", "sceKernelPowerTick", [](Runtime &, AllegrexContext &ctx) {
++        const KernelPlatform &platform = kernel_platform();
++        if (platform.power_tick != nullptr) platform.power_tick(arg(ctx, 0));
++        kernel().finish(ctx, 0u);
++    });
+     // The 4 MiB at kVolatileMemoryBase that a PSP lends a game while it is
+     // not suspending: (unused, void **address, int *size). One holder at a
+     // time; Lock waits for it, TryLock fails with ..._POWER_VMEM_IN_USE.
+diff --git a/host/kernel/iso_image.cpp b/host/kernel/iso_image.cpp
+index 50c43d5..3ff1e0b 100644
+--- a/host/kernel/iso_image.cpp
++++ b/host/kernel/iso_image.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <iostream>
+ 
+ namespace portablekit {
+ namespace {
+@@ -16,7 +17,7 @@ std::uint32_t read_le32(const std::vector<std::uint8_t> &data, std::size_t offse
+ 
+ } // namespace
+ 
+-IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::binary) {
++IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
+     if (!file_) throw psprecomp::Error("Cannot open disc image: " + path.string());
+     size_bytes_ = std::filesystem::file_size(path);
+     std::vector<std::uint8_t> primary(kSectorSize);
+@@ -72,14 +73,48 @@ std::optional<IsoImage::Entry> IsoImage::find(std::string path) const {
+     return found->second;
+ }
+ 
++bool IsoImage::reopen() {
++    file_.close();
++    file_.clear();
++    file_.open(path_, std::ios::binary);
++    return static_cast<bool>(file_);
++}
++
++std::size_t IsoImage::read_once(std::uint64_t offset, std::uint8_t *output, std::size_t count) {
++    file_.clear();
++    file_.seekg(static_cast<std::streamoff>(offset));
++    file_.read(reinterpret_cast<char *>(output), static_cast<std::streamsize>(count));
++    return static_cast<std::size_t>(file_.gcount());
++}
++
+ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output) {
+     if (offset >= size_bytes_) return 0u;
+     const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
+     const phase::Scope timer(phase::IsoRead);
+-    file_.clear();
+-    file_.seekg(static_cast<std::streamoff>(offset));
+-    file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));
+-    return static_cast<std::size_t>(file_.gcount());
++    // After a suspend the next read starts on a fresh handle.
++    if (resume_pending_.exchange(false, std::memory_order_relaxed)) {
++        ++reopen_total_;
++        if (reopen())
++            std::cerr << "[iso] reopened the disc image after resume\n";
++        else {
++            ++reopen_failed_;
++            std::cerr << "[iso] could not reopen the disc image after resume\n";
++        }
++    }
++    std::size_t got = read_once(offset, output.data(), count);
++    if (got == count) return got;
++    // A short read inside the image is a failure (a stale handle after sleep): reopen once and retry once.
++    ++reopen_total_;
++    if (reopen()) {
++        got = read_once(offset, output.data(), count);
++        if (got == count) {
++            std::cerr << "[iso] read at " << offset << " failed; reopened the disc image and read it again\n";
++            return got;
++        }
++    }
++    ++reopen_failed_;
++    std::cerr << "[iso] read at " << offset << " failed (" << got << " of " << count << " bytes), also after reopening\n";
++    return got;
+ }
+ 
+ std::vector<std::string> IsoImage::list(std::string directory) const {
+diff --git a/host/kernel/iso_image.hpp b/host/kernel/iso_image.hpp
+index e52d6a9..278a44d 100644
+--- a/host/kernel/iso_image.hpp
++++ b/host/kernel/iso_image.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <filesystem>
+ #include <fstream>
+@@ -35,11 +36,27 @@ public:
+     std::size_t read(std::uint64_t offset, std::span<std::uint8_t> output);
+     [[nodiscard]] std::vector<std::string> list(std::string directory) const;
+ 
++    // Suspend and resume. After the console slept the handle of a file on the memory card can be stale: a read fails (or, worse,
++    // answers wrongly). read() reopens the file and retries once when a read comes up short, and notify_resumed() makes the
++    // next read reopen it first. reopen_total() counts both kinds for the status line.
++    static void notify_resumed() noexcept { resume_pending_.store(true, std::memory_order_relaxed); }
++    [[nodiscard]] static std::uint64_t reopen_total() noexcept { return reopen_total_.load(std::memory_order_relaxed); }
++    [[nodiscard]] static std::uint64_t reopen_failed_total() noexcept { return reopen_failed_.load(std::memory_order_relaxed); }
++    // Closes the handle as a stale one would be (for tests): the next read has to heal it.
++    void close_handle_for_test() { file_.close(); }
++
+ private:
+     void scan_directory(std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth);
+     [[nodiscard]] static std::string normalize(std::string path);
+ 
++    bool reopen();
++    std::size_t read_once(std::uint64_t offset, std::uint8_t *output, std::size_t count);
++
++    std::filesystem::path path_;
+     std::ifstream file_;
++    static inline std::atomic<bool> resume_pending_{false};
++    static inline std::atomic<std::uint64_t> reopen_total_{0};
++    static inline std::atomic<std::uint64_t> reopen_failed_{0};
+     std::uint64_t size_bytes_{};
+     std::map<std::string, Entry> entries_;
+ };
+diff --git a/host/kernel/kernel_platform.hpp b/host/kernel/kernel_platform.hpp
+index 4f647a3..886ea30 100644
+--- a/host/kernel/kernel_platform.hpp
++++ b/host/kernel/kernel_platform.hpp
+@@ -23,6 +23,9 @@ struct KernelPlatform {
+     void (*wait_event)(std::uint64_t timeout_us) = nullptr;
+     // Wakes wait_event(). Callable from any host thread.
+     void (*signal_event)() = nullptr;
++    // Optional. The game called sceKernelPowerTick(type) (0 = all timers, 1 = auto suspend, 6 = display dimming): the platform keeps its
++    // own screen and auto-suspend timers from running out (the Vita's sceKernelPowerTick). A desktop leaves it null.
++    void (*power_tick)(std::uint32_t psp_type) = nullptr;
+ };
+ 
+ void set_kernel_platform(const KernelPlatform &platform) noexcept;
+diff --git a/host/save_data/savedata_store.cpp b/host/save_data/savedata_store.cpp
+index f09c4fa..08b8b22 100644
+--- a/host/save_data/savedata_store.cpp
++++ b/host/save_data/savedata_store.cpp
+@@ -3,6 +3,7 @@
+ #include "save_data/param_sfo.hpp"
+ #include "crypto_keys.hpp"
+ #include "save_data/savedata_crypto.hpp"
++#include "file_replace.hpp"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -39,9 +40,28 @@ bool write_file(const std::filesystem::path &path, const std::vector<std::uint8_
+         out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+         if (!out) return false;
+     }
++    // rename() may refuse an existing target (the Vita's does): file_replace goes through a .bak in that case.
++    const auto replaced = filereplace::replace(temporary.string(), path.string());
++    if (replaced == filereplace::Result::Failed) {
++        std::error_code ec;
++        std::filesystem::remove(temporary, ec);
++        return false;
++    }
++    return true;
++}
++
++// A run killed between the two renames of file_replace leaves `<name>.bak` and no `<name>`: put the old file back.
++void recover_folder(const std::filesystem::path &folder) {
+     std::error_code ec;
+-    std::filesystem::rename(temporary, path, ec);
+-    return !ec;
++    if (!std::filesystem::is_directory(folder, ec)) return;
++    std::vector<std::filesystem::path> backups;
++    for (const auto &entry : std::filesystem::directory_iterator(folder, ec))
++        if (entry.path().extension() == ".bak") backups.push_back(entry.path());
++    for (const auto &backup : backups) {
++        std::filesystem::path target = backup;
++        target.replace_extension();
++        (void)filereplace::recover(target.string());
++    }
+ }
+ 
+ // A hash stored in the file list for `name`, if any.
+@@ -81,6 +101,7 @@ std::filesystem::path save_folder(const std::filesystem::path &memory_stick, con
+ bool save_exists(const std::filesystem::path &memory_stick, const SaveFiles &files) {
+     std::error_code ec;
+     const auto folder = save_folder(memory_stick, files);
++    recover_folder(folder);
+     return std::filesystem::is_directory(folder, ec) && std::filesystem::is_regular_file(folder / kParamSfo, ec);
+ }
+ 
+@@ -141,6 +162,7 @@ bool write_save(const std::filesystem::path &memory_stick, const SaveFiles &file
+                 std::string &error) {
+     const auto folder = save_folder(memory_stick, files);
+     std::error_code ec;
++    recover_folder(folder);
+     std::filesystem::create_directories(folder, ec);
+     if (ec) {
+         error = "cannot create " + folder.string() + ": " + ec.message();
+diff --git a/host/settings/port_settings.cpp b/host/settings/port_settings.cpp
+index 8de34ec..40ee923 100644
+--- a/host/settings/port_settings.cpp
++++ b/host/settings/port_settings.cpp
+@@ -1,5 +1,7 @@
+ #include "settings/port_settings.hpp"
+ 
++#include "file_replace.hpp"
++
+ #include <algorithm>
+ #include <cctype>
+ #include <cstdio>
+@@ -147,12 +149,9 @@ bool default_write_replace(const char *path, const std::string &data) {
+         std::remove(temporary.c_str());
+         return false;
+     }
+-#if defined(_WIN32) || defined(__vita__)
+-    // rename() does not replace an existing file here: the target goes first. A crash between the two calls leaves
+-    // the complete temporary file, which load() recovers.
+-    std::remove(path);
+-#endif
+-    if (std::rename(temporary.c_str(), path) != 0) {
++    // rename() may refuse an existing target (the Vita, Windows): file_replace moves the old file to .bak first, so there is
++    // never a moment with no file, and load() restores the .bak if a run was killed in between.
++    if (filereplace::replace(temporary, path) == filereplace::Result::Failed) {
+         std::remove(temporary.c_str());
+         return false;
+     }
+@@ -438,6 +437,7 @@ bool Settings::load() {
+             // beside it.
+             found = ops_.read_all((path_ + ".tmp").c_str(), text);
+         }
++        if (!found) found = ops_.read_all((path_ + ".bak").c_str(), text);
+         if (!found) return false;
+         return load_text(text);
+     } catch (...) {
+diff --git a/host/settings/port_settings.hpp b/host/settings/port_settings.hpp
+index f2c5df6..b6ee1f0 100644
+--- a/host/settings/port_settings.hpp
++++ b/host/settings/port_settings.hpp
+@@ -114,8 +114,8 @@ struct InitOptions {
+ struct FileOps {
+     // Reads a whole file; false if it does not exist or cannot be read.
+     bool (*read_all)(const char *path, std::string &out){nullptr};
+-    // Replaces `path` by `data` all at once: write a temporary file, then rename it over the target (desktop), or
+-    // remove the target first and rename the temporary file (Vita, where O_TRUNC is unreliable).
++    // Replaces `path` by `data` all at once: write a temporary file, then rename it over the target; where rename()
++    // refuses an existing target the old file goes to .bak first (host/file_replace.hpp).
+     bool (*write_replace)(const char *path, const std::string &data){nullptr};
+ };
+ 
+diff --git a/tests/audio_underrun_tests.cpp b/tests/audio_underrun_tests.cpp
+new file mode 100644
+index 0000000..bb16d0b
+--- /dev/null
++++ b/tests/audio_underrun_tests.cpp
+@@ -0,0 +1,115 @@
++// The underrun fade and the adaptive cushion (host/audio/underrun_fade.hpp): no step at a gap, counted only when a gap is short,
++// and the cushion grows after real underruns and comes back down when it is calm.
++#include "audio/underrun_fade.hpp"
++
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++namespace {
++int g_failures = 0;
++void check(bool c, const char *what) {
++    std::printf("%s %s\n", c ? "ok  " : "FAIL", what);
++    if (!c) ++g_failures;
++}
++using namespace portablekit::audio;
++
++// A loud tone of `frames` frames, starting at phase `at`.
++std::vector<std::int16_t> tone(std::size_t frames, std::size_t at) {
++    std::vector<std::int16_t> v(frames * 2);
++    for (std::size_t i = 0; i < frames; ++i)
++        v[2 * i] = v[2 * i + 1] = static_cast<std::int16_t>(20000.0 * std::sin(0.05 * static_cast<double>(at + i)));
++    return v;
++}
++int max_step(const std::vector<std::int16_t> &v) {
++    int worst = 0;
++    for (std::size_t i = 1; i < v.size() / 2; ++i) worst = std::max(worst, std::abs(v[2 * i] - v[2 * (i - 1)]));
++    return worst;
++}
++} // namespace
++
++int main() {
++    // A continuous stream is left alone.
++    {
++        UnderrunFader f;
++        auto a = tone(1024, 0);
++        const auto ref = a;
++        f.process(a.data(), 1024, 1024);
++        check(a == ref && f.underruns() == 0, "a full buffer passes unchanged");
++    }
++    // A 300-frame hole in the middle of the stream (device wanted 1024, 724 written; the next buffer is complete again).
++    {
++        UnderrunFader f;
++        std::vector<std::int16_t> stream;
++        auto a = tone(1024, 0);
++        f.process(a.data(), 1024, 1024);
++        stream.insert(stream.end(), a.begin(), a.end());
++        auto b = tone(1024, 1024);
++        std::fill(b.begin() + 2 * 724, b.end(), 0);   // only 724 frames were there
++        f.process(b.data(), 1024, 724);
++        stream.insert(stream.end(), b.begin(), b.end());
++        auto c = tone(1024, 2048);
++        f.process(c.data(), 1024, 1024);
++        stream.insert(stream.end(), c.begin(), c.end());
++        // Without the fade the step at 724 is the tone's own value (up to 20000).
++        check(max_step(stream) < 2000, "no sample-to-sample step at the gap or after it is larger than the tone's own slope plus the ramp");
++        check(std::abs(b[2 * (724 + 87)]) < 400 && b[2 * 900] == 0 && std::abs(b[2 * 724]) > std::abs(b[2 * 790]) / 2, "the held sample runs down to zero inside the gap");
++        check(f.underruns() == 1 && f.underrun_frames() == 300, "a gap of 300 frames that ended is one underrun of 300 frames");
++        check(c[0] == 0 || std::abs(c[0]) < 400, "the audio after the gap fades in from silence");
++    }
++    // A pause (one second of nothing) is not an underrun.
++    {
++        UnderrunFader f;
++        auto a = tone(1024, 0);
++        f.process(a.data(), 1024, 1024);
++        for (int i = 0; i < 44; ++i) {
++            std::vector<std::int16_t> z(2048, 0);
++            f.process(z.data(), 1024, 0);
++        }
++        auto b = tone(1024, 0);
++        f.process(b.data(), 1024, 1024);
++        check(f.underruns() == 0, "a gap of a second is a pause, not an underrun");
++    }
++    // Silence before any audio is not an underrun either.
++    {
++        UnderrunFader f;
++        std::vector<std::int16_t> z(2048, 0);
++        f.process(z.data(), 1024, 0);
++        auto b = tone(1024, 0);
++        f.process(b.data(), 1024, 1024);
++        check(f.underruns() == 0, "silence before the first sound is not an underrun");
++    }
++    // A gap longer than one ramp, over several buffers.
++    {
++        UnderrunFader f;
++        auto a = tone(1024, 0);
++        f.process(a.data(), 1024, 1024);
++        std::vector<std::int16_t> z(2048, 0);
++        f.process(z.data(), 1024, 0);
++        f.process(z.data(), 1024, 0);
++        auto b = tone(1024, 0);
++        f.process(b.data(), 1024, 1024);
++        check(f.underruns() == 1 && f.underrun_frames() == 2048, "a two-buffer gap counts once, with its length");
++        check(f.take_new_underruns() == 1 && f.take_new_underruns() == 0, "take_new_underruns reports each underrun once");
++    }
++    // The cushion.
++    {
++        Cushion c(3072, 882, 5632);
++        check(c.frames() == 3072, "the cushion starts at its base");
++        c.on_underrun();
++        check(c.frames() == 3954, "one underrun adds 20 ms");
++        for (int i = 0; i < 10; ++i) c.on_underrun();
++        check(c.frames() == 5632, "the cushion stops at its cap");
++        c.advance(29ull * 44100);
++        check(c.frames() == 5632, "29 s of calm change nothing");
++        c.advance(2ull * 44100);
++        check(c.frames() == 5632 - 882, "30 s of calm take one step off");
++        c.on_underrun();
++        c.advance(29ull * 44100);
++        check(c.frames() == 5632, "an underrun restarts the calm period");
++        c.advance(30ull * 44100 * 10);
++        check(c.frames() == 3072, "enough calm brings it back to the base, not below");
++    }
++    std::printf("%d failure(s)\n", g_failures);
++    return g_failures == 0 ? 0 : 1;
++}
+diff --git a/tests/iso_image_tests.cpp b/tests/iso_image_tests.cpp
+new file mode 100644
+index 0000000..fea5fca
+--- /dev/null
++++ b/tests/iso_image_tests.cpp
+@@ -0,0 +1,70 @@
++// IsoImage on a tiny synthetic ISO9660 image (made here, no game data): reads, and the self-healing of a stale handle after a
++// suspend (a failed read reopens the file once and retries; notify_resumed() reopens before the next read).
++
++#include "kernel/iso_image.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++namespace {
++int g_failures = 0;
++void check(bool condition, const char *what) {
++    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
++    if (!condition) ++g_failures;
++}
++void put32(std::vector<std::uint8_t> &image, std::size_t at, std::uint32_t v) {
++    for (int i = 0; i < 4; ++i) image[at + i] = static_cast<std::uint8_t>(v >> (8 * i));
++}
++} // namespace
++
++int main() {
++    using portablekit::IsoImage;
++    constexpr std::size_t S = IsoImage::kSectorSize;
++    std::vector<std::uint8_t> image(20 * S, 0);
++    std::uint8_t *pvd = image.data() + 16 * S;
++    pvd[0] = 1;
++    std::memcpy(pvd + 1, "CD001", 5);
++    put32(image, 16 * S + 156 + 2, 17);      // root directory: sector 17
++    put32(image, 16 * S + 156 + 10, S);
++    std::uint8_t *dir = image.data() + 17 * S;
++    const char name[] = "A.BIN;1";
++    dir[0] = 33 + 7;                          // record length
++    put32(image, 17 * S + 2, 18);             // the file: sector 18, 100 bytes
++    put32(image, 17 * S + 10, 100);
++    dir[32] = 7;
++    std::memcpy(dir + 33, name, 7);
++    for (int i = 0; i < 100; ++i) image[18 * S + i] = static_cast<std::uint8_t>(i + 1);
++
++    const auto path = std::filesystem::temp_directory_path() / "portablekit_iso_image_test.iso";
++    { std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size())); }
++
++    IsoImage iso(path);
++    const auto entry = iso.find("a.bin");
++    check(entry.has_value() && entry->lba == 18 && entry->size == 100, "the synthetic image lists A.BIN");
++    std::vector<std::uint8_t> out(100);
++    check(iso.read(18 * S, out) == 100 && out[0] == 1 && out[99] == 100, "a plain read returns the file");
++    const auto base = IsoImage::reopen_total();
++
++    iso.close_handle_for_test();   // a stale handle
++    std::vector<std::uint8_t> again(100);
++    check(iso.read(18 * S, again) == 100 && again == out, "a read on a stale handle reopens the file and returns the same bytes");
++    check(IsoImage::reopen_total() == base + 1 && IsoImage::reopen_failed_total() == 0, "... and counts one reopen, no failure");
++    check(iso.read(18 * S + 10, again) == 100 && again[0] == 11, "later reads work on the new handle without another reopen");
++    check(IsoImage::reopen_total() == base + 1, "... still one reopen");
++
++    IsoImage::notify_resumed();
++    check(iso.read(18 * S, again) == 100 && again == out, "after notify_resumed the next read works");
++    check(IsoImage::reopen_total() == base + 2, "... through one proactive reopen");
++
++    std::filesystem::remove(path);
++    // The file is gone: the retry cannot succeed, and the failure is counted, not thrown.
++    iso.close_handle_for_test();
++    check(iso.read(18 * S, again) < 100 && IsoImage::reopen_failed_total() == 1, "a read that cannot be healed reports the short count and counts a failure");
++
++    std::printf("%d failure(s)\n", g_failures);
++    return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/tests/port_settings_tests.cpp b/tests/port_settings_tests.cpp
+index b2d354c..a25e7e4 100644
+--- a/tests/port_settings_tests.cpp
++++ b/tests/port_settings_tests.cpp
+@@ -1,6 +1,7 @@
+ // The port settings (host/settings/port_settings.hpp): the key table, settings.txt round trips with unknown lines
+ // kept, developer overrides, availability, the restart rule and the change counter. No game, no renderer.
+ 
++#include "file_replace.hpp"
+ #include "gpu/hd_texture_pack.hpp"
+ #include "settings/port_settings.hpp"
+ 
+@@ -141,6 +142,13 @@ int main() {
+     t3.set_file_ops({&fake_read, &fake_write});
+     t3.set_path("x/settings.txt");
+     check(t3.load() && t3.index(Key::GfxAntialiasing) == 2u, "a leftover temporary file is used when the real file is gone");
++    // A .bak (the run was killed between the two renames of file_replace) is used when the real file and .tmp are gone.
++    g_files.clear();
++    g_files["x/settings.txt.bak"] = "gfx.antialiasing=fxaa\n";
++    Settings t3b;
++    t3b.set_file_ops({&fake_read, &fake_write});
++    t3b.set_path("x/settings.txt");
++    check(t3b.load() && t3b.index(Key::GfxAntialiasing) == 2u, "a leftover .bak is used when the real file and .tmp are gone");
+     Settings t4;
+     t4.set_file_ops({&fake_read, &fake_write});
+     t4.set_path("nowhere/settings.txt");
+@@ -212,6 +220,36 @@ int main() {
+         std::remove((path + ".tmp").c_str());
+     }
+ 
++    // The same with a rename that refuses an existing target (the Vita's): the second save still replaces the file, and no .bak stays.
++    {
++        struct R {
++            static bool ren(const char *a, const char *b) {
++                std::FILE *e = std::fopen(b, "rb");
++                if (e != nullptr) { std::fclose(e); return false; }
++                return std::rename(a, b) == 0;
++            }
++            static bool rem(const char *p) { return std::remove(p) == 0; }
++            static bool ex(const char *p) { std::FILE *e = std::fopen(p, "rb"); if (e) std::fclose(e); return e != nullptr; }
++        };
++        static const portablekit::filereplace::Ops refusing{&R::ren, &R::rem, &R::ex};
++        portablekit::filereplace::set_ops_for_test(&refusing);
++        const char *tmp = std::getenv("TMPDIR");
++        const std::string path = std::string(tmp != nullptr ? tmp : "/tmp") + "/port_settings_refuse_" + std::to_string(std::rand()) + ".txt";
++        Settings f;
++        f.set_path(path);
++        f.set(Key::GfxMovieFilter, "bilinear");
++        const bool first_ok = f.save();
++        f.set(Key::GfxMovieFilter, "sharp");
++        const bool second_ok = f.save();
++        Settings g;
++        g.set_path(path);
++        check(first_ok && second_ok && g.load() && g.index(Key::GfxMovieFilter) == 0u,
++              "a rename that refuses an existing target: the save still replaces the file");
++        check(!R::ex((path + ".bak").c_str()) && !R::ex((path + ".tmp").c_str()), "... and leaves no .bak or .tmp");
++        portablekit::filereplace::set_ops_for_test(nullptr);
++        std::remove(path.c_str());
++    }
++
+     // Typed accessors and the frame cap periods.
+     settings().set(Key::PerfFrameCap, "30");
+     check(frame_cap() == FrameCap::Fps30 && frame_cap_period_us() == 33366u, "frame cap 30");
+diff --git a/tests/savedata_tests.cpp b/tests/savedata_tests.cpp
+index 509d4ae..d82b218 100644
+--- a/tests/savedata_tests.cpp
++++ b/tests/savedata_tests.cpp
+@@ -8,6 +8,7 @@
+ // The second form checks a save made elsewhere, for example one copied from
+ // a PSP: the PARAM.SFO hashes, the data file's hash, and that the decrypted
+ // data encrypts back to a file with the same hash.
++#include "file_replace.hpp"
+ #include "profile.hpp"
+ #include "save_data/aes128.hpp"
+ #include "save_data/param_sfo.hpp"
+@@ -410,6 +411,61 @@ void test_export_encrypts_plain_save() {
+     std::filesystem::remove_all(target);
+ }
+ 
++
++// A rename that refuses an existing target (the Vita's sceIoRename), and one that dies after the old file went to .bak.
++namespace refuse {
++int renames_until_fail = -1;   // -1: never
++bool exists(const char *p) { return std::filesystem::exists(p); }
++bool remove(const char *p) { return std::remove(p) == 0; }
++bool rename_no_replace(const char *from, const char *to) {
++    if (renames_until_fail == 0) return false;
++    if (renames_until_fail > 0) --renames_until_fail;
++    if (std::filesystem::exists(to)) return false;
++    return std::rename(from, to) == 0;
++}
++const portablekit::filereplace::Ops ops{&rename_no_replace, &remove, &exists};
++} // namespace refuse
++
++void test_save_replace_when_rename_refuses() {
++    const auto root = std::filesystem::temp_directory_path() / "portablekit_savedata_refuse_ms";
++    std::filesystem::remove_all(root);
++    SaveFiles files;
++    files.game_name = "TEST00002";
++    files.file_name = "DATA.BIN";
++    SaveContents first, second;
++    first.data = std::vector<std::uint8_t>(512u, 0x11u);
++    second.data = std::vector<std::uint8_t>(700u, 0x22u);
++    first.title = second.title = "T";
++    std::string error;
++    portablekit::filereplace::set_ops_for_test(&refuse::ops);
++    check(write_save(root, files, first, error), "refusing rename: the first save is written");
++    check(write_save(root, files, second, error), "refusing rename: the second save replaces the first");
++    LoadResult loaded = load_save(root, files);
++    check(loaded.status == LoadStatus::Ok && loaded.contents.data == second.data, "refusing rename: the new save loads");
++    const auto folder = save_folder(root, files);
++    check(!std::filesystem::exists(folder / "DATA.BIN.bak") && !std::filesystem::exists(folder / "DATA.BIN.tmp") &&
++              !std::filesystem::exists(folder / "PARAM.SFO.bak"),
++          "refusing rename: no .bak or .tmp is left");
++
++    // Killed after the old file went to .bak and before the new one went in: the next start brings the old one back.
++    SaveContents third = second;
++    third.data = std::vector<std::uint8_t>(300u, 0x33u);
++    refuse::renames_until_fail = 2;   // the plain rename (refused), then target->.bak, then every rename fails: even the put-back
++    check(!write_save(root, files, third, error), "interrupted replace: the write reports failure");
++    refuse::renames_until_fail = -1;
++    check(load_save(root, files).status == LoadStatus::Ok && load_save(root, files).contents.data == second.data,
++          "interrupted replace: the previous save is still there (restored)");
++
++    // A real crash: DATA.BIN is gone and only the .bak remains.
++    std::filesystem::rename(folder / "DATA.BIN", folder / "DATA.BIN.bak");
++    check(!std::filesystem::exists(folder / "DATA.BIN"), "crash state: the data file is missing");
++    loaded = load_save(root, files);
++    check(loaded.status == LoadStatus::Ok && loaded.contents.data == second.data && std::filesystem::exists(folder / "DATA.BIN"),
++          "crash state: the save is recovered from .bak at the next start");
++    portablekit::filereplace::set_ops_for_test(nullptr);
++    std::filesystem::remove_all(root);
++}
++
+ int main(int argc, char **argv) {
+     if (argc >= 5 && std::string(argv[1]) == "--check")
+         return check_save(argv[2], argv[3], argv[4], argc >= 6 ? argv[5] : nullptr);
+@@ -420,6 +476,7 @@ int main(int argc, char **argv) {
+     test_store();
+     test_transfer();
+     test_export_encrypts_plain_save();
++    test_save_replace_when_rename_refuses();
+     std::printf("%d failure(s)\n", failures);
+     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+ }
+-- 
+2.43.0
+
