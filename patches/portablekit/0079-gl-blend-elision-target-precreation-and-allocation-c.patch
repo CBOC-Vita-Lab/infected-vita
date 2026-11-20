@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 14:26:28 -0500
-Subject: [PATCH 77/77] gl: blend elision, target precreation and allocation
+Subject: [PATCH 79/79] gl: blend elision, target precreation and allocation
  checks, warm-up check, alpha-test census, vitaGL hooks
 
 Draws whose blend provably yields the source colour are drawn with blending off (gl_blend_elide, exact rule in gl_blend_elide.hpp, brute-force tested); FXAA's second texture is made with the display target and a failed target allocation is logged and skipped; the end of the warm-up reports programs that were not in the shader cache and links during play are counted; a census counts alpha-tested draws that come before opaque draws over the same area; platform hooks for vitaGL patches 0005-0007.
@@ -25,10 +25,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/gl_synthetic_tests.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9a58572..9342df5 100644
+index 1abba17..b36a827 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -412,6 +412,15 @@ if(PSPRECOMP_BUILD_TESTS)
+@@ -446,6 +446,15 @@ if(PSPRECOMP_BUILD_TESTS)
      add_test(NAME portablekit_alpha_test_tests COMMAND portablekit_alpha_test_tests)
  endif()
  
@@ -44,7 +44,7 @@ index 9a58572..9342df5 100644
  # Every row and every value of the settings menu: model, save and reload, the menu's buttons, drawing. No GL, no game.
  if(PSPRECOMP_BUILD_TESTS)
      add_executable(portablekit_settings_smoke_tests
-@@ -737,6 +746,22 @@ if(PORTABLEKIT_GE_REPLAY)
+@@ -771,6 +780,22 @@ if(PORTABLEKIT_GE_REPLAY)
      set_target_properties(ge_replay PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
  endif()
  

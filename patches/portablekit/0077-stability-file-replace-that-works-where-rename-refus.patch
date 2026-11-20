@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 14:20:54 -0500
-Subject: [PATCH 77/77] stability: file replace that works where rename refuses, ISO
- self-heal, power tick hook, audio underrun fade and cushion
+Subject: [PATCH 77/79] stability: file replace that works where rename
+ refuses, ISO self-heal, power tick hook, audio underrun fade and cushion
 
 - host/file_replace.hpp: rename; if the target exists and rename refuses, target -> .bak, temp -> target, delete .bak; recover()
   puts a .bak back when the target is missing. Used by savedata_store write_file (recovery on load/exists/write) and by the

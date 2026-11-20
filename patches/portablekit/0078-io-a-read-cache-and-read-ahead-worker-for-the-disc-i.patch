@@ -1,13 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: CBOC-Vita <344212538+CBOC-Vita@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 14:26:53 -0500
-Subject: [PATCH 77/77] io: a read cache and read-ahead worker for the disc
+Subject: [PATCH 78/79] io: a read cache and read-ahead worker for the disc
  image, reads straight into guest memory, UMD read-ahead hints honoured
 
 IsoReadCache (kernel/iso_read_cache.hpp): aligned 64 KiB blocks (about 8 MB, least recently used out first), a handle of its own on the
 file, and a worker thread that reads blocks ahead of a sequential reader (four slots of streams) and where the game's UMD read-ahead
-command (sceIoDevctl 0x01F300A5) says it will read. The bytes are the file's. Every read of the source goes through one local mutex (to
-be replaced by the shared stdio/open lock of builder-stab at the merge). A failed read is retried once after the source was opened
+command (sceIoDevctl 0x01F300A5) says it will read. The bytes are the file's. Every read of the source goes through one local mutex, always taken before the port's stdio lock
+(a wrapped fopen in reopen), never after it, so the two cannot deadlock; stab's notify_resumed() drives IsoImage::reopen(). A failed read is retried once after the source was opened
 again (IsoImage::reopen() / IsoReadCache::reopen() for a wake from sleep); a block that could not be read is never cached. Reads of
 1 MiB or more skip the cache. The worker starts through IoThreadPlatform (core and priority), std::thread by default.
 
@@ -21,24 +21,38 @@ source with reopen and retry, hints, eviction, and IsoImage on a synthetic ISO 9
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- CMakeLists.txt                 |  12 ++
+ CMakeLists.txt                 |  15 +-
  cmake/PortableKit.cmake        |   1 +
  host/hle/hle_io.cpp            |  52 +++++-
- host/kernel/iso_image.cpp      |  80 ++++++++-
- host/kernel/iso_image.hpp      |  22 +++
+ host/kernel/iso_image.cpp      |  87 ++++++++-
+ host/kernel/iso_image.hpp      |  27 ++-
  host/kernel/iso_read_cache.cpp | 317 ++++++++++++++++++++++++++++++++
- host/kernel/iso_read_cache.hpp | 137 ++++++++++++++
+ host/kernel/iso_read_cache.hpp | 140 +++++++++++++++
+ tests/iso_image_tests.cpp      |  18 ++
  tests/iso_read_cache_tests.cpp | 319 +++++++++++++++++++++++++++++++++
- 8 files changed, 932 insertions(+), 8 deletions(-)
+ 9 files changed, 957 insertions(+), 19 deletions(-)
  create mode 100644 host/kernel/iso_read_cache.cpp
  create mode 100644 host/kernel/iso_read_cache.hpp
  create mode 100644 tests/iso_read_cache_tests.cpp
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9a58572..7599d6e 100644
+index 3b407f0..1abba17 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -302,6 +302,18 @@ if(PSPRECOMP_BUILD_TESTS)
+@@ -256,10 +256,11 @@ endif()
+ if(PSPRECOMP_BUILD_TESTS)
+     add_executable(portablekit_iso_image_tests
+         "${PORTABLEKIT_ROOT}/tests/iso_image_tests.cpp"
++        "${PORTABLEKIT_ROOT}/host/kernel/iso_read_cache.cpp"
+         "${PORTABLEKIT_ROOT}/host/kernel/iso_image.cpp")
+     target_compile_features(portablekit_iso_image_tests PRIVATE cxx_std_20)
+     target_include_directories(portablekit_iso_image_tests PRIVATE "${PORTABLEKIT_ROOT}/host" "${PORTABLEKIT_ROOT}/include")
+-    target_link_libraries(portablekit_iso_image_tests PRIVATE psprecomp_core)
++    target_link_libraries(portablekit_iso_image_tests PRIVATE psprecomp_core Threads::Threads)
+     set_target_properties(portablekit_iso_image_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+     add_test(NAME portablekit_iso_image_tests COMMAND portablekit_iso_image_tests)
+ endif()
+@@ -323,6 +324,18 @@ if(PSPRECOMP_BUILD_TESTS)
      add_test(NAME portablekit_rtc_tests COMMAND portablekit_rtc_tests)
  endif()
  
@@ -174,24 +188,21 @@ index cce9a46..b11cdf1 100644
                  if (trace_io())
                      std::cerr << "[io] " << device << " read ahead " << request.sectors
 diff --git a/host/kernel/iso_image.cpp b/host/kernel/iso_image.cpp
-index 50c43d5..5ab2550 100644
+index 3ff1e0b..035caf4 100644
 --- a/host/kernel/iso_image.cpp
 +++ b/host/kernel/iso_image.cpp
-@@ -4,7 +4,9 @@
+@@ -4,6 +4,7 @@
  #include "psprecomp/common.hpp"
  
  #include <algorithm>
 +#include <atomic>
  #include <cctype>
-+#include <iostream>
+ #include <iostream>
  
- namespace portablekit {
- namespace {
-@@ -16,7 +18,77 @@ std::uint32_t read_le32(const std::vector<std::uint8_t> &data, std::size_t offse
+@@ -17,6 +18,76 @@ std::uint32_t read_le32(const std::vector<std::uint8_t> &data, std::size_t offse
  
  } // namespace
  
--IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::binary) {
 +namespace {
 +std::atomic<const IsoReadCache *> g_cache{nullptr};
 +
@@ -262,11 +273,10 @@ index 50c43d5..5ab2550 100644
 +    return true;
 +}
 +
-+IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
+ IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path, std::ios::binary) {
      if (!file_) throw psprecomp::Error("Cannot open disc image: " + path.string());
      size_bytes_ = std::filesystem::file_size(path);
-     std::vector<std::uint8_t> primary(kSectorSize);
-@@ -29,6 +101,11 @@ IsoImage::IsoImage(const std::filesystem::path &path) : file_(path, std::ios::bi
+@@ -30,6 +101,11 @@ IsoImage::IsoImage(const std::filesystem::path &path) : path_(path), file_(path,
      scan_directory(root_lba, root_size, "", 0);
  }
  
@@ -278,19 +288,43 @@ index 50c43d5..5ab2550 100644
  std::string IsoImage::normalize(std::string path) {
      std::replace(path.begin(), path.end(), '\\', '/');
      std::string result;
-@@ -76,6 +153,7 @@ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output)
+@@ -73,13 +149,6 @@ std::optional<IsoImage::Entry> IsoImage::find(std::string path) const {
+     return found->second;
+ }
+ 
+-bool IsoImage::reopen() {
+-    file_.close();
+-    file_.clear();
+-    file_.open(path_, std::ios::binary);
+-    return static_cast<bool>(file_);
+-}
+-
+ std::size_t IsoImage::read_once(std::uint64_t offset, std::uint8_t *output, std::size_t count) {
+     file_.clear();
+     file_.seekg(static_cast<std::streamoff>(offset));
+@@ -91,7 +160,8 @@ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output)
      if (offset >= size_bytes_) return 0u;
      const std::size_t count = static_cast<std::size_t>(std::min<std::uint64_t>(output.size(), size_bytes_ - offset));
      const phase::Scope timer(phase::IsoRead);
+-    // After a suspend the next read starts on a fresh handle.
++    // After a suspend the next read starts on fresh handles. IsoImage::reopen() reopens the cache's handle and this one, so the
++    // cache and the plain path share one design; the cache then retries a failed block itself (once), so nothing retries twice.
+     if (resume_pending_.exchange(false, std::memory_order_relaxed)) {
+         ++reopen_total_;
+         if (reopen())
+@@ -101,6 +171,7 @@ std::size_t IsoImage::read(std::uint64_t offset, std::span<std::uint8_t> output)
+             std::cerr << "[iso] could not reopen the disc image after resume\n";
+         }
+     }
 +    if (cache_ != nullptr) return cache_->read(offset, output.first(count));
-     file_.clear();
-     file_.seekg(static_cast<std::streamoff>(offset));
-     file_.read(reinterpret_cast<char *>(output.data()), static_cast<std::streamsize>(count));
+     std::size_t got = read_once(offset, output.data(), count);
+     if (got == count) return got;
+     // A short read inside the image is a failure (a stale handle after sleep): reopen once and retry once.
 diff --git a/host/kernel/iso_image.hpp b/host/kernel/iso_image.hpp
-index e52d6a9..7c55e6f 100644
+index 278a44d..07a50e4 100644
 --- a/host/kernel/iso_image.hpp
 +++ b/host/kernel/iso_image.hpp
-@@ -4,11 +4,14 @@
+@@ -5,11 +5,14 @@
  #include <filesystem>
  #include <fstream>
  #include <map>
@@ -305,7 +339,7 @@ index e52d6a9..7c55e6f 100644
  namespace portablekit {
  
  // Read-only ISO9660 view of a PSP UMD image. Paths are case-insensitive and
-@@ -28,6 +31,7 @@ public:
+@@ -29,6 +32,7 @@ public:
      };
  
      explicit IsoImage(const std::filesystem::path &path);
@@ -313,9 +347,20 @@ index e52d6a9..7c55e6f 100644
  
      [[nodiscard]] std::optional<Entry> find(std::string path) const;
      [[nodiscard]] std::uint64_t size_bytes() const noexcept { return size_bytes_; }
-@@ -35,13 +39,31 @@ public:
-     std::size_t read(std::uint64_t offset, std::span<std::uint8_t> output);
+@@ -37,23 +41,35 @@ public:
      [[nodiscard]] std::vector<std::string> list(std::string directory) const;
+ 
+     // Suspend and resume. After the console slept the handle of a file on the memory card can be stale: a read fails (or, worse,
+-    // answers wrongly). read() reopens the file and retries once when a read comes up short, and notify_resumed() makes the
+-    // next read reopen it first. reopen_total() counts both kinds for the status line.
++    // answers wrongly). notify_resumed() makes the next read reopen the image first (reopen() below: the cache's handle and the
++    // plain one). Without the cache, read() also reopens once and retries once when a read comes up short; with it, the cache
++    // retries a failed block once after reopening its source, so a read is never retried twice. reopen_total() counts both kinds.
+     static void notify_resumed() noexcept { resume_pending_.store(true, std::memory_order_relaxed); }
+     [[nodiscard]] static std::uint64_t reopen_total() noexcept { return reopen_total_.load(std::memory_order_relaxed); }
+     [[nodiscard]] static std::uint64_t reopen_failed_total() noexcept { return reopen_failed_.load(std::memory_order_relaxed); }
+     // Closes the handle as a stale one would be (for tests): the next read has to heal it.
+     void close_handle_for_test() { file_.close(); }
  
 +    // The read cache and its read-ahead worker (kernel/iso_read_cache.hpp): reads then come from aligned blocks kept in memory,
 +    // from a handle of its own, and a sequential reader or a read-ahead hint of the game has the next blocks read by a helper
@@ -332,11 +377,16 @@ index e52d6a9..7c55e6f 100644
      void scan_directory(std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth);
      [[nodiscard]] static std::string normalize(std::string path);
  
-+    std::filesystem::path path_;
+-    bool reopen();
+     std::size_t read_once(std::uint64_t offset, std::uint8_t *output, std::size_t count);
+ 
+     std::filesystem::path path_;
      std::ifstream file_;
 +    std::unique_ptr<IsoReadCache> cache_;
-     std::uint64_t size_bytes_{};
-     std::map<std::string, Entry> entries_;
+     static inline std::atomic<bool> resume_pending_{false};
+     static inline std::atomic<std::uint64_t> reopen_total_{0};
+     static inline std::atomic<std::uint64_t> reopen_failed_{0};
+@@ -62,3 +78,8 @@ private:
  };
  
  } // namespace portablekit
@@ -670,10 +720,10 @@ index 0000000..2fe7bc1
 +} // namespace portablekit
 diff --git a/host/kernel/iso_read_cache.hpp b/host/kernel/iso_read_cache.hpp
 new file mode 100644
-index 0000000..36e70e9
+index 0000000..a7cd248
 --- /dev/null
 +++ b/host/kernel/iso_read_cache.hpp
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,140 @@
 +#pragma once
 +
 +#include <condition_variable>
@@ -786,8 +836,11 @@ index 0000000..36e70e9
 +    static void worker_main(void *self);
 +    void worker_loop();
 +
-+    // The one mutex every read of the source goes through. ifstream is not thread safe, and the stdio layer under it is not
-+    // either on the Vita. NOTE for the merge with builder-stab: replace this by the shared stdio/open lock that branch adds.
++    // The one mutex every read of the source goes through (ifstream is not thread safe, and the stdio layer under it is not either on
++    // the Vita). Lock order, for the Vita port's stdio lock (--wrap of fopen/fclose and the stdio writers, a recursive lock): this
++    // mutex may be held while a wrapped fopen/fclose (the source's reopen) takes the stdio lock, so the order is always
++    // source_mutex_ -> stdio lock. Nothing holds the stdio lock while calling into the cache (the wrapped functions call only libc),
++    // and reads (fread) are not wrapped, so the two cannot deadlock. mutex_ is taken after source_mutex_ (statistics) and never before it.
 +    std::mutex source_mutex_;
 +    std::unique_ptr<BlockSource> source_;
 +
@@ -811,6 +864,35 @@ index 0000000..36e70e9
 +};
 +
 +} // namespace portablekit
+diff --git a/tests/iso_image_tests.cpp b/tests/iso_image_tests.cpp
+index fea5fca..edf40c9 100644
+--- a/tests/iso_image_tests.cpp
++++ b/tests/iso_image_tests.cpp
+@@ -60,6 +60,24 @@ int main() {
+     check(iso.read(18 * S, again) == 100 && again == out, "after notify_resumed the next read works");
+     check(IsoImage::reopen_total() == base + 2, "... through one proactive reopen");
+ 
++    // With the read cache on: a wake from sleep reopens once (the cache's handle and the plain one), and a read is never retried twice.
++    {
++        IsoImage cached_iso(path);
++        portablekit::IsoReadCache::Config config;
++        config.worker = false;
++        cached_iso.enable_cache(config);
++        const auto before = IsoImage::reopen_total();
++        IsoImage::notify_resumed();
++        std::vector<std::uint8_t> cached(100);
++        check(cached_iso.read(18 * S, cached) == 100 && cached == out, "with the cache: a read after notify_resumed returns the same bytes");
++        check(IsoImage::reopen_total() == before + 1, "... through one reopen, and no retry on top of it");
++        portablekit::IsoCacheStats stats{};
++        check(cached_iso.cache_stats(stats) && stats.reopens == 1 && stats.errors == 0, "... the cache's own handle was reopened once, without an error");
++        cached_iso.close_handle_for_test();   // only the plain handle: the cache reads from its own
++        check(cached_iso.read(18 * S + 10, cached) == 100 && cached[0] == 11 && IsoImage::reopen_total() == before + 1,
++              "a stale plain handle does not matter to a cached read, and nothing is reopened");
++    }
++
+     std::filesystem::remove(path);
+     // The file is gone: the retry cannot succeed, and the failure is counted, not thrown.
+     iso.close_handle_for_test();
 diff --git a/tests/iso_read_cache_tests.cpp b/tests/iso_read_cache_tests.cpp
 new file mode 100644
 index 0000000..cee3f39

@@ -24,6 +24,15 @@
 - With the PSVshellPlus plugin installed, the game sets up its own 500 MHz profile and never overwrites one of yours. It takes effect from the next start.
 - The CPU clock row shows the clock it measured (495 MHz on a real Vita, 1 November 2026).
 
+**Since 6 November**
+- Fewer crashes and hitches: the log is written in the background, and the game's file reading and writing no longer trip over each other. Saves and settings are replaced safely, even where the memory card refuses to rename a file.
+- The screen stays on during movies and attract loops: the game now tells the Vita it is still in use.
+- Sleep and wake are handled: after the Vita wakes, the clock, the disc image, the sound and the fourth core are checked and brought back by themselves.
+- Smoother sound: a gap in the audio no longer clicks, and the sound keeps a little more in reserve on a Vita that has been falling behind.
+- Disc read-ahead: the game reads its disc image through a cache and a helper that reads ahead, so loading is steadier.
+- Title art on the loading screens: the start-up and error screens use the disc's own pictures.
+- GPU savings with the same picture: blending is switched off where it cannot change a pixel, and every effect target is made at start instead of in the middle of play.
+
 **Fixes**
 - The HD textures row no longer shows greyed out at start.
 - Plain boot-screen messages if the shader compiler or memory is missing.

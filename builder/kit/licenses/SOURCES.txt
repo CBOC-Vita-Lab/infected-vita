@@ -54,7 +54,7 @@ The licence texts are in the licenses/ folder next to this file.
    PortableKit runtime and the PSP         https://github.com/TeamGDB/PortableKit                                      MIT (MIT-PortableKit.txt)
    re-implementation (libpk_runtime.a,     commit 33800c4060c53f3233e08f8ab2cc4590a0872063 plus the patches in
    the psprecomp_core objects, headers     patches/portablekit/ of this repository, applied by
-   in game/include)                        scripts/get-portablekit.sh (result tree a9220349f40d51021d5ed7850e477e51a5171e02)
+   in game/include)                        scripts/get-portablekit.sh (result tree 365018119c07b0cfcccc77f3f4c02541db8c55b0)
    vitaGL (libvitaGL.a)                    https://github.com/Rinnegatamante/vitaGL                                    GPL-3.0 (GPL-3.0.txt,
                                            commit dca4b9d143290d78ec043131a19be36c78cdc7b5 plus the five patches       LGPL-3.0-vitaGL-COPYING.LESSER.txt
                                            vita/scripts/patches/vitagl-0001 ... 0005 of this repository                from its repository)
